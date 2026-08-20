@@ -1,0 +1,4 @@
+[target.aarch64-linux-android]
+# Snapdragon 8 Elite / Termux. Candle's half-precision GEMM assembly requires
+# fullfp16 even though v5 keeps sensitive world and optimizer state in FP32.
+rustflags = ["-C", "target-cpu=native", "-C", "target-feature=+fp16"]
