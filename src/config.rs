@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 pub const MIN_PHYSICAL_CHANNELS: usize = 12;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -112,6 +112,7 @@ pub struct RunConfig {
     pub gamma: f32,
     pub train_resolution: usize,
     pub output_resolution: usize,
+    pub snapshot_resolution: usize,
     pub episode_steps: usize,
     pub episode_reset: f32,
     pub bptt: usize,
@@ -170,7 +171,7 @@ impl Default for RunConfig {
             .unwrap_or(4);
         let mut config = Self {
             corpus_dir: PathBuf::from("/sdcard/Download/titan_image_sources"),
-            output_dir: PathBuf::from("/sdcard/Download/titan_image_v5"),
+            output_dir: PathBuf::from("/sdcard/Download/titan_image_v6"),
             run_tag: None,
             mode: TrainingMode::Texture,
             profile: PhoneProfile::S25Balanced,
@@ -182,9 +183,9 @@ impl Default for RunConfig {
             macro_size: 32,
             channels: 24,
             genome_dim: 8,
-            ca_hidden: 96,
-            render_hidden: 64,
-            render_blocks: 3,
+            ca_hidden: 128,
+            render_hidden: 128,
+            render_blocks: 4,
             coord_bands: 4,
             coord_gain: 0.12,
             state_skip: 0.75,
@@ -192,12 +193,13 @@ impl Default for RunConfig {
             gamma: 2.2,
             train_resolution: 192,
             output_resolution: 768,
+            snapshot_resolution: 384,
             episode_steps: 64,
             episode_reset: 0.85,
             bptt: 4,
             core_update_every: 4,
             macro_update_every: 4,
-            snapshot_every: 200,
+            snapshot_every: 50,
             checkpoint_every: 400,
             log_every: 10,
             image_cache: 32,
@@ -207,7 +209,7 @@ impl Default for RunConfig {
             beta1: 0.9,
             beta2: 0.999,
             adam_epsilon: 1e-8,
-            grad_clip: 1.0,
+            grad_clip: 1.5,
             warmup_updates: 24,
             integrator: Integrator::Euler,
             dt: 0.16,
@@ -310,6 +312,7 @@ impl RunConfig {
                 "--gamma" => cfg.gamma = parse(&value()?, flag)?,
                 "--train-resolution" => cfg.train_resolution = parse(&value()?, flag)?,
                 "--output-resolution" => cfg.output_resolution = parse(&value()?, flag)?,
+                "--snapshot-resolution" => cfg.snapshot_resolution = parse(&value()?, flag)?,
                 "--episode-steps" => cfg.episode_steps = parse(&value()?, flag)?,
                 "--episode-reset" => cfg.episode_reset = parse(&value()?, flag)?,
                 "--bptt" => cfg.bptt = parse(&value()?, flag)?,
@@ -388,16 +391,17 @@ impl RunConfig {
                 self.macro_size = 24;
                 self.channels = 16;
                 self.genome_dim = 6;
-                self.ca_hidden = 64;
-                self.render_hidden = 48;
-                self.render_blocks = 2;
+                self.ca_hidden = 96;
+                self.render_hidden = 80;
+                self.render_blocks = 3;
                 self.coord_bands = 3;
                 self.train_resolution = 128;
                 self.output_resolution = 512;
+                self.snapshot_resolution = 256;
                 self.bptt = 4;
                 self.core_update_every = 8;
                 self.episode_steps = 48;
-                self.snapshot_every = 240;
+                self.snapshot_every = 50;
                 self.checkpoint_every = 480;
                 self.gallery_steps = 48;
             }
@@ -406,16 +410,17 @@ impl RunConfig {
                 self.macro_size = 32;
                 self.channels = 24;
                 self.genome_dim = 8;
-                self.ca_hidden = 96;
-                self.render_hidden = 64;
-                self.render_blocks = 3;
+                self.ca_hidden = 128;
+                self.render_hidden = 128;
+                self.render_blocks = 4;
                 self.coord_bands = 4;
                 self.train_resolution = 192;
                 self.output_resolution = 768;
+                self.snapshot_resolution = 384;
                 self.bptt = 4;
                 self.core_update_every = 4;
                 self.episode_steps = 64;
-                self.snapshot_every = 200;
+                self.snapshot_every = 50;
                 self.checkpoint_every = 400;
                 self.gallery_steps = 64;
             }
@@ -424,16 +429,17 @@ impl RunConfig {
                 self.macro_size = 40;
                 self.channels = 32;
                 self.genome_dim = 12;
-                self.ca_hidden = 128;
-                self.render_hidden = 96;
-                self.render_blocks = 4;
+                self.ca_hidden = 192;
+                self.render_hidden = 160;
+                self.render_blocks = 5;
                 self.coord_bands = 5;
                 self.train_resolution = 256;
                 self.output_resolution = 1024;
+                self.snapshot_resolution = 512;
                 self.bptt = 4;
                 self.core_update_every = 2;
                 self.episode_steps = 80;
-                self.snapshot_every = 200;
+                self.snapshot_every = 50;
                 self.checkpoint_every = 400;
                 self.gallery_steps = 80;
             }
@@ -538,16 +544,14 @@ impl RunConfig {
         if self.output_resolution < self.train_resolution || self.output_resolution > 4096 {
             bail!("--output-resolution must be between train resolution and 4096");
         }
+        if self.snapshot_resolution < self.micro_size || self.snapshot_resolution > 4096 {
+            bail!("--snapshot-resolution must be between micro-size and 4096");
+        }
         if self.core_update_every == 0 || self.macro_update_every == 0 || self.log_every == 0 {
             bail!("update and logging cadences must be positive");
         }
-        for (name, cadence) in [
-            ("--snapshot-every", self.snapshot_every),
-            ("--checkpoint-every", self.checkpoint_every),
-        ] {
-            if cadence > 0 && !cadence.is_multiple_of(self.bptt) {
-                bail!("{name} must be zero or a multiple of --bptt");
-            }
+        if self.checkpoint_every > 0 && !self.checkpoint_every.is_multiple_of(self.bptt) {
+            bail!("--checkpoint-every must be zero or a multiple of --bptt");
         }
         if !(1..=256).contains(&self.image_cache) {
             bail!("--image-cache must be in 1..=256");
@@ -699,13 +703,13 @@ impl RunConfig {
     }
 
     pub fn help() -> &'static str {
-        "TITAN Image v5 - S25-first morphogenic visual dynamics\n\
+        "TITAN Image v6 - S25-first morphogenic visual dynamics\n\
          Usage: titan_image [options]\n\n\
          Required and lifecycle:\n\
            --corpus-dir PATH           Source PNG/JPEG/WebP directory (required)\n\
-           --output-dir PATH           v5 artifact directory\n\
+           --output-dir PATH           v6 artifact directory\n\
            --run-tag NAME              Isolate checkpoint and output artifacts\n\
-           --fresh                     Start a new v5 organism for this tag\n\
+           --fresh                     Start a new v6 organism for this tag\n\
            --render-only               Load without training; render/gallery only\n\
            --profile NAME              s25-fast | s25-balanced | s25-quality\n\
            --style NAME                alien-fluid | fractal-flame | reaction-garden | quasicrystal | pure-nca\n\
@@ -716,13 +720,14 @@ impl RunConfig {
            -t, --threads N             Rayon/Candle CPU threads (default <= 8)\n\
            --seed N                    Deterministic training/world seed\n\
            --train-resolution N        Differentiable render resolution\n\
-           --output-resolution N       Final/snapshot render resolution\n\
+           --output-resolution N       Final/gallery render resolution\n\
+           --snapshot-resolution N     Lower-cost periodic preview resolution\n\
            --episode-steps N           Steps per coherent source episode\n\
            --episode-reset X           Seed-state blend at target changes, 0..1\n\
            --bptt N                    Recurrent gradient horizon\n\
            --core-update-every N       Full-core cadence in optimizer windows\n\
            --macro-update-every N      Slow-field cadence in development steps\n\
-           --snapshot-every N          Snapshot cadence; 0 disables\n\
+           --snapshot-every N          Nominal step cadence; 0 disables\n\
            --checkpoint-every N        Checkpoint cadence; 0 disables periodic saves\n\
            --log-every N               Console cadence in optimizer updates\n\
            --image-cache N             Resized source images retained in RAM\n\
@@ -779,9 +784,9 @@ impl RunConfig {
 
     fn presets_help() -> &'static str {
         "Compute profiles:\n\
-           s25-fast      48/24 fields, 16 channels, 128 train, 512 output, sparse core\n\
-           s25-balanced  64/32 fields, 24 channels, 192 train, 768 output\n\
-           s25-quality   80/40 fields, 32 channels, 256 train, 1024 output\n\n\
+           s25-fast      48/24 fields, 16 channels, 96/80x3 model, 128 train\n\
+           s25-balanced  64/32 fields, 24 channels, 128/128x4 model, 192 train\n\
+           s25-quality   80/40 fields, 32 channels, 192/160x5 model, 256 train\n\n\
          Style bases (all individual gains remain overrideable):\n\
            alien-fluid      complex-phase dominant, flowing organic forms\n\
            fractal-flame    stronger stable IFS geometry and phase color\n\
@@ -897,6 +902,10 @@ mod tests {
             output_resolution: 1024,
             ..base.clone()
         };
+        let changed_preview = RunConfig {
+            snapshot_resolution: 512,
+            ..base.clone()
+        };
         assert_ne!(
             base.checkpoint_signature(),
             changed_dt.checkpoint_signature()
@@ -904,6 +913,10 @@ mod tests {
         assert_eq!(
             base.checkpoint_signature(),
             changed_output.checkpoint_signature()
+        );
+        assert_eq!(
+            base.checkpoint_signature(),
+            changed_preview.checkpoint_signature()
         );
     }
 }

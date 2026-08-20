@@ -1,8 +1,8 @@
-# TITAN Image Ecosystem v5
+# TITAN Image Ecosystem v6
 
 TITAN Image is a phone-first laboratory for trainable morphogenic image dynamics. It combines a multirate neural cellular automaton (NCA), independently switchable mathematical operators, a lightweight periodic implicit renderer, persistent optimization, and deterministic genome interpolation. Its intended target is the Snapdragon 8 Elite in the Galaxy S25 Ultra running natively in Termux.
 
-v5 is intentionally incompatible with every earlier image checkpoint. The v4 files under `/sdcard/Download/titan_image_v4` remain untouched; v5 defaults to `/sdcard/Download/titan_image_v5` and writes only `v5` artifacts.
+v6 is intentionally incompatible with earlier image checkpoints. The successful v5 files under `/sdcard/Download/titan_image_v5` remain untouched; v6 defaults to `/sdcard/Download/titan_image_v6` and writes only `v6` artifacts. The balanced v6 network has 172,595 learned parameters, 2.06x v5's 83,831, without doubling the recurrent grids or differentiable render resolution.
 
 ## Start here
 
@@ -12,19 +12,21 @@ Build once:
 cargo build --release --locked
 ```
 
-Then start a new balanced fractal organism with this copy-pasteable command:
+The checked-in AArch64 build configuration supplies `target-cpu=native` and `+fp16`, so this command targets the actual phone CPU rather than a generic AArch64 baseline.
+
+Then start a new balanced alien-fluid organism with this copy-pasteable command:
 
 ```sh
 ./target/release/titan_image \
   --fresh \
   --corpus-dir /sdcard/Download/titan_image_sources \
-  --output-dir /sdcard/Download/titan_image_v5 \
+  --output-dir /sdcard/Download/titan_image_v6 \
   --profile s25-balanced \
-  --style fractal-flame \
+  --style alien-fluid \
   --mode texture \
   --steps 1600 \
   --threads 8 \
-  --run-tag fractal-v5-01
+  --run-tag alien-dynamics-v6-01
 ```
 
 `--fresh` is for the first invocation of a tag. `--steps` means additional development steps, not a final absolute step.
@@ -34,18 +36,32 @@ Continue the exact organism by repeating its training/architecture options witho
 ```sh
 ./target/release/titan_image \
   --corpus-dir /sdcard/Download/titan_image_sources \
-  --output-dir /sdcard/Download/titan_image_v5 \
+  --output-dir /sdcard/Download/titan_image_v6 \
   --profile s25-balanced \
-  --style fractal-flame \
+  --style alien-fluid \
   --mode texture \
   --steps 1600 \
   --threads 8 \
-  --run-tag fractal-v5-01
+  --run-tag alien-dynamics-v6-01
 ```
 
 The loader verifies schema, model/world/optimizer generation, every evolution and loss setting, tensor shapes, world step, and a content hash of the sorted corpus. Renaming a source does not change its genome; changing its bytes does invalidate exact continuation.
 
-## What changed from v4
+Ctrl-C is cooperative: it finishes the active optimizer window, flushes metrics, atomically saves model/world/optimizer state, renders the final image and atlases, writes metadata with `interrupted: true`, and then exits successfully. A stop during gallery generation finishes the active variant and publishes a contact sheet for completed variants.
+
+Periodic previews default to a nominal 50-step cadence. They are written at the first safe optimizer-window boundary at or after each nominal point (for the default BPTT of four: step 52, 100, 152, 200, ...). Balanced previews are 384px while final/gallery output remains 768px, cutting preview pixel work to one quarter of a full render.
+
+## What changed from v5
+
+- Approximately doubled learned capacity in every phone profile: fast 2.01x, balanced 2.06x, and quality 2.10x.
+- Cooperative Ctrl-C/SIGINT handling and truthful interrupted/completed-step metadata.
+- Nominal 50-step low-resolution previews with episode, organism age, and target index in each filename.
+- Separate micro/macro movement, RMS, mean-absolute state, near-bound occupancy, and per-channel RMS range.
+- Image-space temporal deltas, size-normalized gradient RMS, and updated parameter counts in every optimizer-window row.
+- Global gradient clipping raised from 1.0 to 1.5 to preserve approximately the v5 per-parameter clipping pressure after the 2.06x balanced capacity increase; learning rate and dynamics gains remain unchanged pending a real v6 trajectory.
+- Corpus index/name/fingerprint mapping in metadata, exact-duplicate warnings, gallery progress, and build rustflags in provenance.
+
+## v5 foundation retained from v4
 
 - Runtime-selectable micro/macro sizes, channels, genome width, NCA width, renderer width/depth, and coordinate bands.
 - Near and dilation-2 perception rings, inspired by TITAN Audio v9's local/far communication, rather than a single local ring.
@@ -64,7 +80,7 @@ The v4 long run is useful negative evidence. Its final raw image had strong fixe
 
 ## Architecture
 
-The balanced profile evolves a 24-channel `64x64` micro field every step and a `32x32` macro field every fourth step. Each NCA reads fixed identity/Sobel/Laplacian features at radius 1 and dilation 2, the macro context, and an eight-dimensional content-keyed genome. Two pointwise Swish layers mix those features before a zero-initialized update head and deterministic asynchronous cell clock.
+The balanced profile evolves a 24-channel `64x64` micro field every step and a `32x32` macro field every fourth step. Each NCA reads fixed identity/Sobel/Laplacian features at radius 1 and dilation 2, the macro context, and an eight-dimensional content-keyed genome. Two 128-wide pointwise Swish layers mix those features before a zero-initialized update head and deterministic asynchronous cell clock. The periodic renderer uses four 128-wide residual blocks.
 
 Five separately weighted contributions form the derivative:
 
@@ -82,15 +98,15 @@ The authoritative equations, stability boundaries, and non-claims are in [math.m
 
 ## S25 Ultra profiles
 
-| Profile | Fields | Channels | NCA / renderer | Train / output | Core cadence | Observed role |
-|---|---:|---:|---:|---:|---:|---|
-| `s25-fast` | 48 / 24 | 16 | 64 / 48x2 | 128 / 512 | 1 in 8 windows | rapid style and seed search |
-| `s25-balanced` | 64 / 32 | 24 | 96 / 64x3 | 192 / 768 | 1 in 4 windows | recommended sustained run |
-| `s25-quality` | 80 / 40 | 32 | 128 / 96x4 | 256 / 1024 | 1 in 2 windows | slower, memory-heavy refinement |
+| Profile | Fields | Channels | NCA / renderer | Parameters | Train / preview / output | Core cadence | Role |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `s25-fast` | 48 / 24 | 16 | 96 / 80x3 | 74,483 | 128 / 256 / 512 | 1 in 8 windows | rapid style and seed search |
+| `s25-balanced` | 64 / 32 | 24 | 128 / 128x4 | 172,595 | 192 / 384 / 768 | 1 in 4 windows | recommended sustained run |
+| `s25-quality` | 80 / 40 | 32 | 192 / 160x5 | 346,851 | 256 / 512 / 1024 | 1 in 2 windows | slower, memory-heavy refinement |
 
 Profiles are bases. Explicit flags override them regardless of argument order, so `--profile s25-fast --output-resolution 1024` keeps fast training but performs a larger final render.
 
-The actual S25 can expose fewer cores after thermal or Android cpuset changes. v5 clamps the requested count to `available_parallelism()` and records both requested and effective values. In a short local sweep at 128px, eight effective threads beat seven and four; use `--threads 8` for a foreground run and try 4–6 when responsiveness, background survival, or thermal stability matters more than cold-start speed.
+The actual S25 can expose fewer cores after thermal or Android cpuset changes. v6 clamps the requested count to `available_parallelism()` and records both requested and effective values. In a short v5 sweep at 128px, eight effective threads beat seven and four; use `--threads 8` for a foreground run and try 4–6 when responsiveness, background survival, or thermal stability matters more than cold-start speed.
 
 Measured on this checkout before the final documentation commit:
 
@@ -101,7 +117,7 @@ Measured on this checkout before the final documentation commit:
 | v5 fast thread sweep | 32 steps, 128px, 8 effective threads | 3.31 s | about 244 MiB |
 | v5 balanced smoke | 16 steps, 192px, 8 effective threads | 5.12 s | about 719 MiB |
 
-These are short on-device observations, not universal constants or a controlled thermal benchmark. v5 does more spatial supervision and has more parameters, so the v4/v5 row is an end-to-end workflow comparison rather than an isolated kernel speedup. Use the metadata phase profile after a thermal soak for decisions about a long run.
+These are historical v5 observations, not v6 claims, universal constants, or a controlled thermal benchmark. Use v6 metadata and the per-window timing trace after a thermal soak before changing thread count or resolution.
 
 ## Style bases
 
@@ -121,21 +137,21 @@ Suggested first experiments:
 # Fast alien search
 ./target/release/titan_image --fresh \
   --corpus-dir /sdcard/Download/titan_image_sources \
-  --output-dir /sdcard/Download/titan_image_v5 \
+  --output-dir /sdcard/Download/titan_image_v6 \
   --profile s25-fast --style alien-fluid --mode texture \
   --steps 800 --threads 8 --gallery 9 --run-tag alien-search-01
 
 # Reaction-diffusion emphasis
 ./target/release/titan_image --fresh \
   --corpus-dir /sdcard/Download/titan_image_sources \
-  --output-dir /sdcard/Download/titan_image_v5 \
+  --output-dir /sdcard/Download/titan_image_v6 \
   --profile s25-balanced --style reaction-garden --mode texture \
-  --steps 1600 --threads 8 --run-tag reaction-v5-01
+  --steps 1600 --threads 8 --run-tag reaction-v6-01
 
 # Matched pure-learned control
 ./target/release/titan_image --fresh \
   --corpus-dir /sdcard/Download/titan_image_sources \
-  --output-dir /sdcard/Download/titan_image_v5 \
+  --output-dir /sdcard/Download/titan_image_v6 \
   --profile s25-fast --style pure-nca --mode texture \
   --steps 800 --threads 8 --run-tag pure-control-01
 ```
@@ -158,7 +174,7 @@ Use the exact architecture/training settings and corpus of the checkpoint, add `
 ./target/release/titan_image \
   --render-only \
   --corpus-dir /sdcard/Download/titan_image_sources \
-  --output-dir /sdcard/Download/titan_image_v5 \
+  --output-dir /sdcard/Download/titan_image_v6 \
   --profile s25-balanced \
   --style fractal-flame \
   --mode texture \
@@ -167,7 +183,7 @@ Use the exact architecture/training settings and corpus of the checkpoint, add `
   --gallery 9 \
   --gallery-steps 64 \
   --gallery-stride 16 \
-  --run-tag fractal-v5-01
+  --run-tag fractal-v6-01
 ```
 
 Gallery genomes interpolate two corpus genomes and add a small bounded mutation. Every variant starts from a deterministic fresh world and develops for `gallery_steps + variant_index * gallery_stride`, so the contact sheet samples both style space and developmental age. Render-only writes separate render metadata and does not modify model, optimizer, or world checkpoints.
@@ -189,21 +205,21 @@ Gallery genomes interpolate two corpus genomes and add a small bounded mutation.
 
 ## Artifacts
 
-With `--run-tag fractal-v5-01`, the output directory contains:
+With `--run-tag fractal-v6-01`, the output directory contains:
 
-- `titan_image_model_v5_fractal-v5-01.safetensors`
-- `titan_image_optimizer_v5_fractal-v5-01.safetensors`
-- `titan_image_world_v5_fractal-v5-01.safetensors`
-- `titan_image_checkpoint_v5_fractal-v5-01.json`
-- `titan_image_metrics_v5_fractal-v5-01.csv`
-- `titan_image_run_metadata_v5_fractal-v5-01.json`
-- `titan_image_render_metadata_v5_fractal-v5-01.json` after render-only use
-- `titan_image_raw_v5_fractal-v5-01.png`
-- `titan_image_mastered_v5_fractal-v5-01.png`
-- `titan_image_micro_state_v5_fractal-v5-01.png`
-- `titan_image_macro_state_v5_fractal-v5-01.png`
-- numbered raw/mastered variant PNGs and `titan_image_gallery_v5_fractal-v5-01.png`
-- periodic `titan_image_snapshot_v5_fractal-v5-01_*.png` files when enabled
+- `titan_image_model_v6_fractal-v6-01.safetensors`
+- `titan_image_optimizer_v6_fractal-v6-01.safetensors`
+- `titan_image_world_v6_fractal-v6-01.safetensors`
+- `titan_image_checkpoint_v6_fractal-v6-01.json`
+- `titan_image_metrics_v6_fractal-v6-01.csv`
+- `titan_image_run_metadata_v6_fractal-v6-01.json`
+- `titan_image_render_metadata_v6_fractal-v6-01.json` after render-only use
+- `titan_image_raw_v6_fractal-v6-01.png`
+- `titan_image_mastered_v6_fractal-v6-01.png`
+- `titan_image_micro_state_v6_fractal-v6-01.png`
+- `titan_image_macro_state_v6_fractal-v6-01.png`
+- numbered raw/mastered variant PNGs and `titan_image_gallery_v6_fractal-v6-01.png`
+- periodic `titan_image_snapshot_v6_fractal-v6-01_*.png` files when enabled
 
 Raw images are architectural evidence. Mastered images apply toroidal local contrast, bloom, and a shoulder. State atlases normalize every channel independently and are diagnostic maps, not comparable color values or artworks.
 

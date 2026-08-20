@@ -22,7 +22,8 @@ pub struct DynamicsSystem {
 
 pub struct StepOutput {
     pub world: WorldState,
-    pub movement: f32,
+    pub micro_movement: f32,
+    pub macro_movement: f32,
     pub macro_updated: bool,
 }
 
@@ -83,7 +84,12 @@ impl DynamicsSystem {
             FieldScale::Micro,
             tracked,
         )?;
-        let movement = mean_abs(&next_micro.sub(&world.micro)?)?;
+        let micro_movement = mean_abs(&next_micro.sub(&world.micro)?)?;
+        let macro_movement = if macro_updated {
+            mean_abs(&next_macro.sub(&world.macro_field)?)?
+        } else {
+            0.0
+        };
         Ok(StepOutput {
             world: WorldState {
                 micro: next_micro,
@@ -93,7 +99,8 @@ impl DynamicsSystem {
                 episode: world.episode,
                 target_index: world.target_index,
             },
-            movement,
+            micro_movement,
+            macro_movement,
             macro_updated,
         })
     }
@@ -209,7 +216,8 @@ mod tests {
         let output = system.step(&world, &genome, true)?;
         assert_eq!(output.world.micro.dims4()?, (1, 12, 32, 32));
         assert_eq!(output.world.macro_field.dims4()?, (1, 12, 16, 16));
-        assert!(output.movement.is_finite());
+        assert!(output.micro_movement.is_finite());
+        assert!(output.macro_movement.is_finite());
         Ok(())
     }
 }

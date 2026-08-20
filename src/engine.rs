@@ -1,7 +1,7 @@
 use crate::config::{RunConfig, SCHEMA_VERSION};
-use crate::corpus::{ImageCorpus, TargetSample};
+use crate::corpus::{CorpusSourceMetadata, ImageCorpus, TargetSample};
 use crate::dynamics::DynamicsSystem;
-use crate::metrics::{image_metrics, tensor_rms, MetricRecord};
+use crate::metrics::{image_metrics, state_metrics, tensor_rms, MetricRecord, StateDiagnostics};
 use crate::objectives::{visual_loss, LossOutput};
 use crate::optimizer::{OptimizerStats, PersistentAdamW};
 use crate::persistence::{load_checkpoint, save_checkpoint, write_json_atomic, ArtifactPaths};
@@ -9,7 +9,7 @@ use crate::render::{
     save_contact_sheet, save_mastered_png, save_png, save_state_atlas, ImplicitRenderer, RenderPlan,
 };
 use crate::state::WorldState;
-use crate::tensor_ops::splitmix64;
+use crate::tensor_ops::{mean_abs, splitmix64};
 use anyhow::{bail, Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
@@ -19,7 +19,12 @@ use serde::Serialize;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+static INTERRUPT_HANDLER: OnceLock<std::result::Result<(), String>> = OnceLock::new();
 
 #[derive(Default, Clone, Serialize)]
 struct PhaseSeconds {
@@ -41,6 +46,7 @@ struct BuildProvenance {
     dirty: bool,
     release: bool,
     target_arch: &'static str,
+    rustflags: &'static str,
 }
 
 #[derive(Serialize)]
@@ -54,9 +60,13 @@ struct RunMetadata<'a> {
     effective_threads: usize,
     source_images: usize,
     cached_source_images: usize,
+    corpus_sources: Vec<CorpusSourceMetadata>,
     corpus_fingerprint: String,
     config_signature: String,
     parameter_count: usize,
+    requested_development_steps: usize,
+    completed_development_steps: u64,
+    interrupted: bool,
     resumed: bool,
     render_only: bool,
     metrics_continued: bool,
@@ -65,9 +75,12 @@ struct RunMetadata<'a> {
     completed_world_step: u64,
     optimizer_updates_start: u64,
     optimizer_updates_end: u64,
-    optimizer_windows: usize,
+    optimizer_windows_requested: usize,
+    optimizer_windows_completed: usize,
     full_core_windows: usize,
     decoder_only_windows: usize,
+    gallery_requested: usize,
+    gallery_completed: usize,
     final_target: &'a str,
     peak_rss_kib: Option<u64>,
     phase_seconds: PhaseSeconds,
@@ -78,6 +91,7 @@ struct RunMetadata<'a> {
 
 pub fn run(config: RunConfig) -> Result<()> {
     config.validate()?;
+    install_interrupt_handler()?;
     let available_threads = std::thread::available_parallelism()
         .map(|count| count.get())
         .unwrap_or(1);
@@ -105,24 +119,18 @@ pub fn run(config: RunConfig) -> Result<()> {
     let renderer = ImplicitRenderer::new(&config, builder.pp("renderer"))?;
     deterministic_initialize(&vars, config.seed)?;
     let mut optimizer = PersistentAdamW::new(&vars, &config)?;
-    let parameter_count = vars
-        .data()
-        .lock()
-        .expect("VarMap mutex poisoned")
-        .values()
-        .map(|variable| variable.elem_count())
-        .sum();
+    let parameter_count = learned_parameter_count(&vars);
 
     if config.render_only && !paths.checkpoint_complete() {
         bail!(
-            "--render-only requires a complete v5 checkpoint for this output directory and run tag"
+            "--render-only requires a complete v6 checkpoint for this output directory and run tag"
         );
     }
 
     let checkpoint_available = paths.checkpoint_complete();
     if !config.fresh && paths.checkpoint_exists() && !checkpoint_available {
         bail!(
-            "partial v5 checkpoint set in {}; use --fresh or restore all checkpoint files",
+            "partial v6 checkpoint set in {}; use --fresh or restore all checkpoint files",
             config.output_dir.display()
         );
     }
@@ -182,7 +190,7 @@ pub fn run(config: RunConfig) -> Result<()> {
     };
 
     println!(
-        "TITAN Image v5: {} source image(s), {} cached, {} parameters, {} at world step {}",
+        "TITAN Image v6: {} source image(s), {} cached, {} parameters, {} at world step {}",
         corpus.len(),
         corpus.cached_images(),
         parameter_count,
@@ -194,7 +202,7 @@ pub fn run(config: RunConfig) -> Result<()> {
         world.step
     );
     println!(
-        "Profile {:?} / {:?}: {} threads, {}ch {}x{} + {}x{}, train {}px, endpoint loss every {} steps",
+        "Profile {:?} / {:?}: {} threads, {}ch {}x{} + {}x{}, train {}px, preview {}px every ~{} steps, endpoint loss every {} steps",
         config.profile,
         config.style,
         effective_threads,
@@ -204,14 +212,18 @@ pub fn run(config: RunConfig) -> Result<()> {
         config.macro_size,
         config.macro_size,
         config.train_resolution,
+        config.snapshot_resolution,
+        config.snapshot_every,
         config.bptt,
     );
+    println!("Ctrl-C finishes the active optimizer window, saves a checkpoint, and publishes final metadata.");
 
     let train_plan = if config.render_only {
         None
     } else {
         Some(RenderPlan::new(&config, config.train_resolution, &device)?)
     };
+    let mut snapshot_plan: Option<RenderPlan> = None;
     let mut output_plan: Option<RenderPlan> = None;
     let optimizer_windows = if config.render_only {
         0
@@ -220,9 +232,19 @@ pub fn run(config: RunConfig) -> Result<()> {
     };
     let mut full_core_windows = 0usize;
     let mut decoder_only_windows = 0usize;
+    let mut interrupted = false;
+    let mut previous_image: Option<Tensor> = None;
 
     for local_window in 0..optimizer_windows {
+        if stop_requested() {
+            interrupted = true;
+            println!(
+                "\nStop requested before the next optimizer window; saving the current organism."
+            );
+            break;
+        }
         let window_started = Instant::now();
+        let window_start_step = world.step;
         select_episode_if_needed(
             &config,
             &mut corpus,
@@ -231,6 +253,7 @@ pub fn run(config: RunConfig) -> Result<()> {
             &mut sample,
             metrics_writer.as_mut(),
         )?;
+        let episode_started = world.age == 0;
         let window_index = world.step / config.bptt as u64;
         let train_core = window_index.is_multiple_of(config.core_update_every as u64);
         if train_core {
@@ -239,8 +262,10 @@ pub fn run(config: RunConfig) -> Result<()> {
             decoder_only_windows += 1;
         }
 
-        let mut movement_sum = 0.0f32;
-        let mut movement_max = 0.0f32;
+        let mut micro_movement_sum = 0.0f32;
+        let mut micro_movement_max = 0.0f32;
+        let mut macro_movement_sum = 0.0f32;
+        let mut macro_movement_max = 0.0f32;
         let mut macro_updates = 0usize;
         for _ in 0..config.bptt {
             let tick = Instant::now();
@@ -250,8 +275,10 @@ pub fn run(config: RunConfig) -> Result<()> {
             } else {
                 phase.detached_dynamics += seconds(tick.elapsed());
             }
-            movement_sum += stepped.movement;
-            movement_max = movement_max.max(stepped.movement);
+            micro_movement_sum += stepped.micro_movement;
+            micro_movement_max = micro_movement_max.max(stepped.micro_movement);
+            macro_movement_sum += stepped.macro_movement;
+            macro_movement_max = macro_movement_max.max(stepped.macro_movement);
             macro_updates += usize::from(stepped.macro_updated);
             world = stepped.world;
         }
@@ -275,16 +302,36 @@ pub fn run(config: RunConfig) -> Result<()> {
 
         let tick = Instant::now();
         let diagnostics = image_metrics(&rendered.image.detach())?;
-        let state_rms = tensor_rms(&world.micro)?;
+        let micro_state = state_metrics(&world.micro, config.state_limit)?;
+        let macro_state = state_metrics(&world.macro_field, config.state_limit)?;
+        let (image_delta_valid, image_delta_mean, image_delta_rms) =
+            if let Some(previous) = previous_image.as_ref() {
+                let delta = rendered.image.detach().sub(previous)?;
+                (true, mean_abs(&delta)?, tensor_rms(&delta)?)
+            } else {
+                (false, 0.0, 0.0)
+            };
+        previous_image = Some(rendered.image.detach());
         let record = metric_record(
             &world,
             &sample,
             optimizer.updates(),
             train_core,
             macro_updates,
-            movement_sum / config.bptt as f32,
-            movement_max,
-            state_rms,
+            episode_started,
+            micro_movement_sum / config.bptt as f32,
+            micro_movement_max,
+            if macro_updates > 0 {
+                macro_movement_sum / macro_updates as f32
+            } else {
+                0.0
+            },
+            macro_movement_max,
+            &micro_state,
+            &macro_state,
+            image_delta_valid,
+            image_delta_mean,
+            image_delta_rms,
             &diagnostics,
             loss_values,
             &optimizer_stats,
@@ -299,31 +346,54 @@ pub fn run(config: RunConfig) -> Result<()> {
             || local_window + 1 == optimizer_windows
         {
             println!(
-                "step {:>7} | {} | loss {:.5} structure {:.5} | move {:.5} state {:.3} | grad {:.3} clip {:.3} | {:.1} ms/window",
+                "step {:>7} ep {:>3} age {:>3} | {} | loss {:.5} structure {:.5} | move u/m {:.5}/{:.5} | state u/m {:.3}/{:.3} clamp {:.3}/{:.3} | image-delta {:.4} | grad-rms {:.5} clip {:.3} | {:.1} ms/window",
                 world.step,
+                world.episode,
+                world.age,
                 if train_core { "core" } else { "decode" },
                 record.loss_total,
                 record.loss_structure,
-                record.movement_mean,
-                record.state_rms,
-                record.gradient_norm,
+                record.micro_movement_mean,
+                record.macro_movement_mean,
+                record.micro_state_rms,
+                record.macro_state_rms,
+                record.micro_clamp_fraction,
+                record.macro_clamp_fraction,
+                record.image_delta_mean,
+                record.gradient_rms,
                 record.gradient_clip_scale,
                 1000.0 * record.window_seconds,
             );
         }
         phase.metrics_and_logging += seconds(tick.elapsed());
 
-        if config.snapshot_every > 0 && world.step % config.snapshot_every as u64 == 0 {
+        if stop_requested() {
+            interrupted = true;
+            println!(
+                "\nStop requested: completed optimizer window at step {}; saving the organism.",
+                world.step
+            );
+            break;
+        }
+
+        if cadence_due(window_start_step, world.step, config.snapshot_every) {
             let tick = Instant::now();
-            ensure_output_plan(&config, &device, &mut output_plan)?;
+            ensure_render_plan(
+                &config,
+                config.snapshot_resolution,
+                &device,
+                &mut snapshot_plan,
+            )?;
             let snapshot = renderer.render(
                 &world.micro,
                 &world.macro_field,
                 &sample.genome_tensor,
-                output_plan.as_ref().expect("output plan initialized"),
+                snapshot_plan.as_ref().expect("snapshot plan initialized"),
                 false,
             )?;
-            save_png(&snapshot.image, &snapshot_path(&config, world.step))?;
+            let path = snapshot_path(&config, &world);
+            save_png(&snapshot.image, &path)?;
+            println!("preview step {} -> {}", world.step, path.display());
             phase.output_rendering += seconds(tick.elapsed());
         }
         if config.checkpoint_every > 0 && world.step % config.checkpoint_every as u64 == 0 {
@@ -359,7 +429,11 @@ pub fn run(config: RunConfig) -> Result<()> {
     }
 
     let output_tick = Instant::now();
-    ensure_output_plan(&config, &device, &mut output_plan)?;
+    println!(
+        "Rendering final raw/mastered output at {}px...",
+        config.output_resolution
+    );
+    ensure_render_plan(&config, config.output_resolution, &device, &mut output_plan)?;
     let final_render = renderer.render(
         &world.micro.detach(),
         &world.macro_field.detach(),
@@ -378,12 +452,14 @@ pub fn run(config: RunConfig) -> Result<()> {
         paths.mastered.display().to_string(),
     ];
     if config.save_state_atlas {
+        println!("Writing micro/macro state atlases...");
         save_state_atlas(&world.micro, &paths.micro_state)?;
         save_state_atlas(&world.macro_field, &paths.macro_state)?;
         outputs.push(paths.micro_state.display().to_string());
         outputs.push(paths.macro_state.display().to_string());
     }
-    let gallery_outputs = render_gallery(
+    interrupted |= stop_requested();
+    let (gallery_outputs, gallery_interrupted) = render_gallery(
         &config,
         &corpus,
         &dynamics,
@@ -391,6 +467,8 @@ pub fn run(config: RunConfig) -> Result<()> {
         output_plan.as_ref().expect("output plan initialized"),
         &device,
     )?;
+    interrupted |= gallery_interrupted || stop_requested();
+    let gallery_completed = gallery_outputs.len() / 2;
     if !gallery_outputs.is_empty() {
         let mastered: Vec<PathBuf> = gallery_outputs
             .iter()
@@ -418,15 +496,20 @@ pub fn run(config: RunConfig) -> Result<()> {
             dirty: env!("TITAN_BUILD_DIRTY") == "true",
             release: !cfg!(debug_assertions),
             target_arch: std::env::consts::ARCH,
+            rustflags: env!("TITAN_BUILD_RUSTFLAGS"),
         },
         invocation: std::env::args().collect(),
         config: &config,
         effective_threads,
         source_images: corpus.len(),
         cached_source_images: corpus.cached_images(),
+        corpus_sources: corpus.source_manifest(),
         corpus_fingerprint: format!("{:016x}", corpus.fingerprint()),
         config_signature: format!("{:016x}", config.checkpoint_signature()),
         parameter_count,
+        requested_development_steps: config.steps,
+        completed_development_steps: completed_steps,
+        interrupted,
         resumed,
         render_only: config.render_only,
         metrics_continued,
@@ -435,9 +518,12 @@ pub fn run(config: RunConfig) -> Result<()> {
         completed_world_step: world.step,
         optimizer_updates_start,
         optimizer_updates_end: optimizer.updates(),
-        optimizer_windows,
+        optimizer_windows_requested: optimizer_windows,
+        optimizer_windows_completed: full_core_windows + decoder_only_windows,
         full_core_windows,
         decoder_only_windows,
+        gallery_requested: config.gallery,
+        gallery_completed,
         final_target: &sample.name,
         peak_rss_kib: peak_rss_kib(),
         phase_seconds: phase.clone(),
@@ -462,13 +548,18 @@ pub fn run(config: RunConfig) -> Result<()> {
     };
     write_json_atomic(metadata_path, &metadata)?;
     println!(
-        "Finished at world step {} in {:.2}s. Raw: {}  Mastered: {}",
+        "{} at world step {} in {:.2}s. Raw: {}  Mastered: {}",
+        if interrupted {
+            "Stopped safely"
+        } else {
+            "Finished"
+        },
         world.step,
         phase.total,
         paths.raw.display(),
         paths.mastered.display()
     );
-    if config.gallery > 0 {
+    if gallery_completed > 0 {
         println!("Gallery: {}", paths.gallery.display());
     }
     Ok(())
@@ -503,9 +594,16 @@ fn metric_record(
     optimizer_update: u64,
     core_trained: bool,
     macro_updates: usize,
-    movement_mean: f32,
-    movement_max: f32,
-    state_rms: f32,
+    episode_started: bool,
+    micro_movement_mean: f32,
+    micro_movement_max: f32,
+    macro_movement_mean: f32,
+    macro_movement_max: f32,
+    micro_state: &StateDiagnostics,
+    macro_state: &StateDiagnostics,
+    image_delta_valid: bool,
+    image_delta_mean: f32,
+    image_delta_rms: f32,
     image: &crate::metrics::ImageDiagnostics,
     loss: [f32; 6],
     optimizer: &OptimizerStats,
@@ -519,9 +617,24 @@ fn metric_record(
         optimizer_update,
         core_trained,
         macro_updates,
-        movement_mean,
-        movement_max,
-        state_rms,
+        episode_started,
+        micro_movement_mean,
+        micro_movement_max,
+        macro_movement_mean,
+        macro_movement_max,
+        micro_state_rms: micro_state.rms,
+        macro_state_rms: macro_state.rms,
+        micro_state_mean_abs: micro_state.mean_abs,
+        macro_state_mean_abs: macro_state.mean_abs,
+        micro_clamp_fraction: micro_state.clamp_fraction,
+        macro_clamp_fraction: macro_state.clamp_fraction,
+        micro_channel_rms_min: micro_state.channel_rms_min,
+        micro_channel_rms_max: micro_state.channel_rms_max,
+        macro_channel_rms_min: macro_state.channel_rms_min,
+        macro_channel_rms_max: macro_state.channel_rms_max,
+        image_delta_valid,
+        image_delta_mean,
+        image_delta_rms,
         image_variance: image.variance,
         seam_energy: image.seam,
         edge_energy: image.edge,
@@ -542,7 +655,10 @@ fn metric_record(
         loss_seam: loss[4],
         loss_gamut: loss[5],
         gradient_norm: optimizer.gradient_norm,
+        gradient_rms: optimizer.gradient_rms,
         gradient_clip_scale: optimizer.clip_scale,
+        updated_variables: optimizer.updated_variables,
+        updated_parameters: optimizer.updated_parameters,
         effective_learning_rate: optimizer.effective_learning_rate,
         window_seconds,
     }
@@ -564,13 +680,14 @@ fn loss_scalars(loss: &LossOutput) -> Result<[f32; 6]> {
     Ok(values.try_into().expect("six loss tensors were stacked"))
 }
 
-fn ensure_output_plan(
+fn ensure_render_plan(
     config: &RunConfig,
+    resolution: usize,
     device: &Device,
     plan: &mut Option<RenderPlan>,
 ) -> Result<()> {
     if plan.is_none() {
-        *plan = Some(RenderPlan::new(config, config.output_resolution, device)?);
+        *plan = Some(RenderPlan::new(config, resolution, device)?);
     }
     Ok(())
 }
@@ -582,9 +699,23 @@ fn render_gallery(
     renderer: &ImplicitRenderer,
     plan: &RenderPlan,
     device: &Device,
-) -> Result<Vec<PathBuf>> {
+) -> Result<(Vec<PathBuf>, bool)> {
     let mut outputs = Vec::with_capacity(config.gallery * 2);
     for variant in 0..config.gallery {
+        if stop_requested() {
+            println!(
+                "Stop requested before gallery variant {}/{}; publishing completed outputs.",
+                variant + 1,
+                config.gallery
+            );
+            return Ok((outputs, true));
+        }
+        println!(
+            "Rendering gallery variant {}/{} ({} development steps)...",
+            variant + 1,
+            config.gallery,
+            config.gallery_steps + variant * config.gallery_stride
+        );
         let genome = corpus.gallery_genome(variant, config.gallery_seed);
         let genome_tensor = Tensor::from_vec(genome, config.genome_dim, device)?;
         let variant_seed = splitmix64(config.seed ^ config.gallery_seed ^ variant as u64);
@@ -607,7 +738,7 @@ fn render_gallery(
         outputs.push(raw);
         outputs.push(mastered);
     }
-    Ok(outputs)
+    Ok((outputs, stop_requested()))
 }
 
 fn deterministic_initialize(varmap: &VarMap, seed: u64) -> Result<()> {
@@ -647,6 +778,16 @@ fn deterministic_initialize(varmap: &VarMap, seed: u64) -> Result<()> {
     Ok(())
 }
 
+fn learned_parameter_count(varmap: &VarMap) -> usize {
+    varmap
+        .data()
+        .lock()
+        .expect("VarMap mutex poisoned")
+        .values()
+        .map(|variable| variable.elem_count())
+        .sum()
+}
+
 fn parameter_seed(seed: u64, name: &str) -> u64 {
     name.bytes()
         .fold(seed ^ 0xcbf2_9ce4_8422_2325, |hash, byte| {
@@ -673,6 +814,25 @@ fn seconds(duration: Duration) -> f64 {
     duration.as_secs_f64()
 }
 
+fn install_interrupt_handler() -> Result<()> {
+    STOP_REQUESTED.store(false, Ordering::SeqCst);
+    match INTERRUPT_HANDLER.get_or_init(|| {
+        ctrlc::set_handler(|| STOP_REQUESTED.store(true, Ordering::SeqCst))
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(()) => Ok(()),
+        Err(error) => bail!("cannot install Ctrl-C handler: {error}"),
+    }
+}
+
+fn stop_requested() -> bool {
+    STOP_REQUESTED.load(Ordering::SeqCst)
+}
+
+fn cadence_due(previous_step: u64, current_step: u64, cadence: usize) -> bool {
+    cadence > 0 && previous_step / (cadence as u64) < current_step / (cadence as u64)
+}
+
 fn run_id() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -694,16 +854,20 @@ fn peak_rss_kib() -> Option<u64> {
     None
 }
 
-fn snapshot_path(config: &RunConfig, step: u64) -> PathBuf {
+fn snapshot_path(config: &RunConfig, world: &WorldState) -> PathBuf {
     config.output_dir.join(format!(
-        "titan_image_snapshot_v5{}_{step:09}.png",
-        config.suffix()
+        "titan_image_snapshot_v6{}_{:09}_ep{:05}_age{:04}_target{:04}.png",
+        config.suffix(),
+        world.step,
+        world.episode,
+        world.age,
+        world.target_index,
     ))
 }
 
 fn gallery_path(config: &RunConfig, variant: usize, mastered: bool) -> PathBuf {
     config.output_dir.join(format!(
-        "titan_image_variant_v5{}_{:03}_{}.png",
+        "titan_image_variant_v6{}_{:03}_{}.png",
         config.suffix(),
         variant + 1,
         if mastered { "mastered" } else { "raw" }
@@ -747,7 +911,7 @@ mod tests {
     #[test]
     fn fresh_and_resumed_training_write_complete_artifacts() -> Result<()> {
         let root = std::env::temp_dir().join(format!(
-            "titan-image-v5-test-{}-{}",
+            "titan-image-v6-test-{}-{}",
             std::process::id(),
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
         ));
@@ -816,5 +980,28 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn balanced_profile_is_approximately_twice_v5_capacity() -> Result<()> {
+        let device = Device::Cpu;
+        let config = RunConfig::default();
+        let vars = VarMap::new();
+        let builder = VarBuilder::from_varmap(&vars, DType::F32, &device);
+        let _dynamics = DynamicsSystem::new(&config, builder.pp("dynamics"), &device)?;
+        let _renderer = ImplicitRenderer::new(&config, builder.pp("renderer"))?;
+        let count = learned_parameter_count(&vars);
+        assert_eq!(count, 172_595);
+        assert!((1.9..=2.2).contains(&(count as f64 / 83_831.0)));
+        Ok(())
+    }
+
+    #[test]
+    fn nominal_snapshot_cadence_uses_safe_window_boundaries() {
+        assert!(!cadence_due(48, 48, 50));
+        assert!(cadence_due(48, 52, 50));
+        assert!(cadence_due(96, 100, 50));
+        assert!(!cadence_due(100, 104, 50));
+        assert!(!cadence_due(48, 52, 0));
     }
 }

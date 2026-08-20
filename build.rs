@@ -20,4 +20,8 @@ fn main() {
         .unwrap_or(true);
     println!("cargo:rustc-env=TITAN_BUILD_COMMIT={commit}");
     println!("cargo:rustc-env=TITAN_BUILD_DIRTY={dirty}");
+    let rustflags = std::env::var("CARGO_ENCODED_RUSTFLAGS")
+        .unwrap_or_default()
+        .replace('\u{1f}', " ");
+    println!("cargo:rustc-env=TITAN_BUILD_RUSTFLAGS={rustflags}");
 }

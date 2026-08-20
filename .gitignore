@@ -4,3 +4,7 @@
 titan_image_*_v5*.json
 titan_image_*_v5*.csv
 titan_image_*_v5*.png
+titan_image_*_v6*.json
+titan_image_*_v6*.csv
+titan_image_*_v6*.png
+/analysis/

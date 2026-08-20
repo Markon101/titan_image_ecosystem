@@ -14,9 +14,24 @@ pub struct MetricRecord {
     pub optimizer_update: u64,
     pub core_trained: bool,
     pub macro_updates: usize,
-    pub movement_mean: f32,
-    pub movement_max: f32,
-    pub state_rms: f32,
+    pub episode_started: bool,
+    pub micro_movement_mean: f32,
+    pub micro_movement_max: f32,
+    pub macro_movement_mean: f32,
+    pub macro_movement_max: f32,
+    pub micro_state_rms: f32,
+    pub macro_state_rms: f32,
+    pub micro_state_mean_abs: f32,
+    pub macro_state_mean_abs: f32,
+    pub micro_clamp_fraction: f32,
+    pub macro_clamp_fraction: f32,
+    pub micro_channel_rms_min: f32,
+    pub micro_channel_rms_max: f32,
+    pub macro_channel_rms_min: f32,
+    pub macro_channel_rms_max: f32,
+    pub image_delta_valid: bool,
+    pub image_delta_mean: f32,
+    pub image_delta_rms: f32,
     pub image_variance: f32,
     pub seam_energy: f32,
     pub edge_energy: f32,
@@ -37,7 +52,10 @@ pub struct MetricRecord {
     pub loss_seam: f32,
     pub loss_gamut: f32,
     pub gradient_norm: f32,
+    pub gradient_rms: f32,
     pub gradient_clip_scale: f32,
+    pub updated_variables: usize,
+    pub updated_parameters: usize,
     pub effective_learning_rate: f64,
     pub window_seconds: f64,
 }
@@ -52,16 +70,25 @@ pub struct ImageDiagnostics {
     pub correlations: [f32; 3],
 }
 
+#[derive(Clone, Debug)]
+pub struct StateDiagnostics {
+    pub rms: f32,
+    pub mean_abs: f32,
+    pub clamp_fraction: f32,
+    pub channel_rms_min: f32,
+    pub channel_rms_max: f32,
+}
+
 impl MetricRecord {
     pub fn write_header(mut writer: impl Write) -> Result<()> {
-        writeln!(writer, "step,age,episode,target_index,optimizer_update,core_trained,macro_updates,movement_mean,movement_max,state_rms,image_variance,seam_energy,edge_energy,gamut_excess,red_mean,green_mean,blue_mean,red_variance,green_variance,blue_variance,rg_correlation,rb_correlation,gb_correlation,loss_total,loss_content,loss_palette,loss_structure,loss_seam,loss_gamut,gradient_norm,gradient_clip_scale,effective_learning_rate,window_seconds")?;
+        writeln!(writer, "step,age,episode,target_index,optimizer_update,core_trained,macro_updates,episode_started,micro_movement_mean,micro_movement_max,macro_movement_mean,macro_movement_max,micro_state_rms,macro_state_rms,micro_state_mean_abs,macro_state_mean_abs,micro_clamp_fraction,macro_clamp_fraction,micro_channel_rms_min,micro_channel_rms_max,macro_channel_rms_min,macro_channel_rms_max,image_delta_valid,image_delta_mean,image_delta_rms,image_variance,seam_energy,edge_energy,gamut_excess,red_mean,green_mean,blue_mean,red_variance,green_variance,blue_variance,rg_correlation,rb_correlation,gb_correlation,loss_total,loss_content,loss_palette,loss_structure,loss_seam,loss_gamut,gradient_norm,gradient_rms,gradient_clip_scale,updated_variables,updated_parameters,effective_learning_rate,window_seconds")?;
         Ok(())
     }
 
     pub fn write_csv(&self, mut writer: impl Write) -> Result<()> {
         writeln!(
             writer,
-            "{},{},{},{},{},{},{},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.9},{:.6}",
+            "{},{},{},{},{},{},{},{},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.9},{:.7},{},{},{:.9},{:.6}",
             self.step,
             self.age,
             self.episode,
@@ -69,9 +96,24 @@ impl MetricRecord {
             self.optimizer_update,
             self.core_trained,
             self.macro_updates,
-            self.movement_mean,
-            self.movement_max,
-            self.state_rms,
+            self.episode_started,
+            self.micro_movement_mean,
+            self.micro_movement_max,
+            self.macro_movement_mean,
+            self.macro_movement_max,
+            self.micro_state_rms,
+            self.macro_state_rms,
+            self.micro_state_mean_abs,
+            self.macro_state_mean_abs,
+            self.micro_clamp_fraction,
+            self.macro_clamp_fraction,
+            self.micro_channel_rms_min,
+            self.micro_channel_rms_max,
+            self.macro_channel_rms_min,
+            self.macro_channel_rms_max,
+            self.image_delta_valid,
+            self.image_delta_mean,
+            self.image_delta_rms,
             self.image_variance,
             self.seam_energy,
             self.edge_energy,
@@ -92,7 +134,10 @@ impl MetricRecord {
             self.loss_seam,
             self.loss_gamut,
             self.gradient_norm,
+            self.gradient_rms,
             self.gradient_clip_scale,
+            self.updated_variables,
+            self.updated_parameters,
             self.effective_learning_rate,
             self.window_seconds,
         )?;
@@ -158,4 +203,45 @@ pub fn image_metrics(image: &Tensor) -> candle_core::Result<ImageDiagnostics> {
 
 pub fn tensor_rms(tensor: &Tensor) -> candle_core::Result<f32> {
     tensor.sqr()?.mean_all()?.sqrt()?.to_scalar::<f32>()
+}
+
+pub fn state_metrics(tensor: &Tensor, state_limit: f32) -> candle_core::Result<StateDiagnostics> {
+    let (_, channels, height, width) = tensor.dims4()?;
+    let absolute = tensor.abs()?;
+    let threshold = state_limit * 0.99;
+    let clamp_fraction = absolute
+        .ge(threshold)?
+        .to_dtype(candle_core::DType::F32)?
+        .mean_all()?
+        .to_scalar::<f32>()?;
+    let channel_rms = tensor
+        .sqr()?
+        .reshape((channels, height * width))?
+        .mean(1)?
+        .sqrt()?
+        .to_vec1::<f32>()?;
+    Ok(StateDiagnostics {
+        rms: tensor_rms(tensor)?,
+        mean_abs: absolute.mean_all()?.to_scalar::<f32>()?,
+        clamp_fraction,
+        channel_rms_min: channel_rms.iter().copied().fold(f32::INFINITY, f32::min),
+        channel_rms_max: channel_rms.iter().copied().fold(0.0, f32::max),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Device;
+
+    #[test]
+    fn state_metrics_report_scale_channels_and_bound_occupancy() -> candle_core::Result<()> {
+        let values = vec![0.0f32, 1.0, -2.0, 3.5, 0.0, 0.0, 0.0, 0.0];
+        let tensor = Tensor::from_vec(values, (1, 2, 2, 2), &Device::Cpu)?;
+        let metrics = state_metrics(&tensor, 3.5)?;
+        assert!((metrics.clamp_fraction - 0.125).abs() < 1e-6);
+        assert!(metrics.channel_rms_max > metrics.channel_rms_min);
+        assert!(metrics.rms.is_finite());
+        Ok(())
+    }
 }

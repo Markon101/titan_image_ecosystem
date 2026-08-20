@@ -41,18 +41,18 @@ impl ArtifactPaths {
                 .join(format!("{name}{suffix}.{extension}"))
         };
         Self {
-            model: in_output("titan_image_model_v5", "safetensors"),
-            optimizer: in_output("titan_image_optimizer_v5", "safetensors"),
-            world: in_output("titan_image_world_v5", "safetensors"),
-            checkpoint_manifest: in_output("titan_image_checkpoint_v5", "json"),
-            metrics: in_output("titan_image_metrics_v5", "csv"),
-            metadata: in_output("titan_image_run_metadata_v5", "json"),
-            render_metadata: in_output("titan_image_render_metadata_v5", "json"),
-            raw: in_output("titan_image_raw_v5", "png"),
-            mastered: in_output("titan_image_mastered_v5", "png"),
-            gallery: in_output("titan_image_gallery_v5", "png"),
-            micro_state: in_output("titan_image_micro_state_v5", "png"),
-            macro_state: in_output("titan_image_macro_state_v5", "png"),
+            model: in_output("titan_image_model_v6", "safetensors"),
+            optimizer: in_output("titan_image_optimizer_v6", "safetensors"),
+            world: in_output("titan_image_world_v6", "safetensors"),
+            checkpoint_manifest: in_output("titan_image_checkpoint_v6", "json"),
+            metrics: in_output("titan_image_metrics_v6", "csv"),
+            metadata: in_output("titan_image_run_metadata_v6", "json"),
+            render_metadata: in_output("titan_image_render_metadata_v6", "json"),
+            raw: in_output("titan_image_raw_v6", "png"),
+            mastered: in_output("titan_image_mastered_v6", "png"),
+            gallery: in_output("titan_image_gallery_v6", "png"),
+            micro_state: in_output("titan_image_micro_state_v6", "png"),
+            macro_state: in_output("titan_image_macro_state_v6", "png"),
         }
     }
 
@@ -114,7 +114,7 @@ pub fn load_checkpoint(
 ) -> Result<(WorldState, usize)> {
     if !paths.checkpoint_complete() {
         bail!(
-            "incomplete v5 checkpoint set in {}; use --fresh or restore model, optimizer, world, and checkpoint manifest",
+            "incomplete v6 checkpoint set in {}; use --fresh or restore model, optimizer, world, and checkpoint manifest",
             paths.model.parent().unwrap_or(Path::new(".")).display()
         );
     }
@@ -131,7 +131,7 @@ pub fn load_checkpoint(
         || manifest.corpus_fingerprint != corpus_fingerprint
     {
         bail!(
-            "checkpoint manifest does not match v5 architecture, training settings, or corpus bytes; use the original inputs or a new --run-tag with --fresh"
+            "checkpoint manifest does not match v6 architecture, training settings, or corpus bytes; use the original inputs or a new --run-tag with --fresh"
         );
     }
     let world = load_world(&paths.world, device, config, signature, corpus_fingerprint)?;
@@ -278,7 +278,7 @@ fn load_world(
     if micro.dims4()? != (1, config.channels, config.micro_size, config.micro_size)
         || macro_field.dims4()? != (1, config.channels, config.macro_size, config.macro_size)
     {
-        bail!("world field shape does not match the requested v5 architecture");
+        bail!("world field shape does not match the requested v6 architecture");
     }
     Ok(WorldState {
         micro,

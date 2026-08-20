@@ -26,9 +26,11 @@ pub struct PersistentAdamW {
 #[derive(Clone, Debug, Serialize)]
 pub struct OptimizerStats {
     pub gradient_norm: f32,
+    pub gradient_rms: f32,
     pub clip_scale: f32,
     pub effective_learning_rate: f64,
     pub updated_variables: usize,
+    pub updated_parameters: usize,
     pub backward_seconds: f64,
     pub step_seconds: f64,
 }
@@ -85,10 +87,12 @@ impl PersistentAdamW {
     fn step(&mut self, gradients: &GradStore) -> Result<OptimizerStats> {
         let mut squared_norm = 0.0f64;
         let mut updated_variables = 0usize;
+        let mut updated_parameters = 0usize;
         for state in &self.variables {
             if let Some(gradient) = gradients.get(state.variable.as_tensor()) {
                 squared_norm += gradient.sqr()?.sum_all()?.to_scalar::<f32>()? as f64;
                 updated_variables += 1;
+                updated_parameters += gradient.elem_count();
             }
         }
         let gradient_norm = squared_norm.sqrt();
@@ -146,9 +150,11 @@ impl PersistentAdamW {
         self.updates = next_update;
         Ok(OptimizerStats {
             gradient_norm: gradient_norm as f32,
+            gradient_rms: (gradient_norm / (updated_parameters as f64).sqrt()) as f32,
             clip_scale: clip_scale as f32,
             effective_learning_rate: learning_rate,
             updated_variables,
+            updated_parameters,
             backward_seconds: 0.0,
             step_seconds: 0.0,
         })

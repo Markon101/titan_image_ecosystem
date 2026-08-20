@@ -2,6 +2,7 @@ use crate::config::{RunConfig, TrainingMode};
 use crate::tensor_ops::splitmix64;
 use anyhow::{bail, Context, Result};
 use candle_core::{Device, Tensor};
+use serde::Serialize;
 use std::collections::VecDeque;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -13,6 +14,13 @@ pub struct TargetSample {
     pub index: usize,
     pub name: String,
     pub fingerprint: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CorpusSourceMetadata {
+    pub index: usize,
+    pub name: String,
+    pub fingerprint: String,
 }
 
 struct SourceImage {
@@ -77,6 +85,16 @@ impl ImageCorpus {
                 .cmp(&b.fingerprint)
                 .then_with(|| a.path.cmp(&b.path))
         });
+        let duplicate_content = sources
+            .windows(2)
+            .filter(|pair| pair[0].fingerprint == pair[1].fingerprint)
+            .count();
+        if duplicate_content > 0 {
+            println!(
+                "Corpus warning: {duplicate_content} exact duplicate source entr{} will receive repeated schedule weight.",
+                if duplicate_content == 1 { "y" } else { "ies" }
+            );
+        }
         if config.mode == TrainingMode::Single && sources.len() != 1 {
             bail!(
                 "single mode requires exactly one source image; found {} in {}",
@@ -134,6 +152,18 @@ impl ImageCorpus {
 
     pub fn cached_images(&self) -> usize {
         self.cache.len()
+    }
+
+    pub fn source_manifest(&self) -> Vec<CorpusSourceMetadata> {
+        self.sources
+            .iter()
+            .enumerate()
+            .map(|(index, source)| CorpusSourceMetadata {
+                index,
+                name: source.name.clone(),
+                fingerprint: format!("{:016x}", source.fingerprint),
+            })
+            .collect()
     }
 
     pub fn sample(&mut self, episode: u64, device: &Device) -> Result<TargetSample> {

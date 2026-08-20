@@ -1,6 +1,6 @@
-# TITAN Image v5: mathematical and experimental specification
+# TITAN Image v6: mathematical and experimental specification
 
-This document describes the equations that the v5 program actually evaluates. It separates consequences of those equations from visual hypotheses that must be tested. v5 is intentionally incompatible with v4: grid sizes, channel counts, conditioning, schedules, losses, optimizer state, and checkpoint identity are runtime-defined.
+This document describes the equations that the v6 program actually evaluates. It separates consequences of those equations from visual hypotheses that must be tested. v6 is intentionally incompatible with earlier schemas: grid sizes, channel counts, learned widths, conditioning, schedules, losses, optimizer state, and checkpoint identity are runtime-defined.
 
 ## 1. State, domain, and notation
 
@@ -31,7 +31,7 @@ The terms are respectively the learned NCA, reaction-diffusion, complex phase, c
 
 ## 2. Near/far neural cellular rule
 
-For each channel, v5 applies identity, horizontal Sobel, vertical Sobel, and five-point Laplacian filters at dilation one and dilation two. If
+For each channel, v6 applies identity, horizontal Sobel, vertical Sobel, and five-point Laplacian filters at dilation one and dilation two. If
 
 \[
 \mathcal P(Z)=[K_{r,j}*_{\mathbb T^2}Z]_{r\in\{1,2\},j\in\{I,x,y,\Delta\}},
@@ -65,7 +65,7 @@ The macro field advances when
 a\bmod k_M=0,
 \]
 
-then its periodic bilinear upsample is supplied to the micro update. The micro field advances every development step. v5 supports Euler
+then its periodic bilinear upsample is supplied to the micro update. The micro field advances every development step. v6 supports Euler
 
 \[
 Z_{n+1}=\Pi_{[-L,L]}(Z_n+hF(Z_n))
@@ -164,7 +164,7 @@ w_i(x)=A_ix+b_i,\qquad
 
 On nonempty compact subsets with Hausdorff distance, its Hutchinson operator is therefore a contraction. Banach's fixed-point theorem gives a unique compact IFS attractor and geometric convergence of ideal set iteration. The finite chaos-game histogram is blurred, centered, and normalized; it is evidence of an IFS-derived target, not proof that a PNG has a particular fractal dimension.
 
-Unlike v4's constant velocity injection, v5 uses stable target attraction in channel four:
+Unlike v4's constant velocity injection, v6 uses stable target attraction in channel four:
 
 \[
 A_F(Z)_4=\gamma_F(T_F-Z_4).
@@ -221,7 +221,7 @@ c_B(x,y)=
   \sin(2\pi2^by),\cos(2\pi2^by)]_{b=0}^{B-1}.
 \]
 
-v4 supplied a unit-amplitude coordinate band at the cell-grid frequency, creating an easy visible lattice shortcut. v5 exposes coordinate gain and keeps it low by profile.
+v4 supplied a unit-amplitude coordinate band at the cell-grid frequency, creating an easy visible lattice shortcut. v6 exposes coordinate gain and keeps it low by profile.
 
 The learned pointwise decoder is a residual Swish MLP:
 
@@ -305,7 +305,7 @@ This is exact truncated BPTT for the configured endpoint and horizon. It is not 
 
 ## 12. Persistent AdamW
 
-For global gradient vector \(g\), v5 records its norm and applies
+For global gradient vector \(g\), v6 records its norm and size-normalized RMS, then applies
 
 \[
 \tilde g=g\min\left(1,\frac{c}{\lVert g\rVert_2}\right)
@@ -362,7 +362,7 @@ while an endpoint render scales roughly as
 O(R^2H_r(C+G+B+K H_r)).
 \]
 
-Here \(R\) is training resolution and \(K\) the render-block count. Output-only rendering scales with output resolution but does not build a training graph. This explains the v5 phone strategy:
+Here \(R\) is training resolution and \(K\) the render-block count. Output-only rendering scales with output resolution but does not build a training graph. This explains the v6 phone strategy:
 
 - evolve on compact micro/macro grids;
 - render differentiably only once per BPTT window;
@@ -374,7 +374,7 @@ Here \(R\) is training resolution and \(K\) the render-block count. Output-only 
 
 Thread count is only one variable. Android cpusets and thermal control can reduce available cores or frequency during a sustained run; metadata records requested settings and effective parallelism, while an honest performance experiment must also record thermal conditions.
 
-## 16. What v5 does and does not establish
+## 16. What v6 does and does not establish
 
 The implementation establishes deterministic seeded initialization, bounded projected state, toroidal stencils, independently switchable operators, content-bound continuation, and a measurable training/output pipeline.
 
