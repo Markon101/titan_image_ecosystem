@@ -1,6 +1,6 @@
 use crate::config::RunConfig;
 use crate::tensor_ops::splitmix64;
-use candle_core::{Device, Result, Tensor};
+use candle_core::{DType, Device, Result, Tensor};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
@@ -8,6 +8,7 @@ use rand_chacha::ChaCha8Rng;
 pub struct WorldState {
     pub micro: Tensor,
     pub macro_field: Tensor,
+    pub memory: Tensor,
     /// Global completed development steps. This never resets between episodes.
     pub step: u64,
     /// Development age of the current seeded organism.
@@ -26,6 +27,7 @@ impl WorldState {
                 seed ^ 0xa11e_9a2d,
                 device,
             )?,
+            memory: Tensor::zeros((1, config.interface_width), DType::F32, device)?,
             step: 0,
             age: 0,
             episode: 0,
@@ -44,6 +46,7 @@ impl WorldState {
             return Ok(Self {
                 micro: self.micro.detach(),
                 macro_field: self.macro_field.detach(),
+                memory: self.memory.detach(),
                 step: self.step,
                 age: self.age,
                 episode,
@@ -64,6 +67,7 @@ impl WorldState {
                 .detach()
                 .affine(keep, 0.0)?
                 .add(&seeded.macro_field.affine(reset, 0.0)?)?,
+            memory: self.memory.detach().affine(keep, 0.0)?,
             step: self.step,
             age: 0,
             episode,
@@ -75,6 +79,7 @@ impl WorldState {
         Self {
             micro: self.micro.detach(),
             macro_field: self.macro_field.detach(),
+            memory: self.memory.detach(),
             step: self.step,
             age: self.age,
             episode: self.episode,

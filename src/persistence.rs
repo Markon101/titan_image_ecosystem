@@ -41,18 +41,18 @@ impl ArtifactPaths {
                 .join(format!("{name}{suffix}.{extension}"))
         };
         Self {
-            model: in_output("titan_image_model_v6", "safetensors"),
-            optimizer: in_output("titan_image_optimizer_v6", "safetensors"),
-            world: in_output("titan_image_world_v6", "safetensors"),
-            checkpoint_manifest: in_output("titan_image_checkpoint_v6", "json"),
-            metrics: in_output("titan_image_metrics_v6", "csv"),
-            metadata: in_output("titan_image_run_metadata_v6", "json"),
-            render_metadata: in_output("titan_image_render_metadata_v6", "json"),
-            raw: in_output("titan_image_raw_v6", "png"),
-            mastered: in_output("titan_image_mastered_v6", "png"),
-            gallery: in_output("titan_image_gallery_v6", "png"),
-            micro_state: in_output("titan_image_micro_state_v6", "png"),
-            macro_state: in_output("titan_image_macro_state_v6", "png"),
+            model: in_output("titan_image_model_v7", "safetensors"),
+            optimizer: in_output("titan_image_optimizer_v7", "safetensors"),
+            world: in_output("titan_image_world_v7", "safetensors"),
+            checkpoint_manifest: in_output("titan_image_checkpoint_v7", "json"),
+            metrics: in_output("titan_image_metrics_v7", "csv"),
+            metadata: in_output("titan_image_run_metadata_v7", "json"),
+            render_metadata: in_output("titan_image_render_metadata_v7", "json"),
+            raw: in_output("titan_image_raw_v7", "png"),
+            mastered: in_output("titan_image_mastered_v7", "png"),
+            gallery: in_output("titan_image_gallery_v7", "png"),
+            micro_state: in_output("titan_image_micro_state_v7", "png"),
+            macro_state: in_output("titan_image_macro_state_v7", "png"),
         }
     }
 
@@ -114,7 +114,7 @@ pub fn load_checkpoint(
 ) -> Result<(WorldState, usize)> {
     if !paths.checkpoint_complete() {
         bail!(
-            "incomplete v6 checkpoint set in {}; use --fresh or restore model, optimizer, world, and checkpoint manifest",
+            "incomplete v7 checkpoint set in {}; use --fresh or restore model, optimizer, world, and checkpoint manifest",
             paths.model.parent().unwrap_or(Path::new(".")).display()
         );
     }
@@ -131,7 +131,7 @@ pub fn load_checkpoint(
         || manifest.corpus_fingerprint != corpus_fingerprint
     {
         bail!(
-            "checkpoint manifest does not match v6 architecture, training settings, or corpus bytes; use the original inputs or a new --run-tag with --fresh"
+            "checkpoint manifest does not match v7 architecture, training settings, or corpus bytes; use the original inputs or a new --run-tag with --fresh"
         );
     }
     let world = load_world(&paths.world, device, config, signature, corpus_fingerprint)?;
@@ -228,6 +228,7 @@ fn save_world(
     let mut tensors = HashMap::new();
     tensors.insert("world.micro".to_owned(), world.micro.detach());
     tensors.insert("world.macro".to_owned(), world.macro_field.detach());
+    tensors.insert("world.memory".to_owned(), world.memory.detach());
     for (name, value) in [
         ("world.schema", SCHEMA_VERSION as u64),
         ("world.step", world.step),
@@ -275,15 +276,21 @@ fn load_world(
         .get("world.macro")
         .context("world missing macro field")?
         .clone();
+    let memory = tensors
+        .get("world.memory")
+        .context("world missing recurrent interface memory")?
+        .clone();
     if micro.dims4()? != (1, config.channels, config.micro_size, config.micro_size)
         || macro_field.dims4()? != (1, config.channels, config.macro_size, config.macro_size)
+        || memory.dims2()? != (1, config.interface_width)
     {
-        bail!("world field shape does not match the requested v6 architecture");
+        bail!("world field shape does not match the requested v7 architecture");
     }
     Ok(WorldState {
         micro,
         macro_field,
         step: scalar("world.step")?,
+        memory,
         age: scalar("world.age")?,
         episode: scalar("world.episode")?,
         target_index: scalar("world.target_index")? as usize,

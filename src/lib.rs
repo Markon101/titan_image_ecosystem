@@ -4,6 +4,7 @@ pub mod config;
 pub mod corpus;
 pub mod dynamics;
 pub mod engine;
+pub mod interface;
 pub mod metrics;
 pub mod objectives;
 pub mod optimizer;
@@ -12,5 +13,7 @@ pub mod render;
 pub mod state;
 pub mod tensor_ops;
 
-pub use config::{Integrator, PhoneProfile, RunConfig, StylePreset, TrainingMode};
+pub use config::{
+    ConditioningMode, Integrator, OptimizerKind, PhoneProfile, RunConfig, StylePreset, TrainingMode,
+};
 pub use engine::run;

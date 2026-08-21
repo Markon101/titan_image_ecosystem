@@ -119,7 +119,7 @@ pub fn deterministic_clock_mask(
 }
 
 /// Global octave Fourier coordinates. v4's 64-cycle cell coordinates visibly
-/// stamped the decoder lattice into output; v6 uses only canvas-scale bands.
+/// stamped the decoder lattice into output; v7 uses only canvas-scale bands.
 pub fn coordinate_features(resolution: usize, bands: usize, device: &Device) -> Result<Tensor> {
     let channels = bands * 4;
     let plane = resolution * resolution;

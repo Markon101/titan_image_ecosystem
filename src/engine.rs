@@ -1,4 +1,4 @@
-use crate::config::{RunConfig, SCHEMA_VERSION};
+use crate::config::{ConditioningMode, RunConfig, SCHEMA_VERSION};
 use crate::corpus::{CorpusSourceMetadata, ImageCorpus, TargetSample};
 use crate::dynamics::DynamicsSystem;
 use crate::metrics::{image_metrics, state_metrics, tensor_rms, MetricRecord, StateDiagnostics};
@@ -123,14 +123,14 @@ pub fn run(config: RunConfig) -> Result<()> {
 
     if config.render_only && !paths.checkpoint_complete() {
         bail!(
-            "--render-only requires a complete v6 checkpoint for this output directory and run tag"
+            "--render-only requires a complete v7 checkpoint for this output directory and run tag"
         );
     }
 
     let checkpoint_available = paths.checkpoint_complete();
     if !config.fresh && paths.checkpoint_exists() && !checkpoint_available {
         bail!(
-            "partial v6 checkpoint set in {}; use --fresh or restore all checkpoint files",
+            "partial v7 checkpoint set in {}; use --fresh or restore all checkpoint files",
             config.output_dir.display()
         );
     }
@@ -190,7 +190,7 @@ pub fn run(config: RunConfig) -> Result<()> {
     };
 
     println!(
-        "TITAN Image v6: {} source image(s), {} cached, {} parameters, {} at world step {}",
+        "TITAN Image v7: {} source image(s), {} cached, {} parameters, {} at world step {}",
         corpus.len(),
         corpus.cached_images(),
         parameter_count,
@@ -215,6 +215,17 @@ pub fn run(config: RunConfig) -> Result<()> {
         config.snapshot_resolution,
         config.snapshot_every,
         config.bptt,
+    );
+    println!(
+        "Interface {}x{} tokens, width {}, {} shared loop(s), morph L{}/{}, {:?} conditioning, {:?} optimizer",
+        config.interface_grid,
+        config.interface_grid,
+        config.interface_width,
+        config.interface_loops,
+        config.morph_depth,
+        config.morph_layers,
+        config.conditioning,
+        optimizer.kind(),
     );
     println!("Ctrl-C finishes the active optimizer window, saves a checkpoint, and publishes final metadata.");
 
@@ -267,9 +278,17 @@ pub fn run(config: RunConfig) -> Result<()> {
         let mut macro_movement_sum = 0.0f32;
         let mut macro_movement_max = 0.0f32;
         let mut macro_updates = 0usize;
+        let reference_fidelity = reference_fidelity(&config, world.step);
         for _ in 0..config.bptt {
             let tick = Instant::now();
-            let stepped = dynamics.step(&world, &sample.genome_tensor, train_core)?;
+            let stepped = dynamics.step(
+                &world,
+                &sample.genome_tensor,
+                Some(&sample.reference_micro),
+                Some(&sample.reference_macro),
+                reference_fidelity,
+                train_core,
+            )?;
             if train_core {
                 phase.tracked_dynamics += seconds(tick.elapsed());
             } else {
@@ -335,6 +354,8 @@ pub fn run(config: RunConfig) -> Result<()> {
             &diagnostics,
             loss_values,
             &optimizer_stats,
+            reference_fidelity,
+            tensor_rms(&world.memory)?,
             seconds(window_started.elapsed()),
         );
         record.write_csv(
@@ -607,6 +628,8 @@ fn metric_record(
     image: &crate::metrics::ImageDiagnostics,
     loss: [f32; 6],
     optimizer: &OptimizerStats,
+    reference_fidelity: f32,
+    interface_memory_rms: f32,
     window_seconds: f64,
 ) -> MetricRecord {
     MetricRecord {
@@ -661,6 +684,9 @@ fn metric_record(
         updated_parameters: optimizer.updated_parameters,
         effective_learning_rate: optimizer.effective_learning_rate,
         window_seconds,
+        reference_fidelity,
+        interface_memory_rms,
+        muon_variables: optimizer.muon_variables,
     }
 }
 
@@ -722,7 +748,9 @@ fn render_gallery(
         let mut world = WorldState::fresh(config, variant_seed, device)?;
         let development_steps = config.gallery_steps + variant * config.gallery_stride;
         for _ in 0..development_steps {
-            world = dynamics.step(&world, &genome_tensor, false)?.world;
+            world = dynamics
+                .step(&world, &genome_tensor, None, None, 0.0, false)?
+                .world;
         }
         let rendered = renderer.render(
             &world.micro,
@@ -814,6 +842,23 @@ fn seconds(duration: Duration) -> f64 {
     duration.as_secs_f64()
 }
 
+fn reference_fidelity(config: &RunConfig, step: u64) -> f32 {
+    match config.conditioning {
+        ConditioningMode::Generate => 0.0,
+        ConditioningMode::Reconstruct => config.reference_fidelity_max,
+        ConditioningMode::Hybrid => {
+            let key = splitmix64(config.seed ^ step.wrapping_mul(0xd1b5_4a32_d192_ed03));
+            let dropout = (key >> 40) as f32 / (1u32 << 24) as f32;
+            if dropout < config.reference_dropout {
+                return 0.0;
+            }
+            let unit = (splitmix64(key ^ 0xa17e_51d5) >> 40) as f32 / (1u32 << 24) as f32;
+            config.reference_fidelity_min
+                + unit * (config.reference_fidelity_max - config.reference_fidelity_min)
+        }
+    }
+}
+
 fn install_interrupt_handler() -> Result<()> {
     STOP_REQUESTED.store(false, Ordering::SeqCst);
     match INTERRUPT_HANDLER.get_or_init(|| {
@@ -856,7 +901,7 @@ fn peak_rss_kib() -> Option<u64> {
 
 fn snapshot_path(config: &RunConfig, world: &WorldState) -> PathBuf {
     config.output_dir.join(format!(
-        "titan_image_snapshot_v6{}_{:09}_ep{:05}_age{:04}_target{:04}.png",
+        "titan_image_snapshot_v7{}_{:09}_ep{:05}_age{:04}_target{:04}.png",
         config.suffix(),
         world.step,
         world.episode,
@@ -867,7 +912,7 @@ fn snapshot_path(config: &RunConfig, world: &WorldState) -> PathBuf {
 
 fn gallery_path(config: &RunConfig, variant: usize, mastered: bool) -> PathBuf {
     config.output_dir.join(format!(
-        "titan_image_variant_v6{}_{:03}_{}.png",
+        "titan_image_variant_v7{}_{:03}_{}.png",
         config.suffix(),
         variant + 1,
         if mastered { "mastered" } else { "raw" }
@@ -911,7 +956,7 @@ mod tests {
     #[test]
     fn fresh_and_resumed_training_write_complete_artifacts() -> Result<()> {
         let root = std::env::temp_dir().join(format!(
-            "titan-image-v6-test-{}-{}",
+            "titan-image-v7-test-{}-{}",
             std::process::id(),
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
         ));
@@ -983,7 +1028,7 @@ mod tests {
     }
 
     #[test]
-    fn balanced_profile_is_approximately_twice_v5_capacity() -> Result<()> {
+    fn balanced_profile_includes_recurrent_interface_capacity() -> Result<()> {
         let device = Device::Cpu;
         let config = RunConfig::default();
         let vars = VarMap::new();
@@ -991,8 +1036,8 @@ mod tests {
         let _dynamics = DynamicsSystem::new(&config, builder.pp("dynamics"), &device)?;
         let _renderer = ImplicitRenderer::new(&config, builder.pp("renderer"))?;
         let count = learned_parameter_count(&vars);
-        assert_eq!(count, 172_595);
-        assert!((1.9..=2.2).contains(&(count as f64 / 83_831.0)));
+        assert_eq!(count, 682_851);
+        assert!((3.8..=4.1).contains(&(count as f64 / 172_595.0)));
         Ok(())
     }
 

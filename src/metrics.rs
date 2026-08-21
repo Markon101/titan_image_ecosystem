@@ -58,6 +58,9 @@ pub struct MetricRecord {
     pub updated_parameters: usize,
     pub effective_learning_rate: f64,
     pub window_seconds: f64,
+    pub reference_fidelity: f32,
+    pub interface_memory_rms: f32,
+    pub muon_variables: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -81,14 +84,14 @@ pub struct StateDiagnostics {
 
 impl MetricRecord {
     pub fn write_header(mut writer: impl Write) -> Result<()> {
-        writeln!(writer, "step,age,episode,target_index,optimizer_update,core_trained,macro_updates,episode_started,micro_movement_mean,micro_movement_max,macro_movement_mean,macro_movement_max,micro_state_rms,macro_state_rms,micro_state_mean_abs,macro_state_mean_abs,micro_clamp_fraction,macro_clamp_fraction,micro_channel_rms_min,micro_channel_rms_max,macro_channel_rms_min,macro_channel_rms_max,image_delta_valid,image_delta_mean,image_delta_rms,image_variance,seam_energy,edge_energy,gamut_excess,red_mean,green_mean,blue_mean,red_variance,green_variance,blue_variance,rg_correlation,rb_correlation,gb_correlation,loss_total,loss_content,loss_palette,loss_structure,loss_seam,loss_gamut,gradient_norm,gradient_rms,gradient_clip_scale,updated_variables,updated_parameters,effective_learning_rate,window_seconds")?;
+        writeln!(writer, "step,age,episode,target_index,optimizer_update,core_trained,macro_updates,episode_started,micro_movement_mean,micro_movement_max,macro_movement_mean,macro_movement_max,micro_state_rms,macro_state_rms,micro_state_mean_abs,macro_state_mean_abs,micro_clamp_fraction,macro_clamp_fraction,micro_channel_rms_min,micro_channel_rms_max,macro_channel_rms_min,macro_channel_rms_max,image_delta_valid,image_delta_mean,image_delta_rms,image_variance,seam_energy,edge_energy,gamut_excess,red_mean,green_mean,blue_mean,red_variance,green_variance,blue_variance,rg_correlation,rb_correlation,gb_correlation,loss_total,loss_content,loss_palette,loss_structure,loss_seam,loss_gamut,gradient_norm,gradient_rms,gradient_clip_scale,updated_variables,updated_parameters,effective_learning_rate,window_seconds,reference_fidelity,interface_memory_rms,muon_variables")?;
         Ok(())
     }
 
     pub fn write_csv(&self, mut writer: impl Write) -> Result<()> {
         writeln!(
             writer,
-            "{},{},{},{},{},{},{},{},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.9},{:.7},{},{},{:.9},{:.6}",
+            "{},{},{},{},{},{},{},{},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.9},{:.7},{},{},{:.9},{:.6},{:.7},{:.7},{}",
             self.step,
             self.age,
             self.episode,
@@ -140,6 +143,9 @@ impl MetricRecord {
             self.updated_parameters,
             self.effective_learning_rate,
             self.window_seconds,
+            self.reference_fidelity,
+            self.interface_memory_rms,
+            self.muon_variables,
         )?;
         Ok(())
     }

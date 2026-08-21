@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 pub const MIN_PHYSICAL_CHANNELS: usize = 12;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -87,6 +87,42 @@ impl Integrator {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConditioningMode {
+    Generate,
+    Hybrid,
+    Reconstruct,
+}
+
+impl ConditioningMode {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "generate" | "unconditioned" => Ok(Self::Generate),
+            "hybrid" => Ok(Self::Hybrid),
+            "reconstruct" | "reconstruction" => Ok(Self::Reconstruct),
+            _ => bail!("invalid --conditioning {value}; expected generate, hybrid, or reconstruct"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OptimizerKind {
+    AdamW,
+    HybridMuon,
+}
+
+impl OptimizerKind {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "adamw" => Ok(Self::AdamW),
+            "hybrid-muon" | "muon" => Ok(Self::HybridMuon),
+            _ => bail!("invalid --optimizer {value}; expected adamw or hybrid-muon"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunConfig {
     pub corpus_dir: PathBuf,
@@ -103,6 +139,16 @@ pub struct RunConfig {
     pub channels: usize,
     pub genome_dim: usize,
     pub ca_hidden: usize,
+    pub interface_grid: usize,
+    pub interface_width: usize,
+    pub interface_loops: usize,
+    pub morph_layers: usize,
+    pub morph_depth: usize,
+    pub interface_gain: f32,
+    pub conditioning: ConditioningMode,
+    pub reference_fidelity_min: f32,
+    pub reference_fidelity_max: f32,
+    pub reference_dropout: f32,
     pub render_hidden: usize,
     pub render_blocks: usize,
     pub coord_bands: usize,
@@ -130,12 +176,16 @@ pub struct RunConfig {
     pub adam_epsilon: f64,
     pub grad_clip: f64,
     pub warmup_updates: usize,
+    pub optimizer: OptimizerKind,
+    pub muon_momentum: f64,
+    pub muon_ns_steps: usize,
     pub integrator: Integrator,
     pub dt: f32,
     pub state_limit: f32,
     pub clock_probability: f32,
     pub nca_gain: f32,
     pub reaction_gain: f32,
+    pub state_leak: f32,
     pub phase_gain: f32,
     pub fractal_gain: f32,
     pub quasiperiodic_gain: f32,
@@ -171,7 +221,7 @@ impl Default for RunConfig {
             .unwrap_or(4);
         let mut config = Self {
             corpus_dir: PathBuf::from("/sdcard/Download/titan_image_sources"),
-            output_dir: PathBuf::from("/sdcard/Download/titan_image_v6"),
+            output_dir: PathBuf::from("/sdcard/Download/titan_image_v7"),
             run_tag: None,
             mode: TrainingMode::Texture,
             profile: PhoneProfile::S25Balanced,
@@ -186,6 +236,16 @@ impl Default for RunConfig {
             ca_hidden: 128,
             render_hidden: 128,
             render_blocks: 4,
+            interface_grid: 4,
+            interface_width: 128,
+            interface_loops: 3,
+            morph_layers: 4,
+            morph_depth: 3,
+            interface_gain: 0.18,
+            conditioning: ConditioningMode::Hybrid,
+            reference_fidelity_min: 0.15,
+            reference_fidelity_max: 0.85,
+            reference_dropout: 0.15,
             coord_bands: 4,
             coord_gain: 0.12,
             state_skip: 0.75,
@@ -214,12 +274,16 @@ impl Default for RunConfig {
             integrator: Integrator::Euler,
             dt: 0.16,
             state_limit: 3.5,
+            optimizer: OptimizerKind::AdamW,
+            muon_momentum: 0.95,
+            muon_ns_steps: 5,
             clock_probability: 0.72,
             nca_gain: 0.38,
             reaction_gain: 0.35,
             phase_gain: 0.85,
             fractal_gain: 0.08,
             quasiperiodic_gain: 0.12,
+            state_leak: 0.035,
             cyclic_gain: 0.22,
             rd_diffusion_u: 0.16,
             rd_diffusion_v: 0.08,
@@ -303,6 +367,16 @@ impl RunConfig {
                 "--channels" => cfg.channels = parse(&value()?, flag)?,
                 "--genome-dim" => cfg.genome_dim = parse(&value()?, flag)?,
                 "--ca-hidden" => cfg.ca_hidden = parse(&value()?, flag)?,
+                "--interface-grid" => cfg.interface_grid = parse(&value()?, flag)?,
+                "--interface-width" => cfg.interface_width = parse(&value()?, flag)?,
+                "--interface-loops" => cfg.interface_loops = parse(&value()?, flag)?,
+                "--morph-layers" => cfg.morph_layers = parse(&value()?, flag)?,
+                "--morph-depth" => cfg.morph_depth = parse(&value()?, flag)?,
+                "--interface-gain" => cfg.interface_gain = parse(&value()?, flag)?,
+                "--conditioning" => cfg.conditioning = ConditioningMode::parse(&value()?)?,
+                "--reference-fidelity-min" => cfg.reference_fidelity_min = parse(&value()?, flag)?,
+                "--reference-fidelity-max" => cfg.reference_fidelity_max = parse(&value()?, flag)?,
+                "--reference-dropout" => cfg.reference_dropout = parse(&value()?, flag)?,
                 "--render-hidden" => cfg.render_hidden = parse(&value()?, flag)?,
                 "--render-blocks" => cfg.render_blocks = parse(&value()?, flag)?,
                 "--coord-bands" => cfg.coord_bands = parse(&value()?, flag)?,
@@ -330,12 +404,16 @@ impl RunConfig {
                 "--adam-epsilon" => cfg.adam_epsilon = parse(&value()?, flag)?,
                 "--grad-clip" => cfg.grad_clip = parse(&value()?, flag)?,
                 "--warmup-updates" => cfg.warmup_updates = parse(&value()?, flag)?,
+                "--optimizer" => cfg.optimizer = OptimizerKind::parse(&value()?)?,
+                "--muon-momentum" => cfg.muon_momentum = parse(&value()?, flag)?,
+                "--muon-ns-steps" => cfg.muon_ns_steps = parse(&value()?, flag)?,
                 "--integrator" => cfg.integrator = Integrator::parse(&value()?)?,
                 "--dt" => cfg.dt = parse(&value()?, flag)?,
                 "--state-limit" => cfg.state_limit = parse(&value()?, flag)?,
                 "--clock-probability" => cfg.clock_probability = parse(&value()?, flag)?,
                 "--nca-gain" => cfg.nca_gain = parse(&value()?, flag)?,
                 "--reaction-gain" => cfg.reaction_gain = parse(&value()?, flag)?,
+                "--state-leak" => cfg.state_leak = parse(&value()?, flag)?,
                 "--phase-gain" => cfg.phase_gain = parse(&value()?, flag)?,
                 "--fractal-gain" => cfg.fractal_gain = parse(&value()?, flag)?,
                 "--quasiperiodic-gain" => {
@@ -392,6 +470,11 @@ impl RunConfig {
                 self.channels = 16;
                 self.genome_dim = 6;
                 self.ca_hidden = 96;
+                self.interface_grid = 4;
+                self.interface_width = 96;
+                self.interface_loops = 2;
+                self.morph_layers = 3;
+                self.morph_depth = 2;
                 self.render_hidden = 80;
                 self.render_blocks = 3;
                 self.coord_bands = 3;
@@ -412,6 +495,11 @@ impl RunConfig {
                 self.genome_dim = 8;
                 self.ca_hidden = 128;
                 self.render_hidden = 128;
+                self.interface_grid = 4;
+                self.interface_width = 128;
+                self.interface_loops = 3;
+                self.morph_layers = 4;
+                self.morph_depth = 3;
                 self.render_blocks = 4;
                 self.coord_bands = 4;
                 self.train_resolution = 192;
@@ -431,6 +519,11 @@ impl RunConfig {
                 self.genome_dim = 12;
                 self.ca_hidden = 192;
                 self.render_hidden = 160;
+                self.interface_grid = 5;
+                self.interface_width = 160;
+                self.interface_loops = 4;
+                self.morph_layers = 6;
+                self.morph_depth = 4;
                 self.render_blocks = 5;
                 self.coord_bands = 5;
                 self.train_resolution = 256;
@@ -534,6 +627,34 @@ impl RunConfig {
         {
             bail!("architecture controls exceed their safe phone ranges");
         }
+        if !(2..=8).contains(&self.interface_grid)
+            || !self.micro_size.is_multiple_of(self.interface_grid)
+            || !self.macro_size.is_multiple_of(self.interface_grid)
+        {
+            bail!("--interface-grid must be 2..=8 and divide both field sizes");
+        }
+        if !(32..=512).contains(&self.interface_width)
+            || !self.interface_width.is_multiple_of(32)
+            || !(1..=8).contains(&self.interface_loops)
+            || !(1..=16).contains(&self.morph_layers)
+            || !(1..=self.morph_layers).contains(&self.morph_depth)
+        {
+            bail!("recurrent-interface controls exceed their safe phone ranges");
+        }
+        finite_range(self.interface_gain, 0.0, 1.0, "--interface-gain")?;
+        finite_range(
+            self.reference_fidelity_min,
+            0.0,
+            1.0,
+            "--reference-fidelity-min",
+        )?;
+        finite_range(
+            self.reference_fidelity_max,
+            self.reference_fidelity_min,
+            1.0,
+            "--reference-fidelity-max",
+        )?;
+        finite_range(self.reference_dropout, 0.0, 1.0, "--reference-dropout")?;
         finite_range(self.coord_gain, 0.0, 2.0, "--coord-gain")?;
         finite_range(self.state_skip, 0.0, 4.0, "--state-skip")?;
         finite_range(self.chroma, 0.0, 0.4, "--chroma")?;
@@ -563,10 +684,14 @@ impl RunConfig {
         }
         finite_positive(self.adam_epsilon, "--adam-epsilon")?;
         finite_nonnegative(self.grad_clip, "--grad-clip")?;
+        if !(0.0..1.0).contains(&self.muon_momentum) || !(1..=10).contains(&self.muon_ns_steps) {
+            bail!("--muon-momentum must be in [0,1) and --muon-ns-steps in 1..=10");
+        }
         finite_range(self.dt, 0.005, 0.25, "--dt")?;
         finite_range(self.state_limit, 1.0, 12.0, "--state-limit")?;
         finite_range(self.clock_probability, 0.05, 1.0, "--clock-probability")?;
         finite_range(self.episode_reset, 0.0, 1.0, "--episode-reset")?;
+        finite_range(self.state_leak, 0.0, 0.5, "--state-leak")?;
         for (name, value) in [
             ("--nca-gain", self.nca_gain),
             ("--reaction-gain", self.reaction_gain),
@@ -651,6 +776,16 @@ impl RunConfig {
             self.channels as u64,
             self.genome_dim as u64,
             self.ca_hidden as u64,
+            self.interface_grid as u64,
+            self.interface_width as u64,
+            self.interface_loops as u64,
+            self.morph_layers as u64,
+            self.morph_depth as u64,
+            self.interface_gain.to_bits() as u64,
+            self.conditioning as u64,
+            self.reference_fidelity_min.to_bits() as u64,
+            self.reference_fidelity_max.to_bits() as u64,
+            self.reference_dropout.to_bits() as u64,
             self.render_hidden as u64,
             self.render_blocks as u64,
             self.coord_bands as u64,
@@ -671,10 +806,14 @@ impl RunConfig {
             self.adam_epsilon.to_bits(),
             self.grad_clip.to_bits(),
             self.warmup_updates as u64,
+            self.optimizer as u64,
+            self.muon_momentum.to_bits(),
+            self.muon_ns_steps as u64,
             self.dt.to_bits() as u64,
             self.state_limit.to_bits() as u64,
             self.clock_probability.to_bits() as u64,
             self.nca_gain.to_bits() as u64,
+            self.state_leak.to_bits() as u64,
             self.reaction_gain.to_bits() as u64,
             self.phase_gain.to_bits() as u64,
             self.fractal_gain.to_bits() as u64,
@@ -703,13 +842,13 @@ impl RunConfig {
     }
 
     pub fn help() -> &'static str {
-        "TITAN Image v6 - S25-first morphogenic visual dynamics\n\
+        "TITAN Image v7 - S25-first morphogenic visual dynamics\n\
          Usage: titan_image [options]\n\n\
          Required and lifecycle:\n\
            --corpus-dir PATH           Source PNG/JPEG/WebP directory (required)\n\
-           --output-dir PATH           v6 artifact directory\n\
+           --output-dir PATH           v7 artifact directory\n\
            --run-tag NAME              Isolate checkpoint and output artifacts\n\
-           --fresh                     Start a new v6 organism for this tag\n\
+           --fresh                     Start a new v7 organism for this tag\n\
            --render-only               Load without training; render/gallery only\n\
            --profile NAME              s25-fast | s25-balanced | s25-quality\n\
            --style NAME                alien-fluid | fractal-flame | reaction-garden | quasicrystal | pure-nca\n\
@@ -738,6 +877,12 @@ impl RunConfig {
            --channels N                Recurrent channels, 12..64\n\
            --genome-dim N              Conditioning dimensions, 2..32\n\
            --ca-hidden N               NCA pointwise hidden width\n\
+           --interface-grid N          Pooled token-grid edge; divides both fields\n\
+           --interface-width N         Recurrent token/GRU width\n\
+           --interface-loops N         Shared transformer passes per world step\n\
+           --morph-layers N            Physical append-preserving memory blocks\n\
+           --morph-depth N             Active memory blocks, <= morph-layers\n\
+           --interface-gain X          Spatial writeback gain, 0..1\n\
            --render-hidden N           Implicit renderer hidden width\n\
            --render-blocks N           Renderer residual blocks, 1..8\n\
            --coord-bands N             Global Fourier coordinate octaves, 1..8\n\
@@ -750,13 +895,21 @@ impl RunConfig {
            --state-limit X             Symmetric recurrent-state bound\n\
            --clock-probability X       Deterministic asynchronous cell rate\n\
            --nca-gain X                Learned update gain\n\n\
+           --state-leak X              Contractive recurrent-state restoring gain\n\
+           --conditioning NAME         generate | hybrid | reconstruct\n\
+           --reference-fidelity-min X  Hybrid reference-strength floor, 0..1\n\
+           --reference-fidelity-max X  Hybrid/reconstruction ceiling, 0..1\n\
+           --reference-dropout X       Null-reference probability in hybrid mode\n\n\
          Optimizer:\n\
            --learning-rate X           AdamW peak learning rate\n\
+           --optimizer NAME            adamw | hybrid-muon\n\
            --weight-decay X            AdamW decoupled weight decay\n\
            --beta1 X --beta2 X         Adam moment coefficients\n\
            --adam-epsilon X             Adam denominator epsilon\n\
            --grad-clip X               Global L2 clip; 0 disables\n\
            --warmup-updates N          Linear optimizer warmup length\n\n\
+           --muon-momentum X           Muon momentum coefficient\n\
+           --muon-ns-steps N           Newton-Schulz iterations, 1..10\n\n\
          Dynamics and ablations:\n\
            --reaction-gain X           Gray-Scott contribution\n\
            --phase-gain X              Complex-phase contribution\n\

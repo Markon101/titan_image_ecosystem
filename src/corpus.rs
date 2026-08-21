@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 
 pub struct TargetSample {
     pub image: Tensor,
+    pub reference_micro: Tensor,
+    pub reference_macro: Tensor,
     pub genome: Vec<f32>,
     pub genome_tensor: Tensor,
     pub index: usize,
@@ -33,6 +35,8 @@ struct SourceImage {
 struct CachedImage {
     index: usize,
     image: Tensor,
+    reference_micro: Tensor,
+    reference_macro: Tensor,
 }
 
 pub struct ImageCorpus {
@@ -40,6 +44,8 @@ pub struct ImageCorpus {
     cache: VecDeque<CachedImage>,
     cache_capacity: usize,
     resolution: usize,
+    micro_size: usize,
+    macro_size: usize,
     seed: u64,
     mode: TrainingMode,
     fingerprint: u64,
@@ -113,14 +119,26 @@ impl ImageCorpus {
                 format!("corpus preflight failed for {}", source.path.display())
             })?;
             if index < config.image_cache {
-                let values = planar_from_image(decoded, config.train_resolution);
+                let image = Tensor::from_vec(
+                    planar_from_image(decoded.clone(), config.train_resolution),
+                    (1, 3, config.train_resolution, config.train_resolution),
+                    device,
+                )?;
+                let reference_micro = Tensor::from_vec(
+                    planar_from_image(decoded.clone(), config.micro_size),
+                    (1, 3, config.micro_size, config.micro_size),
+                    device,
+                )?;
+                let reference_macro = Tensor::from_vec(
+                    planar_from_image(decoded, config.macro_size),
+                    (1, 3, config.macro_size, config.macro_size),
+                    device,
+                )?;
                 cache.push_back(CachedImage {
                     index,
-                    image: Tensor::from_vec(
-                        values,
-                        (1, 3, config.train_resolution, config.train_resolution),
-                        device,
-                    )?,
+                    image,
+                    reference_micro,
+                    reference_macro,
                 });
             }
         }
@@ -130,6 +148,8 @@ impl ImageCorpus {
             cache,
             cache_capacity: config.image_cache,
             resolution: config.train_resolution,
+            micro_size: config.micro_size,
+            macro_size: config.macro_size,
             seed: config.seed,
             mode: config.mode,
             fingerprint,
@@ -168,28 +188,52 @@ impl ImageCorpus {
 
     pub fn sample(&mut self, episode: u64, device: &Device) -> Result<TargetSample> {
         let index = self.index_for_episode(episode);
-        let image = if let Some(position) = self.cache.iter().position(|entry| entry.index == index)
+        let (image, reference_micro, reference_macro) = if let Some(position) =
+            self.cache.iter().position(|entry| entry.index == index)
         {
             let entry = self.cache.remove(position).expect("cache position exists");
-            let image = entry.image.clone();
+            let tensors = (
+                entry.image.clone(),
+                entry.reference_micro.clone(),
+                entry.reference_macro.clone(),
+            );
             self.cache.push_back(entry);
-            image
+            tensors
         } else {
-            let values = load_planar(&self.sources[index].path, self.resolution)?;
-            let image = Tensor::from_vec(values, (1, 3, self.resolution, self.resolution), device)?;
+            let decoded = decode_source(&self.sources[index].path)
+                .with_context(|| format!("cannot decode {}", self.sources[index].path.display()))?;
+            let image = Tensor::from_vec(
+                planar_from_image(decoded.clone(), self.resolution),
+                (1, 3, self.resolution, self.resolution),
+                device,
+            )?;
+            let reference_micro = Tensor::from_vec(
+                planar_from_image(decoded.clone(), self.micro_size),
+                (1, 3, self.micro_size, self.micro_size),
+                device,
+            )?;
+            let reference_macro = Tensor::from_vec(
+                planar_from_image(decoded, self.macro_size),
+                (1, 3, self.macro_size, self.macro_size),
+                device,
+            )?;
             if self.cache.len() == self.cache_capacity {
                 self.cache.pop_front();
             }
             self.cache.push_back(CachedImage {
                 index,
                 image: image.clone(),
+                reference_micro: reference_micro.clone(),
+                reference_macro: reference_macro.clone(),
             });
-            image
+            (image, reference_micro, reference_macro)
         };
         let source = &self.sources[index];
         let genome = source.genome.clone();
         Ok(TargetSample {
             image,
+            reference_micro,
+            reference_macro,
             genome_tensor: Tensor::from_vec(genome.clone(), genome.len(), device)?,
             genome,
             index,
@@ -290,6 +334,7 @@ fn generated_name(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 fn load_planar(path: &Path, resolution: usize) -> Result<Vec<f32>> {
     Ok(planar_from_image(decode_source(path)?, resolution))
 }
