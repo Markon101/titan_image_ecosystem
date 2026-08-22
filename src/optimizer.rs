@@ -37,6 +37,10 @@ pub struct OptimizerStats {
     pub gradient_norm: f32,
     pub gradient_rms: f32,
     pub clip_scale: f32,
+    pub core_gradient_rms: f32,
+    pub decoder_gradient_rms: f32,
+    pub core_updated_parameters: usize,
+    pub decoder_updated_parameters: usize,
     pub effective_learning_rate: f64,
     pub updated_variables: usize,
     pub updated_parameters: usize,
@@ -108,11 +112,23 @@ impl PersistentAdamW {
     fn step(&mut self, gradients: &GradStore) -> Result<OptimizerStats> {
         let mut squared_norm = 0.0f64;
         let mut updated_variables = 0usize;
+        let mut core_squared_norm = 0.0f64;
+        let mut decoder_squared_norm = 0.0f64;
+        let mut core_updated_parameters = 0usize;
+        let mut decoder_updated_parameters = 0usize;
         let mut updated_parameters = 0usize;
         let mut muon_variables = 0usize;
         for state in &self.variables {
             if let Some(gradient) = gradients.get(state.variable.as_tensor()) {
-                squared_norm += gradient.sqr()?.sum_all()?.to_scalar::<f32>()? as f64;
+                let gradient_energy = gradient.sqr()?.sum_all()?.to_scalar::<f32>()? as f64;
+                squared_norm += gradient_energy;
+                if state.name.starts_with("dynamics.") {
+                    core_squared_norm += gradient_energy;
+                    core_updated_parameters += gradient.elem_count();
+                } else if state.name.starts_with("renderer.") {
+                    decoder_squared_norm += gradient_energy;
+                    decoder_updated_parameters += gradient.elem_count();
+                }
                 updated_variables += 1;
                 updated_parameters += gradient.elem_count();
                 muon_variables += usize::from(state.use_muon);
@@ -196,10 +212,22 @@ impl PersistentAdamW {
         Ok(OptimizerStats {
             gradient_norm: gradient_norm as f32,
             gradient_rms: (gradient_norm / (updated_parameters as f64).sqrt()) as f32,
+            core_gradient_rms: if core_updated_parameters > 0 {
+                (core_squared_norm / core_updated_parameters as f64).sqrt() as f32
+            } else {
+                0.0
+            },
+            decoder_gradient_rms: if decoder_updated_parameters > 0 {
+                (decoder_squared_norm / decoder_updated_parameters as f64).sqrt() as f32
+            } else {
+                0.0
+            },
             clip_scale: clip_scale as f32,
             effective_learning_rate: learning_rate,
             updated_variables,
             updated_parameters,
+            core_updated_parameters,
+            decoder_updated_parameters,
             muon_variables,
             backward_seconds: 0.0,
             step_seconds: 0.0,
@@ -253,7 +281,7 @@ impl PersistentAdamW {
             .context("optimizer has no optimizer-kind marker")?
             .to_scalar::<i64>()?;
         if saved_kind != self.optimizer_kind as i64 {
-            bail!("optimizer kind does not match the requested v7 configuration");
+            bail!("optimizer kind does not match the requested v8 configuration");
         }
         let updates = tensors
             .get("optimizer.updates")
@@ -300,12 +328,11 @@ fn zeropower_newton_schulz(gradient: &Tensor, steps: usize) -> Result<Tensor> {
     } else {
         gradient.clone()
     };
-    let norm = value
-        .sqr()?
-        .sum_all()?
-        .sqrt()?
-        .to_scalar::<f32>()?
-        .max(MUON_EPSILON as f32) as f64;
+    let raw_norm = value.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()? as f64;
+    if !raw_norm.is_finite() {
+        bail!("non-finite Muon direction norm; optimizer update was not applied");
+    }
+    let norm = raw_norm.max(MUON_EPSILON);
     value = value.affine(1.0 / norm, 0.0)?;
     for _ in 0..steps {
         let gram = value.matmul(&value.t()?)?;
@@ -316,11 +343,16 @@ fn zeropower_newton_schulz(gradient: &Tensor, steps: usize) -> Result<Tensor> {
             .affine(MUON_A, 0.0)?
             .add(&polynomial.matmul(&value)?)?;
     }
-    if transposed {
-        value.t()?.contiguous().map_err(Into::into)
+    let output = if transposed {
+        value.t()?.contiguous()?
     } else {
-        Ok(value)
+        value
+    };
+    let output_rms = output.sqr()?.mean_all()?.sqrt()?.to_scalar::<f32>()?;
+    if !output_rms.is_finite() {
+        bail!("non-finite Muon direction after Newton-Schulz; optimizer update was not applied");
     }
+    Ok(output)
 }
 
 fn atomic_safetensors(tensors: &HashMap<String, Tensor>, path: &Path) -> Result<()> {

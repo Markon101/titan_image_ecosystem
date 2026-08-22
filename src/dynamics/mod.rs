@@ -4,7 +4,7 @@ mod operators;
 use crate::config::{Integrator, RunConfig};
 use crate::interface::RecurrentInterface;
 use crate::state::WorldState;
-use crate::tensor_ops::{broadcast_vector, mean_abs, zeros, PeriodicUpsampler};
+use crate::tensor_ops::{broadcast_vector, mean_abs, smooth_limit, zeros, PeriodicUpsampler};
 use anyhow::Result;
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
@@ -204,10 +204,8 @@ impl DynamicsSystem {
                 )?
             }
         };
-        field
-            .add(&derivative.affine(self.config.dt as f64, 0.0)?)?
-            .clamp(-self.config.state_limit, self.config.state_limit)
-            .map_err(Into::into)
+        let proposed = field.add(&derivative.affine(self.config.dt as f64, 0.0)?)?;
+        smooth_limit(&proposed, self.config.state_limit).map_err(Into::into)
     }
 
     #[allow(clippy::too_many_arguments)]

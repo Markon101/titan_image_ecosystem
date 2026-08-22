@@ -1,19 +1,22 @@
-# TITAN Image Ecosystem v7
+# TITAN Image Ecosystem v8
 
-TITAN Image v7 is a phone-first, multiscale recurrent image organism for the
-Galaxy S25 Ultra in Termux. It combines local neural cellular automata, a small
-looped attention interface, GRU memory, runtime-sized morphic residual memory,
-optional mathematical field operators, and an implicit high-resolution
+TITAN Image v8 is the recurrent-stability release of the phone-first,
+multiscale image organism for the Galaxy S25 Ultra in Termux. It combines local
+neural cellular automata, a looped global interface, bounded GRU/MorphicStack
+memory, optional mathematical field operators, and an implicit high-resolution
 renderer.
 
-v7 is intentionally checkpoint-incompatible with v6 and writes only v7
-artifacts. Existing files under /sdcard/Download/titan_image_v6 are not read or
-overwritten. The default output root is /sdcard/Download/titan_image_v7.
+v8 is intentionally checkpoint-incompatible with v7 and writes only v8
+artifacts. Existing files under /sdcard/Download/titan_image_v7 are never read
+or overwritten. The default output root is /sdcard/Download/titan_image_v8.
 
-This first v7 commit establishes the architecture required for adjustable
-reference reconstruction and later generative transport. It is not yet a
-diffusion or flow-matching model: its training objective remains endpoint image
-matching after recurrent development.
+The v8 boundary follows an artifact-backed v7 saturation postmortem: v7 fields
+could reach 100% hard-clamp occupancy while recurrent-memory RMS exceeded 300,
+and a coordinate/genome decoder could conceal the dead core. v8 bounds every
+recurrent feedback path, restores the intended zero-output initialization,
+adds differentiable stability barriers and a safe-stop watchdog, and reports
+core-versus-decoder gradients. It remains an endpoint recurrent-development
+model, not diffusion or flow matching.
 
 ## Start here
 
@@ -29,14 +32,14 @@ Start a balanced hybrid reconstruction/generation organism:
 ./target/release/titan_image \
   --fresh \
   --corpus-dir /sdcard/Download/titan_image_sources \
-  --output-dir /sdcard/Download/titan_image_v7 \
+  --output-dir /sdcard/Download/titan_image_v8 \
   --profile s25-balanced \
   --style alien-fluid \
   --mode family \
   --conditioning hybrid \
   --steps 1600 \
   --threads 8 \
-  --run-tag morphic-rin-v7-01
+  --run-tag morphic-rin-v8-01
 ~~~
 
 Continue by repeating the exact training and architecture settings without
@@ -48,7 +51,7 @@ For a reconstruction-heavy experiment:
 ./target/release/titan_image \
   --fresh \
   --corpus-dir /sdcard/Download/titan_image_sources \
-  --output-dir /sdcard/Download/titan_image_v7 \
+  --output-dir /sdcard/Download/titan_image_v8 \
   --profile s25-balanced \
   --style pure-nca \
   --mode family \
@@ -56,7 +59,7 @@ For a reconstruction-heavy experiment:
   --reference-fidelity-max 0.95 \
   --steps 1600 \
   --threads 8 \
-  --run-tag reconstruct-v7-01
+  --run-tag reconstruct-v8-01
 ~~~
 
 For the matched autonomous control, use --conditioning generate. That removes
@@ -91,8 +94,34 @@ This separates spatial size, learned capacity, and compute depth:
 - --morph-layers: physical memory-block capacity;
 - --morph-depth: active learned blocks.
 
-Changing these controls selects a distinct checkpoint architecture. v7 does
+Changing these controls selects a distinct checkpoint architecture. v8 does
 not yet resize a saved checkpoint across them.
+
+## Recurrent stability
+
+The stable defaults are deliberately conservative:
+
+- `dt=0.12`, `nca_gain=0.25`, and `state_leak=0.10`;
+- `memory_limit=3.0` and `morph_residual_gain=0.02`;
+- independent full memory reset at episode boundaries;
+- a quartic smooth state projection instead of a hard clamp;
+- bounded `tanh` interface writeback;
+- state and memory soft-barrier weights of `0.02` and `0.002`;
+- global gradient clipping at 1.0 with 48-update warmup;
+- one full-core window for each decoder-only window in balanced/fast profiles.
+
+`--core-update-every 2` means the renderer receives two updates for every one
+core update: one full-core window and one decoder-only window. Use `1` when
+both core and renderer should update every window.
+
+The stability watchdog stops after eight consecutive windows above 25%
+near-bound occupancy, saves a normal resumable checkpoint, marks
+`stability_stopped=true`, and skips gallery rollout. Set
+`--stability-patience 0` only for deliberate instability ablations.
+
+Training logs and CSV rows report development steps/second, not optimizer
+windows/second. The final metadata contains both average milliseconds per
+development step and average development steps/second.
 
 ## Adjustable reference conditioning
 
@@ -125,7 +154,7 @@ experimental until matched wall-clock-controlled ablations earn it.
 
 ## ARM, OpenCL, and NPU boundary
 
-The release build retains native AArch64 and FP16 instruction support. v7 also
+The release build retains native AArch64 and FP16 instruction support. v8 also
 precomputes cell-clock banks rather than allocating a host vector and Tensor at
 every NCA step. Model and optimizer tensors remain FP32.
 
@@ -134,21 +163,22 @@ the current Termux OpenCL loader enumerates zero platforms and direct vendor
 loading is blocked by Android linker namespaces. QNN/HTP is a fixed-graph
 inference deployment route, not a Candle autograd backend.
 
-See RESEARCH_V7.md for the research and accelerator record.
+See RESEARCH_V7.md for the architecture and accelerator record and
+RESEARCH_V8.md for the stability postmortem.
 
 ## Profiles
 
-| Profile | Fields | Channels | Interface | Loops / morph | Train / output |
-|---|---:|---:|---:|---:|---:|
-| s25-fast | 48 / 24 | 16 | 4x4x96 | 2 / L2 of 3 | 128 / 512 |
-| s25-balanced | 64 / 32 | 24 | 4x4x128 | 3 / L3 of 4 | 192 / 768 |
-| s25-quality | 80 / 40 | 32 | 5x5x160 | 4 / L4 of 6 | 256 / 1024 |
+| Profile | Fields | Channels | Interface | Loops / morph | Core cadence | Train / output |
+|---|---:|---:|---:|---:|---:|---:|
+| s25-fast | 48 / 24 | 16 | 4x4x96 | 2 / L2 of 3 | 2 | 128 / 512 |
+| s25-balanced | 64 / 32 | 24 | 4x4x128 | 3 / L3 of 4 | 2 | 192 / 768 |
+| s25-quality | 80 / 40 | 32 | 5x5x160 | 4 / L4 of 6 | 1 | 256 / 1024 |
 
 ## Artifacts
 
-v7 writes separately named model, optimizer, world, checkpoint-manifest,
+v8 writes separately named model, optimizer, world, checkpoint-manifest,
 metrics, metadata, raw/mastered image, state-atlas, snapshot, and gallery
-artifacts with the titan_image_*_v7 prefix. World checkpoints now include
+artifacts with the titan_image_*_v8 prefix. World checkpoints now include
 recurrent-interface memory. Model, world, optimizer kind/moments,
 configuration signature, corpus fingerprint, and world step must agree before
 continuation.

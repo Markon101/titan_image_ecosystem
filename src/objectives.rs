@@ -10,11 +10,16 @@ pub struct LossOutput {
     pub structure: Tensor,
     pub seam: Tensor,
     pub gamut: Tensor,
+    pub state: Tensor,
+    pub memory: Tensor,
 }
 
 pub fn visual_loss(
     rendered: &RenderOutput,
     target: &Tensor,
+    micro: &Tensor,
+    macro_field: &Tensor,
+    memory: &Tensor,
     config: &RunConfig,
 ) -> Result<LossOutput> {
     let image = &rendered.image;
@@ -27,12 +32,17 @@ pub fn visual_loss(
     let structure = gradient_distribution_loss(image, &target)?;
     let seam = seam_energy(image)?;
     let gamut = rendered.gamut_excess.clone();
+    let state = stability_barrier(micro, config.state_soft_limit)?
+        .add(&stability_barrier(macro_field, config.state_soft_limit)?.affine(0.5, 0.0)?)?;
+    let memory = stability_barrier(memory, 0.5 * config.memory_limit)?;
     let total = content
         .affine(config.loss_content as f64, 0.0)?
         .add(&palette.affine(config.loss_palette as f64, 0.0)?)?
         .add(&structure.affine(config.loss_structure as f64, 0.0)?)?
         .add(&seam.affine(config.loss_seam as f64, 0.0)?)?
-        .add(&gamut.affine(config.loss_gamut as f64, 0.0)?)?;
+        .add(&gamut.affine(config.loss_gamut as f64, 0.0)?)?
+        .add(&state.affine(config.loss_state as f64, 0.0)?)?
+        .add(&memory.affine(config.loss_memory as f64, 0.0)?)?;
     Ok(LossOutput {
         total,
         content,
@@ -40,6 +50,8 @@ pub fn visual_loss(
         structure,
         seam,
         gamut,
+        state,
+        memory,
     })
 }
 
@@ -48,6 +60,15 @@ pub fn visual_loss(
 /// while remaining much cheaper than a learned perceptual network on a phone.
 fn texture_loss(image: &Tensor, target: &Tensor) -> Result<Tensor> {
     gram_loss(image, target)?.add(&autocorrelation_loss(image, target)?.affine(0.7, 0.0)?)
+}
+
+fn stability_barrier(value: &Tensor, soft_limit: f32) -> Result<Tensor> {
+    value
+        .abs()?
+        .affine(1.0, -(soft_limit as f64))?
+        .clamp(0.0f32, f32::MAX)?
+        .sqr()?
+        .mean_all()
 }
 
 fn gram_loss(image: &Tensor, target: &Tensor) -> Result<Tensor> {
@@ -191,8 +212,20 @@ mod tests {
             image: image.clone(),
             gamut_excess: Tensor::new(0.0f32, &Device::Cpu)?,
         };
-        let loss = visual_loss(&rendered, &image, &config)?;
+        let state = Tensor::zeros((1, 12, 16, 16), DType::F32, &Device::Cpu)?;
+        let memory = Tensor::zeros((1, 32), DType::F32, &Device::Cpu)?;
+        let loss = visual_loss(&rendered, &image, &state, &state, &memory, &config)?;
         assert!(loss.total.to_scalar::<f32>()? < 1e-7);
+        Ok(())
+    }
+
+    #[test]
+    fn stability_barrier_ignores_center_and_penalizes_excess() -> Result<()> {
+        let values = Tensor::new(&[-2.0f32, -0.5, 0.0, 0.5, 2.0], &Device::Cpu)?;
+        let loss = stability_barrier(&values, 1.0)?.to_scalar::<f32>()?;
+        assert!((loss - 0.4).abs() < 1e-6);
+        let centered = Tensor::new(&[-0.5f32, 0.0, 0.5], &Device::Cpu)?;
+        assert_eq!(stability_barrier(&centered, 1.0)?.to_scalar::<f32>()?, 0.0);
         Ok(())
     }
 }

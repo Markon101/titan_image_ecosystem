@@ -46,7 +46,10 @@ impl WorldState {
             return Ok(Self {
                 micro: self.micro.detach(),
                 macro_field: self.macro_field.detach(),
-                memory: self.memory.detach(),
+                memory: self
+                    .memory
+                    .detach()
+                    .affine(1.0 - config.memory_reset as f64, 0.0)?,
                 step: self.step,
                 age: self.age,
                 episode,
@@ -67,7 +70,10 @@ impl WorldState {
                 .detach()
                 .affine(keep, 0.0)?
                 .add(&seeded.macro_field.affine(reset, 0.0)?)?,
-            memory: self.memory.detach().affine(keep, 0.0)?,
+            memory: self
+                .memory
+                .detach()
+                .affine(1.0 - config.memory_reset as f64, 0.0)?,
             step: self.step,
             age: 0,
             episode,
@@ -143,6 +149,28 @@ mod tests {
             a.micro.flatten_all()?.to_vec1::<f32>()?,
             b.micro.flatten_all()?.to_vec1::<f32>()?
         );
+        Ok(())
+    }
+
+    #[test]
+    fn memory_reset_is_independent_from_field_reset() -> Result<()> {
+        let config = RunConfig {
+            micro_size: 24,
+            macro_size: 12,
+            channels: 12,
+            interface_width: 32,
+            episode_reset: 0.0,
+            memory_reset: 1.0,
+            train_resolution: 24,
+            output_resolution: 24,
+            ..RunConfig::default()
+        };
+        let mut world = WorldState::fresh(&config, 9, &Device::Cpu)?;
+        let original_micro = world.micro.flatten_all()?.to_vec1::<f32>()?;
+        world.memory = Tensor::ones((1, 32), DType::F32, &Device::Cpu)?;
+        let reset = world.reseed_for_episode(&config, 10, 1, 0)?;
+        assert_eq!(reset.micro.flatten_all()?.to_vec1::<f32>()?, original_micro);
+        assert_eq!(reset.memory.abs()?.max_all()?.to_scalar::<f32>()?, 0.0);
         Ok(())
     }
 }

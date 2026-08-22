@@ -1,4 +1,4 @@
-# TITAN Image v7 mathematical specification
+# TITAN Image v8 mathematical specification
 
 ## State hierarchy
 
@@ -26,9 +26,26 @@ T'_k = T_k + 0.25 P_O A_k
 
 T''_k = T'_k + 0.25 P_2 swish(P_1 norm(T'_k)).
 
-The GRU updates h from token mean, then the active prefix of morphic residual
-blocks refines it. A bounded h residual is returned to every token.
-Zero-initialized write heads map tokens back to spatial micro/macro biases.
+The GRU first produces a bounded candidate, then the active morphic prefix uses
+small residual gates:
+
+h'_0 = B_H(GRU(mean(T''_k), h_k))
+
+h'_(l+1) = B_H(h'_l + alpha / sqrt(l+1) W_2,l swish(W_1,l norm(h'_l))).
+
+The smooth odd bound is
+
+B_L(x) = x / (1 + (x/L)^4)^(1/4).
+
+It approaches +/-L without a finite-input zero derivative. The spatial
+writebacks are independently bounded:
+
+I_X = g_I upsample(tanh(W_X T)),  I_M = g_I upsample(tanh(W_M T)).
+
+Morphic contracts, attention/feed-forward residual outputs, NCA outputs, and
+interface write heads start at zero; normalization scales start at one and all
+biases at zero. This makes the initial recurrent system identity-like rather
+than secretly randomizing nominal zero-output modules.
 
 Attention is confined to G^2 tokens, so its quadratic term is independent of
 dense render resolution.
@@ -41,22 +58,20 @@ scheduled without host allocation per step.
 
 The derivative is:
 
-F(Z) = F_NCA(Z) + F_interface(Z) + F_physical(Z) - lambda Z.
+F(Z) = F_NCA(Z) + I(Z,h) + F_physical(Z) - lambda Z.
 
-The final term is v7's restoring leak against hard-clamp drift. The hard
-projection remains a safety rail, not a claimed dynamical feature.
-
-Euler and midpoint remain available:
-
-Z_(n+1) = clip(Z_n + dt F(Z_n))
-
-or
+Euler proposes U_(n+1) = Z_n + dt F(Z_n). Midpoint instead uses
 
 k_1 = F(Z_n)
 
 k_2 = F(Z_n + dt k_1/2)
 
-Z_(n+1) = clip(Z_n + dt k_2).
+U_(n+1) = Z_n + dt k_2.
+
+Both finish with the smooth projection Z_(n+1) = B_L(U_(n+1)); v8 has no hard
+state clamp. At the defaults, active NCA movement is bounded by
+dt*g_NCA = 0.12*0.25 = 0.03 before other terms, while restoring movement at the
+3.5 state boundary is dt*lambda*3.5 = 0.042.
 
 ## Reference conditioning
 
@@ -67,16 +82,23 @@ cannot be confused with naturally weak reference features.
 
 ## Objective boundary
 
-v7 retains the v6 endpoint objective: aligned pixel L1 for single/family mode
-or normalized color/autocorrelation statistics for texture mode, plus palette,
-gradient-structure, seam, and gamut terms.
+v8 retains the endpoint image objective: aligned pixel L1 for single/family
+mode or normalized color/autocorrelation statistics for texture mode, plus
+palette, gradient-structure, seam, and gamut terms. It adds soft energy
+barriers rather than a zero-seeking global L2 penalty:
 
-This is reconstruction-conditioned recurrent development. It is not yet a
-score-matching, denoising-diffusion, or flow-matching objective.
+L_state = lambda_s [E relu(|X|-s)^2 + 0.5 E relu(|M|-s)^2]
+
+L_memory = lambda_h E relu(|h|-H/2)^2.
+
+These terms are active on full-core windows; detached decoder-only dynamics do
+not falsely claim core gradients. This remains reconstruction-conditioned
+recurrent development, not score matching, denoising diffusion, or flow
+matching.
 
 ## Hybrid Muon
 
-For selected interface matrix gradient G, v7 forms momentum and applies
+For selected interface matrix gradient G, v8 forms momentum and applies
 Newton-Schulz iterations to a Frobenius-normalized matrix:
 
 X <- aX + (bXX^T + c(XX^T)^2)X,
@@ -86,3 +108,7 @@ and decoupled weight decay precede both update geometries.
 
 Muon's usefulness in this small recurrent visual model is an experimental
 question, not a consequence of the equation.
+
+Global gradient norm must be finite before any update. Muon additionally
+rejects a nonfinite direction norm before Newton-Schulz normalization instead of
+silently converting it into an arbitrary direction.

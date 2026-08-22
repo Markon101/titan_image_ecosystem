@@ -119,7 +119,7 @@ pub fn deterministic_clock_mask(
 }
 
 /// Global octave Fourier coordinates. v4's 64-cycle cell coordinates visibly
-/// stamped the decoder lattice into output; v7 uses only canvas-scale bands.
+/// stamped the decoder lattice into output; v8 uses only canvas-scale bands.
 pub fn coordinate_features(resolution: usize, bands: usize, device: &Device) -> Result<Tensor> {
     let channels = bands * 4;
     let plane = resolution * resolution;
@@ -270,6 +270,15 @@ pub fn variance(x: &Tensor) -> Result<Tensor> {
     x.broadcast_sub(&mean)?.sqr()?.mean_all()
 }
 
+/// Smooth odd projection with asymptotes at +/- limit. Unlike a hard clamp,
+/// its derivative remains nonzero for every finite input, while the quartic
+/// shoulder stays close to identity through the useful center of the state.
+pub fn smooth_limit(value: &Tensor, limit: f32) -> Result<Tensor> {
+    let scaled = value.affine(1.0 / limit as f64, 0.0)?;
+    let denominator = scaled.sqr()?.sqr()?.affine(1.0, 1.0)?.powf(0.25)?;
+    value.broadcast_div(&denominator)
+}
+
 pub fn channel_mean(x: &Tensor) -> Result<Tensor> {
     let (_, c, h, w) = x.dims4()?;
     x.reshape((1, c, h * w))?.mean(D::Minus1)
@@ -285,6 +294,7 @@ pub fn splitmix64(mut value: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_nn::{Init, VarBuilder, VarMap};
 
     #[test]
     fn clock_is_repeatable_and_nontrivial() -> Result<()> {
@@ -330,6 +340,34 @@ mod tests {
         let x = Tensor::from_vec(vec![1f32, 2., 3., 4.], (1, 1, 1, 4), &Device::Cpu)?;
         let y = periodic_shift(&x, 0, 1)?;
         assert_eq!(y.flatten_all()?.to_vec1::<f32>()?, vec![4., 1., 2., 3.]);
+        Ok(())
+    }
+
+    #[test]
+    fn smooth_limit_is_bounded_odd_and_near_identity_at_the_origin() -> Result<()> {
+        let values = Tensor::new(&[-100.0f32, -0.1, 0.0, 0.1, 100.0], &Device::Cpu)?;
+        let limited = smooth_limit(&values, 3.5)?.to_vec1::<f32>()?;
+        assert!(limited.iter().all(|value| value.abs() < 3.5));
+        assert!((limited[0] + limited[4]).abs() < 1e-5);
+        assert!((limited[1] + 0.1).abs() < 1e-5);
+        assert_eq!(limited[2], 0.0);
+        assert!((limited[3] - 0.1).abs() < 1e-5);
+        Ok(())
+    }
+
+    #[test]
+    fn smooth_limit_retains_a_finite_gradient_outside_the_shoulder() -> Result<()> {
+        let variables = VarMap::new();
+        let builder = VarBuilder::from_varmap(&variables, DType::F32, &Device::Cpu);
+        let value = builder.get_with_hints(1, "probe", Init::Const(10.0))?;
+        let output = smooth_limit(&value, 3.5)?.sum_all()?;
+        let gradients = output.backward()?;
+        let gradient = gradients
+            .get(&value)
+            .expect("smooth limit input gradient")
+            .to_vec1::<f32>()?[0];
+        assert!(gradient.is_finite());
+        assert!(gradient > 0.0);
         Ok(())
     }
 }

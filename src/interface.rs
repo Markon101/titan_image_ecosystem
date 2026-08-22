@@ -1,5 +1,5 @@
 use crate::config::RunConfig;
-use crate::tensor_ops::PeriodicUpsampler;
+use crate::tensor_ops::{smooth_limit, PeriodicUpsampler};
 use anyhow::Result;
 use candle_core::{Device, Tensor, D};
 use candle_nn::{Init, Linear, Module, RmsNorm, VarBuilder};
@@ -68,17 +68,23 @@ impl MorphicBlock {
         Ok(Self {
             norm: candle_nn::rms_norm(width, 1e-5, vb.pp("norm"))?,
             expand: candle_nn::linear(width, width * 2, vb.pp("expand"))?,
-            contract: candle_nn::linear(width * 2, width, vb.pp("contract"))?,
+            contract: zero_linear(width * 2, width, vb.pp("contract"))?,
         })
     }
 
-    fn forward(&self, value: &Tensor, index: usize, tracked: bool) -> Result<Tensor> {
+    fn forward(
+        &self,
+        value: &Tensor,
+        index: usize,
+        residual_gain: f32,
+        tracked: bool,
+    ) -> Result<Tensor> {
         let hidden = swish(&linear_mode(
             &self.expand,
             &self.norm.forward(value)?,
             tracked,
         )?)?;
-        let gain = 0.30 / ((index + 1) as f64).sqrt();
+        let gain = residual_gain as f64 / ((index + 1) as f64).sqrt();
         value
             .add(&linear_mode(&self.contract, &hidden, tracked)?.affine(gain, 0.0)?)
             .map_err(Into::into)
@@ -110,6 +116,8 @@ pub struct RecurrentInterface {
     width: usize,
     loops: usize,
     morph_depth: usize,
+    morph_residual_gain: f32,
+    memory_limit: f32,
     gain: f32,
 }
 
@@ -214,6 +222,8 @@ impl RecurrentInterface {
             loops: config.interface_loops,
             morph_depth: config.morph_depth,
             gain: config.interface_gain,
+            morph_residual_gain: config.morph_residual_gain,
+            memory_limit: config.memory_limit,
         })
     }
 
@@ -283,16 +293,21 @@ impl RecurrentInterface {
                 &next_memory,
                 tracked,
             )?;
+            next_memory = smooth_limit(&next_memory, self.memory_limit)?;
             for (index, block) in self.morphic.iter().take(self.morph_depth).enumerate() {
-                next_memory = block.forward(&next_memory, index, tracked)?;
+                next_memory =
+                    block.forward(&next_memory, index, self.morph_residual_gain, tracked)?;
+                next_memory = smooth_limit(&next_memory, self.memory_limit)?;
             }
             tokens = tokens.broadcast_add(&next_memory.affine(0.10, 0.0)?)?;
         }
 
         let micro_grid = linear_mode(&self.micro_write, &tokens, tracked)?
+            .tanh()?
             .t()?
             .reshape((1, self.micro_write.weight().dim(0)?, self.grid, self.grid))?;
         let macro_grid = linear_mode(&self.macro_write, &tokens, tracked)?
+            .tanh()?
             .t()?
             .reshape((1, self.macro_write.weight().dim(0)?, self.grid, self.grid))?;
         let micro_bias = self
@@ -397,6 +412,62 @@ mod tests {
         assert_eq!(output.macro_bias.dims4()?, (1, 12, 12, 12));
         assert_eq!(output.memory.dims2()?, (1, 32));
         assert!(output.micro_bias.abs()?.max_all()?.to_scalar::<f32>()? < 1e-7);
+        Ok(())
+    }
+
+    #[test]
+    fn recurrent_interface_remains_bounded_over_long_rollout() -> Result<()> {
+        let device = Device::Cpu;
+        let config = RunConfig {
+            micro_size: 24,
+            macro_size: 12,
+            channels: 12,
+            genome_dim: 4,
+            interface_grid: 3,
+            interface_width: 32,
+            interface_loops: 3,
+            morph_layers: 4,
+            morph_depth: 3,
+            memory_limit: 2.0,
+            train_resolution: 24,
+            output_resolution: 24,
+            ..RunConfig::default()
+        };
+        let variables = VarMap::new();
+        let interface = RecurrentInterface::new(
+            &config,
+            VarBuilder::from_varmap(&variables, DType::F32, &device),
+            &device,
+        )?;
+        let micro = Tensor::zeros((1, 12, 24, 24), DType::F32, &device)?;
+        let macro_field = Tensor::zeros((1, 12, 12, 12), DType::F32, &device)?;
+        let reference_micro = Tensor::zeros((1, 3, 24, 24), DType::F32, &device)?;
+        let reference_macro = Tensor::zeros((1, 3, 12, 12), DType::F32, &device)?;
+        let genome = Tensor::zeros(4, DType::F32, &device)?;
+        let mut memory = Tensor::zeros((1, 32), DType::F32, &device)?;
+        for step in 0..256 {
+            let output = interface.forward(
+                &micro,
+                &macro_field,
+                &reference_micro,
+                &reference_macro,
+                &genome,
+                &memory,
+                0.0,
+                (step % 64) as f32 / 64.0,
+                false,
+            )?;
+            memory = output.memory;
+            assert!(
+                memory.abs()?.max_all()?.to_scalar::<f32>()? < config.memory_limit,
+                "memory escaped its smooth bound at step {step}"
+            );
+            assert!(
+                output.micro_bias.abs()?.max_all()?.to_scalar::<f32>()?
+                    <= config.interface_gain + 1e-6,
+                "micro writeback escaped its tanh bound at step {step}"
+            );
+        }
         Ok(())
     }
 }

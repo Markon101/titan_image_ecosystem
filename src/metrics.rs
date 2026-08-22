@@ -1,5 +1,4 @@
 use crate::render::{channel_moments, seam_energy};
-use crate::tensor_ops::variance;
 use anyhow::Result;
 use candle_core::Tensor;
 use serde::Serialize;
@@ -61,6 +60,14 @@ pub struct MetricRecord {
     pub reference_fidelity: f32,
     pub interface_memory_rms: f32,
     pub muon_variables: usize,
+    pub loss_state: f32,
+    pub loss_memory: f32,
+    pub core_gradient_rms: f32,
+    pub decoder_gradient_rms: f32,
+    pub core_updated_parameters: usize,
+    pub decoder_updated_parameters: usize,
+    pub stability_violation: bool,
+    pub development_steps_per_second: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -84,12 +91,12 @@ pub struct StateDiagnostics {
 
 impl MetricRecord {
     pub fn write_header(mut writer: impl Write) -> Result<()> {
-        writeln!(writer, "step,age,episode,target_index,optimizer_update,core_trained,macro_updates,episode_started,micro_movement_mean,micro_movement_max,macro_movement_mean,macro_movement_max,micro_state_rms,macro_state_rms,micro_state_mean_abs,macro_state_mean_abs,micro_clamp_fraction,macro_clamp_fraction,micro_channel_rms_min,micro_channel_rms_max,macro_channel_rms_min,macro_channel_rms_max,image_delta_valid,image_delta_mean,image_delta_rms,image_variance,seam_energy,edge_energy,gamut_excess,red_mean,green_mean,blue_mean,red_variance,green_variance,blue_variance,rg_correlation,rb_correlation,gb_correlation,loss_total,loss_content,loss_palette,loss_structure,loss_seam,loss_gamut,gradient_norm,gradient_rms,gradient_clip_scale,updated_variables,updated_parameters,effective_learning_rate,window_seconds,reference_fidelity,interface_memory_rms,muon_variables")?;
+        writeln!(writer, "step,age,episode,target_index,optimizer_update,core_trained,macro_updates,episode_started,micro_movement_mean,micro_movement_max,macro_movement_mean,macro_movement_max,micro_state_rms,macro_state_rms,micro_state_mean_abs,macro_state_mean_abs,micro_clamp_fraction,macro_clamp_fraction,micro_channel_rms_min,micro_channel_rms_max,macro_channel_rms_min,macro_channel_rms_max,image_delta_valid,image_delta_mean,image_delta_rms,image_variance,seam_energy,edge_energy,gamut_excess,red_mean,green_mean,blue_mean,red_variance,green_variance,blue_variance,rg_correlation,rb_correlation,gb_correlation,loss_total,loss_content,loss_palette,loss_structure,loss_seam,loss_gamut,gradient_norm,gradient_rms,gradient_clip_scale,updated_variables,updated_parameters,effective_learning_rate,window_seconds,reference_fidelity,interface_memory_rms,muon_variables,loss_state,loss_memory,core_gradient_rms,decoder_gradient_rms,core_updated_parameters,decoder_updated_parameters,stability_violation,development_steps_per_second")?;
         Ok(())
     }
 
     pub fn write_csv(&self, mut writer: impl Write) -> Result<()> {
-        writeln!(
+        write!(
             writer,
             "{},{},{},{},{},{},{},{},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.7},{:.9},{:.7},{},{},{:.9},{:.6},{:.7},{:.7},{}",
             self.step,
@@ -147,6 +154,18 @@ impl MetricRecord {
             self.interface_memory_rms,
             self.muon_variables,
         )?;
+        writeln!(
+            writer,
+            ",{:.7},{:.7},{:.9},{:.9},{},{},{},{:.3}",
+            self.loss_state,
+            self.loss_memory,
+            self.core_gradient_rms,
+            self.decoder_gradient_rms,
+            self.core_updated_parameters,
+            self.decoder_updated_parameters,
+            self.stability_violation,
+            self.development_steps_per_second,
+        )?;
         Ok(())
     }
 }
@@ -154,7 +173,6 @@ impl MetricRecord {
 pub fn image_metrics(image: &Tensor) -> candle_core::Result<ImageDiagnostics> {
     let (_, channels, h, w) = image.dims4()?;
     debug_assert_eq!(channels, 3);
-    let image_variance = variance(image)?;
     let seams = seam_energy(image)?;
     let dx = image
         .narrow(3, 1, w - 1)?
@@ -168,6 +186,7 @@ pub fn image_metrics(image: &Tensor) -> candle_core::Result<ImageDiagnostics> {
         .add(&dy.sqr()?.mean_all()?)?
         .affine(0.5, 0.0)?;
     let (means, variances) = channel_moments(image)?;
+    let image_variance = variances.mean_all()?;
     let flat = image.reshape((3, h * w))?;
     let centered = flat.broadcast_sub(&means.unsqueeze(1)?)?;
     let correlation = |first: usize, second: usize| -> candle_core::Result<Tensor> {
@@ -248,6 +267,18 @@ mod tests {
         assert!((metrics.clamp_fraction - 0.125).abs() < 1e-6);
         assert!(metrics.channel_rms_max > metrics.channel_rms_min);
         assert!(metrics.rms.is_finite());
+        Ok(())
+    }
+
+    #[test]
+    fn spatial_variance_rejects_uniform_color_false_positive() -> candle_core::Result<()> {
+        let red = Tensor::zeros((1, 1, 4, 4), candle_core::DType::F32, &Device::Cpu)?;
+        let cyan = Tensor::ones((1, 1, 4, 4), candle_core::DType::F32, &Device::Cpu)?;
+        let image = Tensor::cat(&[&red, &cyan, &cyan], 1)?;
+        let metrics = image_metrics(&image)?;
+        assert!(metrics.variance < 1e-7);
+        assert!(metrics.edge < 1e-7);
+        assert_eq!(metrics.means, [0.0, 1.0, 1.0]);
         Ok(())
     }
 }

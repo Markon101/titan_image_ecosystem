@@ -67,6 +67,7 @@ struct RunMetadata<'a> {
     requested_development_steps: usize,
     completed_development_steps: u64,
     interrupted: bool,
+    stability_stopped: bool,
     resumed: bool,
     render_only: bool,
     metrics_continued: bool,
@@ -85,6 +86,7 @@ struct RunMetadata<'a> {
     peak_rss_kib: Option<u64>,
     phase_seconds: PhaseSeconds,
     average_ms_per_development_step: f64,
+    average_development_steps_per_second: f64,
     outputs: Vec<String>,
     claims: [&'static str; 5],
 }
@@ -123,14 +125,14 @@ pub fn run(config: RunConfig) -> Result<()> {
 
     if config.render_only && !paths.checkpoint_complete() {
         bail!(
-            "--render-only requires a complete v7 checkpoint for this output directory and run tag"
+            "--render-only requires a complete v8 checkpoint for this output directory and run tag"
         );
     }
 
     let checkpoint_available = paths.checkpoint_complete();
     if !config.fresh && paths.checkpoint_exists() && !checkpoint_available {
         bail!(
-            "partial v7 checkpoint set in {}; use --fresh or restore all checkpoint files",
+            "partial v8 checkpoint set in {}; use --fresh or restore all checkpoint files",
             config.output_dir.display()
         );
     }
@@ -190,7 +192,7 @@ pub fn run(config: RunConfig) -> Result<()> {
     };
 
     println!(
-        "TITAN Image v7: {} source image(s), {} cached, {} parameters, {} at world step {}",
+        "TITAN Image v8: {} source image(s), {} cached, {} parameters, {} at world step {}",
         corpus.len(),
         corpus.cached_images(),
         parameter_count,
@@ -244,6 +246,8 @@ pub fn run(config: RunConfig) -> Result<()> {
     let mut full_core_windows = 0usize;
     let mut decoder_only_windows = 0usize;
     let mut interrupted = false;
+    let mut stability_stopped = false;
+    let mut saturation_windows = 0usize;
     let mut previous_image: Option<Tensor> = None;
 
     for local_window in 0..optimizer_windows {
@@ -310,7 +314,14 @@ pub fn run(config: RunConfig) -> Result<()> {
             train_plan.as_ref().expect("training has a render plan"),
             true,
         )?;
-        let losses = visual_loss(&rendered, &sample.image, &config)?;
+        let losses = visual_loss(
+            &rendered,
+            &sample.image,
+            &world.micro,
+            &world.macro_field,
+            &world.memory,
+            &config,
+        )?;
         let loss_values = loss_scalars(&losses)?;
         phase.render_and_loss += seconds(tick.elapsed());
 
@@ -330,7 +341,17 @@ pub fn run(config: RunConfig) -> Result<()> {
             } else {
                 (false, 0.0, 0.0)
             };
+        let interface_memory_rms = tensor_rms(&world.memory)?;
+        let stability_violation = micro_state.clamp_fraction > config.max_saturation_fraction
+            || macro_state.clamp_fraction > config.max_saturation_fraction;
+        saturation_windows = if stability_violation {
+            saturation_windows + 1
+        } else {
+            0
+        };
         previous_image = Some(rendered.image.detach());
+        let window_seconds = seconds(window_started.elapsed());
+        let development_steps_per_second = config.bptt as f64 / window_seconds.max(1e-9);
         let record = metric_record(
             &world,
             &sample,
@@ -355,8 +376,10 @@ pub fn run(config: RunConfig) -> Result<()> {
             loss_values,
             &optimizer_stats,
             reference_fidelity,
-            tensor_rms(&world.memory)?,
-            seconds(window_started.elapsed()),
+            interface_memory_rms,
+            stability_violation,
+            window_seconds,
+            development_steps_per_second,
         );
         record.write_csv(
             metrics_writer
@@ -367,7 +390,7 @@ pub fn run(config: RunConfig) -> Result<()> {
             || local_window + 1 == optimizer_windows
         {
             println!(
-                "step {:>7} ep {:>3} age {:>3} | {} | loss {:.5} structure {:.5} | move u/m {:.5}/{:.5} | state u/m {:.3}/{:.3} clamp {:.3}/{:.3} | image-delta {:.4} | grad-rms {:.5} clip {:.3} | {:.1} ms/window",
+                "step {:>7} ep {:>3} age {:>3} | {} | loss {:.5} structure {:.5} | move u/m {:.5}/{:.5} | state u/m {:.3}/{:.3} clamp {:.3}/{:.3} mem {:.3} | image-delta {:.4} | grad-rms c/d {:.5}/{:.5} clip {:.3} | {:.2} step/s",
                 world.step,
                 world.episode,
                 world.age,
@@ -380,13 +403,25 @@ pub fn run(config: RunConfig) -> Result<()> {
                 record.macro_state_rms,
                 record.micro_clamp_fraction,
                 record.macro_clamp_fraction,
+                record.interface_memory_rms,
                 record.image_delta_mean,
-                record.gradient_rms,
+                record.core_gradient_rms,
+                record.decoder_gradient_rms,
                 record.gradient_clip_scale,
-                1000.0 * record.window_seconds,
+                record.development_steps_per_second,
             );
         }
         phase.metrics_and_logging += seconds(tick.elapsed());
+        if config.stability_patience > 0 && saturation_windows >= config.stability_patience {
+            stability_stopped = true;
+            interrupted = true;
+            println!(
+                "Stability watchdog stopped training at step {} after {} consecutive near-bound windows; saving a resumable checkpoint.",
+                world.step,
+                saturation_windows,
+            );
+            break;
+        }
 
         if stop_requested() {
             interrupted = true;
@@ -480,14 +515,18 @@ pub fn run(config: RunConfig) -> Result<()> {
         outputs.push(paths.macro_state.display().to_string());
     }
     interrupted |= stop_requested();
-    let (gallery_outputs, gallery_interrupted) = render_gallery(
-        &config,
-        &corpus,
-        &dynamics,
-        &renderer,
-        output_plan.as_ref().expect("output plan initialized"),
-        &device,
-    )?;
+    let (gallery_outputs, gallery_interrupted) = if stability_stopped {
+        (Vec::new(), false)
+    } else {
+        render_gallery(
+            &config,
+            &corpus,
+            &dynamics,
+            &renderer,
+            output_plan.as_ref().expect("output plan initialized"),
+            &device,
+        )?
+    };
     interrupted |= gallery_interrupted || stop_requested();
     let gallery_completed = gallery_outputs.len() / 2;
     if !gallery_outputs.is_empty() {
@@ -508,6 +547,11 @@ pub fn run(config: RunConfig) -> Result<()> {
     phase.total = seconds(started.elapsed());
 
     let completed_steps = world.step.saturating_sub(start_world_step);
+    let average_development_steps_per_second = if phase.total > 0.0 {
+        completed_steps as f64 / phase.total
+    } else {
+        0.0
+    };
     let metadata = RunMetadata {
         schema_version: SCHEMA_VERSION,
         package_version: env!("CARGO_PKG_VERSION"),
@@ -531,6 +575,7 @@ pub fn run(config: RunConfig) -> Result<()> {
         requested_development_steps: config.steps,
         completed_development_steps: completed_steps,
         interrupted,
+        stability_stopped,
         resumed,
         render_only: config.render_only,
         metrics_continued,
@@ -554,6 +599,7 @@ pub fn run(config: RunConfig) -> Result<()> {
             0.0
         },
         outputs,
+        average_development_steps_per_second,
         claims: [
             "autonomous morphogenic image generator",
             "not an action-conditioned world model",
@@ -569,7 +615,7 @@ pub fn run(config: RunConfig) -> Result<()> {
     };
     write_json_atomic(metadata_path, &metadata)?;
     println!(
-        "{} at world step {} in {:.2}s. Raw: {}  Mastered: {}",
+        "{} at world step {} in {:.2}s ({:.2} development step/s). Raw: {}  Mastered: {}",
         if interrupted {
             "Stopped safely"
         } else {
@@ -577,8 +623,9 @@ pub fn run(config: RunConfig) -> Result<()> {
         },
         world.step,
         phase.total,
+        average_development_steps_per_second,
         paths.raw.display(),
-        paths.mastered.display()
+        paths.mastered.display(),
     );
     if gallery_completed > 0 {
         println!("Gallery: {}", paths.gallery.display());
@@ -626,11 +673,13 @@ fn metric_record(
     image_delta_mean: f32,
     image_delta_rms: f32,
     image: &crate::metrics::ImageDiagnostics,
-    loss: [f32; 6],
+    loss: [f32; 8],
     optimizer: &OptimizerStats,
     reference_fidelity: f32,
     interface_memory_rms: f32,
+    stability_violation: bool,
     window_seconds: f64,
+    development_steps_per_second: f64,
 ) -> MetricRecord {
     MetricRecord {
         step: world.step,
@@ -687,10 +736,18 @@ fn metric_record(
         reference_fidelity,
         interface_memory_rms,
         muon_variables: optimizer.muon_variables,
+        loss_state: loss[6],
+        loss_memory: loss[7],
+        core_gradient_rms: optimizer.core_gradient_rms,
+        decoder_gradient_rms: optimizer.decoder_gradient_rms,
+        core_updated_parameters: optimizer.core_updated_parameters,
+        decoder_updated_parameters: optimizer.decoder_updated_parameters,
+        development_steps_per_second,
+        stability_violation,
     }
 }
 
-fn loss_scalars(loss: &LossOutput) -> Result<[f32; 6]> {
+fn loss_scalars(loss: &LossOutput) -> Result<[f32; 8]> {
     let values = Tensor::stack(
         &[
             &loss.total,
@@ -699,11 +756,13 @@ fn loss_scalars(loss: &LossOutput) -> Result<[f32; 6]> {
             &loss.structure,
             &loss.seam,
             &loss.gamut,
+            &loss.state,
+            &loss.memory,
         ],
         0,
     )?
     .to_vec1::<f32>()?;
-    Ok(values.try_into().expect("six loss tensors were stacked"))
+    Ok(values.try_into().expect("eight loss tensors were stacked"))
 }
 
 fn ensure_render_plan(
@@ -769,6 +828,21 @@ fn render_gallery(
     Ok((outputs, stop_requested()))
 }
 
+fn zero_initialized_parameter(name: &str) -> bool {
+    name.ends_with(".bias")
+        || name.contains("micro_ca.output")
+        || name.contains("macro_ca.output")
+        || name.contains("micro_write.weight")
+        || name.contains("macro_write.weight")
+        || name.contains("attention_output.weight")
+        || name.contains("feedforward_contract.weight")
+        || (name.contains(".morphic_") && name.contains(".contract.weight"))
+}
+
+fn unit_initialized_parameter(name: &str) -> bool {
+    name.contains("norm.weight")
+}
+
 fn deterministic_initialize(varmap: &VarMap, seed: u64) -> Result<()> {
     let data = varmap.data().lock().expect("VarMap mutex poisoned");
     let mut names: Vec<&String> = data.keys().collect();
@@ -777,12 +851,14 @@ fn deterministic_initialize(varmap: &VarMap, seed: u64) -> Result<()> {
         let variable = &data[name];
         let dims = variable.dims();
         let count = variable.elem_count();
-        let zero_nca_output = name.contains("micro_ca.output") || name.contains("macro_ca.output");
-        let neutral_color_bias = name.contains("renderer.oklab.bias");
+        let zero_initialized = zero_initialized_parameter(name);
+        let unit_initialized = unit_initialized_parameter(name);
         let small_color_head = name.contains("renderer.oklab.weight");
         let mut rng = ChaCha8Rng::seed_from_u64(parameter_seed(seed, name));
-        let values = if zero_nca_output || neutral_color_bias {
+        let values = if zero_initialized {
             vec![0.0f32; count]
+        } else if unit_initialized {
+            vec![1.0f32; count]
         } else if name.ends_with(".weight") {
             let fan_in = *dims.get(1).unwrap_or(&1);
             let stdev = if small_color_head {
@@ -792,13 +868,7 @@ fn deterministic_initialize(varmap: &VarMap, seed: u64) -> Result<()> {
             };
             normal_values(&mut rng, count, stdev)
         } else {
-            let weight_name = format!("{}.weight", name.trim_end_matches(".bias"));
-            let fan_in = data
-                .get(&weight_name)
-                .and_then(|weight| weight.dims().get(1).copied())
-                .unwrap_or(1);
-            let bound = 1.0f32 / (fan_in as f32).sqrt();
-            (0..count).map(|_| rng.gen_range(-bound..bound)).collect()
+            vec![0.0f32; count]
         };
         let initialized = Tensor::from_vec(values, variable.shape().clone(), variable.device())?;
         variable.set(&initialized)?;
@@ -901,7 +971,7 @@ fn peak_rss_kib() -> Option<u64> {
 
 fn snapshot_path(config: &RunConfig, world: &WorldState) -> PathBuf {
     config.output_dir.join(format!(
-        "titan_image_snapshot_v7{}_{:09}_ep{:05}_age{:04}_target{:04}.png",
+        "titan_image_snapshot_v8{}_{:09}_ep{:05}_age{:04}_target{:04}.png",
         config.suffix(),
         world.step,
         world.episode,
@@ -912,7 +982,7 @@ fn snapshot_path(config: &RunConfig, world: &WorldState) -> PathBuf {
 
 fn gallery_path(config: &RunConfig, variant: usize, mastered: bool) -> PathBuf {
     config.output_dir.join(format!(
-        "titan_image_variant_v7{}_{:03}_{}.png",
+        "titan_image_variant_v8{}_{:03}_{}.png",
         config.suffix(),
         variant + 1,
         if mastered { "mastered" } else { "raw" }
@@ -956,7 +1026,7 @@ mod tests {
     #[test]
     fn fresh_and_resumed_training_write_complete_artifacts() -> Result<()> {
         let root = std::env::temp_dir().join(format!(
-            "titan-image-v7-test-{}-{}",
+            "titan-image-v8-test-{}-{}",
             std::process::id(),
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
         ));
@@ -984,6 +1054,21 @@ mod tests {
         assert_eq!(metadata["resumed"], true);
         assert_eq!(metadata["completed_world_step"], 4);
         assert_eq!(metadata["optimizer_updates_end"], 4);
+        assert!(
+            metadata["average_development_steps_per_second"]
+                .as_f64()
+                .unwrap_or(0.0)
+                > 0.0
+        );
+        let metrics = std::fs::read_to_string(&paths.metrics)?;
+        let mut rows = metrics.lines();
+        let header = rows.next().expect("metrics header");
+        let columns = header.split(',').count();
+        assert!(header.contains("core_gradient_rms"));
+        assert!(header.contains("development_steps_per_second"));
+        for row in rows {
+            assert_eq!(row.split(',').count(), columns, "CSV column mismatch");
+        }
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -1018,11 +1103,23 @@ mod tests {
         let second_data = second.data().lock().expect("VarMap mutex poisoned");
         for (name, variable) in first_data.iter() {
             let other = &second_data[name];
+            let values = variable.flatten_all()?.to_vec1::<f32>()?;
             assert_eq!(
-                variable.flatten_all()?.to_vec1::<f32>()?,
+                values,
                 other.flatten_all()?.to_vec1::<f32>()?,
                 "parameter {name} differed"
             );
+            if zero_initialized_parameter(name) {
+                assert!(
+                    values.iter().all(|value| *value == 0.0),
+                    "parameter {name} was not zero initialized"
+                );
+            } else if unit_initialized_parameter(name) {
+                assert!(
+                    values.iter().all(|value| *value == 1.0),
+                    "parameter {name} was not unit initialized"
+                );
+            }
         }
         Ok(())
     }
@@ -1048,5 +1145,51 @@ mod tests {
         assert!(cadence_due(96, 100, 50));
         assert!(!cadence_due(100, 104, 50));
         assert!(!cadence_due(48, 52, 0));
+    }
+
+    #[test]
+    fn initialized_core_stays_bounded_over_long_autonomous_rollout() -> Result<()> {
+        let device = Device::Cpu;
+        let config = RunConfig {
+            style: crate::config::StylePreset::PureNca,
+            micro_size: 24,
+            macro_size: 12,
+            channels: 12,
+            genome_dim: 4,
+            ca_hidden: 32,
+            interface_grid: 3,
+            interface_width: 32,
+            interface_loops: 2,
+            morph_layers: 3,
+            morph_depth: 2,
+            reaction_gain: 0.0,
+            phase_gain: 0.0,
+            fractal_gain: 0.0,
+            quasiperiodic_gain: 0.0,
+            cyclic_gain: 0.0,
+            train_resolution: 24,
+            output_resolution: 24,
+            ..RunConfig::default()
+        };
+        let vars = VarMap::new();
+        let dynamics = DynamicsSystem::new(
+            &config,
+            VarBuilder::from_varmap(&vars, DType::F32, &device).pp("dynamics"),
+            &device,
+        )?;
+        deterministic_initialize(&vars, config.seed)?;
+        let genome = Tensor::zeros(config.genome_dim, DType::F32, &device)?;
+        let mut world = WorldState::fresh(&config, config.seed, &device)?;
+        for _ in 0..256 {
+            world = dynamics
+                .step(&world, &genome, None, None, 0.0, false)?
+                .world;
+        }
+        let micro = state_metrics(&world.micro, config.state_limit)?;
+        let macro_field = state_metrics(&world.macro_field, config.state_limit)?;
+        assert!(micro.clamp_fraction < 1e-4);
+        assert!(macro_field.clamp_fraction < 1e-4);
+        assert!(world.memory.abs()?.max_all()?.to_scalar::<f32>()? < config.memory_limit);
+        Ok(())
     }
 }

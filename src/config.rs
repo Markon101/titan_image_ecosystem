@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 pub const MIN_PHYSICAL_CHANNELS: usize = 12;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -144,6 +144,8 @@ pub struct RunConfig {
     pub interface_loops: usize,
     pub morph_layers: usize,
     pub morph_depth: usize,
+    pub morph_residual_gain: f32,
+    pub memory_limit: f32,
     pub interface_gain: f32,
     pub conditioning: ConditioningMode,
     pub reference_fidelity_min: f32,
@@ -161,6 +163,7 @@ pub struct RunConfig {
     pub snapshot_resolution: usize,
     pub episode_steps: usize,
     pub episode_reset: f32,
+    pub memory_reset: f32,
     pub bptt: usize,
     pub core_update_every: usize,
     pub macro_update_every: usize,
@@ -182,6 +185,7 @@ pub struct RunConfig {
     pub integrator: Integrator,
     pub dt: f32,
     pub state_limit: f32,
+    pub state_soft_limit: f32,
     pub clock_probability: f32,
     pub nca_gain: f32,
     pub reaction_gain: f32,
@@ -204,6 +208,10 @@ pub struct RunConfig {
     pub loss_structure: f32,
     pub loss_seam: f32,
     pub loss_gamut: f32,
+    pub loss_state: f32,
+    pub loss_memory: f32,
+    pub max_saturation_fraction: f32,
+    pub stability_patience: usize,
     pub mastering_strength: f32,
     pub save_state_atlas: bool,
     pub gallery: usize,
@@ -221,7 +229,7 @@ impl Default for RunConfig {
             .unwrap_or(4);
         let mut config = Self {
             corpus_dir: PathBuf::from("/sdcard/Download/titan_image_sources"),
-            output_dir: PathBuf::from("/sdcard/Download/titan_image_v7"),
+            output_dir: PathBuf::from("/sdcard/Download/titan_image_v8"),
             run_tag: None,
             mode: TrainingMode::Texture,
             profile: PhoneProfile::S25Balanced,
@@ -241,6 +249,8 @@ impl Default for RunConfig {
             interface_loops: 3,
             morph_layers: 4,
             morph_depth: 3,
+            morph_residual_gain: 0.02,
+            memory_limit: 3.0,
             interface_gain: 0.18,
             conditioning: ConditioningMode::Hybrid,
             reference_fidelity_min: 0.15,
@@ -257,7 +267,8 @@ impl Default for RunConfig {
             episode_steps: 64,
             episode_reset: 0.85,
             bptt: 4,
-            core_update_every: 4,
+            memory_reset: 1.0,
+            core_update_every: 2,
             macro_update_every: 4,
             snapshot_every: 50,
             checkpoint_every: 400,
@@ -269,21 +280,22 @@ impl Default for RunConfig {
             beta1: 0.9,
             beta2: 0.999,
             adam_epsilon: 1e-8,
-            grad_clip: 1.5,
-            warmup_updates: 24,
+            grad_clip: 1.0,
+            warmup_updates: 48,
             integrator: Integrator::Euler,
-            dt: 0.16,
+            dt: 0.12,
             state_limit: 3.5,
             optimizer: OptimizerKind::AdamW,
             muon_momentum: 0.95,
+            state_soft_limit: 1.5,
             muon_ns_steps: 5,
             clock_probability: 0.72,
-            nca_gain: 0.38,
+            nca_gain: 0.25,
             reaction_gain: 0.35,
             phase_gain: 0.85,
             fractal_gain: 0.08,
             quasiperiodic_gain: 0.12,
-            state_leak: 0.035,
+            state_leak: 0.10,
             cyclic_gain: 0.22,
             rd_diffusion_u: 0.16,
             rd_diffusion_v: 0.08,
@@ -301,6 +313,10 @@ impl Default for RunConfig {
             loss_gamut: 0.18,
             mastering_strength: 0.75,
             save_state_atlas: true,
+            loss_state: 0.02,
+            loss_memory: 0.002,
+            max_saturation_fraction: 0.25,
+            stability_patience: 8,
             gallery: 4,
             gallery_steps: 64,
             gallery_stride: 16,
@@ -372,6 +388,8 @@ impl RunConfig {
                 "--interface-loops" => cfg.interface_loops = parse(&value()?, flag)?,
                 "--morph-layers" => cfg.morph_layers = parse(&value()?, flag)?,
                 "--morph-depth" => cfg.morph_depth = parse(&value()?, flag)?,
+                "--morph-residual-gain" => cfg.morph_residual_gain = parse(&value()?, flag)?,
+                "--memory-limit" => cfg.memory_limit = parse(&value()?, flag)?,
                 "--interface-gain" => cfg.interface_gain = parse(&value()?, flag)?,
                 "--conditioning" => cfg.conditioning = ConditioningMode::parse(&value()?)?,
                 "--reference-fidelity-min" => cfg.reference_fidelity_min = parse(&value()?, flag)?,
@@ -389,6 +407,7 @@ impl RunConfig {
                 "--snapshot-resolution" => cfg.snapshot_resolution = parse(&value()?, flag)?,
                 "--episode-steps" => cfg.episode_steps = parse(&value()?, flag)?,
                 "--episode-reset" => cfg.episode_reset = parse(&value()?, flag)?,
+                "--memory-reset" => cfg.memory_reset = parse(&value()?, flag)?,
                 "--bptt" => cfg.bptt = parse(&value()?, flag)?,
                 "--core-update-every" => cfg.core_update_every = parse(&value()?, flag)?,
                 "--macro-update-every" => cfg.macro_update_every = parse(&value()?, flag)?,
@@ -410,6 +429,7 @@ impl RunConfig {
                 "--integrator" => cfg.integrator = Integrator::parse(&value()?)?,
                 "--dt" => cfg.dt = parse(&value()?, flag)?,
                 "--state-limit" => cfg.state_limit = parse(&value()?, flag)?,
+                "--state-soft-limit" => cfg.state_soft_limit = parse(&value()?, flag)?,
                 "--clock-probability" => cfg.clock_probability = parse(&value()?, flag)?,
                 "--nca-gain" => cfg.nca_gain = parse(&value()?, flag)?,
                 "--reaction-gain" => cfg.reaction_gain = parse(&value()?, flag)?,
@@ -434,6 +454,12 @@ impl RunConfig {
                 "--loss-structure" => cfg.loss_structure = parse(&value()?, flag)?,
                 "--loss-seam" => cfg.loss_seam = parse(&value()?, flag)?,
                 "--loss-gamut" => cfg.loss_gamut = parse(&value()?, flag)?,
+                "--loss-state" => cfg.loss_state = parse(&value()?, flag)?,
+                "--loss-memory" => cfg.loss_memory = parse(&value()?, flag)?,
+                "--max-saturation-fraction" => {
+                    cfg.max_saturation_fraction = parse(&value()?, flag)?
+                }
+                "--stability-patience" => cfg.stability_patience = parse(&value()?, flag)?,
                 "--mastering-strength" => cfg.mastering_strength = parse(&value()?, flag)?,
                 "--gallery" => cfg.gallery = parse(&value()?, flag)?,
                 "--gallery-steps" => cfg.gallery_steps = parse(&value()?, flag)?,
@@ -482,7 +508,7 @@ impl RunConfig {
                 self.output_resolution = 512;
                 self.snapshot_resolution = 256;
                 self.bptt = 4;
-                self.core_update_every = 8;
+                self.core_update_every = 2;
                 self.episode_steps = 48;
                 self.snapshot_every = 50;
                 self.checkpoint_every = 480;
@@ -506,7 +532,7 @@ impl RunConfig {
                 self.output_resolution = 768;
                 self.snapshot_resolution = 384;
                 self.bptt = 4;
-                self.core_update_every = 4;
+                self.core_update_every = 2;
                 self.episode_steps = 64;
                 self.snapshot_every = 50;
                 self.checkpoint_every = 400;
@@ -530,7 +556,7 @@ impl RunConfig {
                 self.output_resolution = 1024;
                 self.snapshot_resolution = 512;
                 self.bptt = 4;
-                self.core_update_every = 2;
+                self.core_update_every = 1;
                 self.episode_steps = 80;
                 self.snapshot_every = 50;
                 self.checkpoint_every = 400;
@@ -642,6 +668,8 @@ impl RunConfig {
             bail!("recurrent-interface controls exceed their safe phone ranges");
         }
         finite_range(self.interface_gain, 0.0, 1.0, "--interface-gain")?;
+        finite_range(self.morph_residual_gain, 0.0, 0.25, "--morph-residual-gain")?;
+        finite_range(self.memory_limit, 0.5, 16.0, "--memory-limit")?;
         finite_range(
             self.reference_fidelity_min,
             0.0,
@@ -689,8 +717,15 @@ impl RunConfig {
         }
         finite_range(self.dt, 0.005, 0.25, "--dt")?;
         finite_range(self.state_limit, 1.0, 12.0, "--state-limit")?;
+        finite_range(
+            self.state_soft_limit,
+            0.25,
+            self.state_limit,
+            "--state-soft-limit",
+        )?;
         finite_range(self.clock_probability, 0.05, 1.0, "--clock-probability")?;
         finite_range(self.episode_reset, 0.0, 1.0, "--episode-reset")?;
+        finite_range(self.memory_reset, 0.0, 1.0, "--memory-reset")?;
         finite_range(self.state_leak, 0.0, 0.5, "--state-leak")?;
         for (name, value) in [
             ("--nca-gain", self.nca_gain),
@@ -727,7 +762,22 @@ impl RunConfig {
             positive_loss |= value > 0.0;
         }
         if !positive_loss {
-            bail!("at least one loss weight must be positive");
+            bail!("at least one visual loss weight must be positive");
+        }
+        for (name, value) in [
+            ("--loss-state", self.loss_state),
+            ("--loss-memory", self.loss_memory),
+        ] {
+            finite_range(value, 0.0, 100.0, name)?;
+        }
+        finite_range(
+            self.max_saturation_fraction,
+            0.0,
+            1.0,
+            "--max-saturation-fraction",
+        )?;
+        if self.stability_patience > 10_000 {
+            bail!("--stability-patience must be <= 10000");
         }
         finite_range(self.mastering_strength, 0.0, 2.0, "--mastering-strength")?;
         if self.gallery > 64 || self.gallery_steps > 1024 || self.gallery_stride > 256 {
@@ -781,6 +831,8 @@ impl RunConfig {
             self.interface_loops as u64,
             self.morph_layers as u64,
             self.morph_depth as u64,
+            self.morph_residual_gain.to_bits() as u64,
+            self.memory_limit.to_bits() as u64,
             self.interface_gain.to_bits() as u64,
             self.conditioning as u64,
             self.reference_fidelity_min.to_bits() as u64,
@@ -797,6 +849,7 @@ impl RunConfig {
             self.episode_steps as u64,
             self.episode_reset.to_bits() as u64,
             self.bptt as u64,
+            self.memory_reset.to_bits() as u64,
             self.core_update_every as u64,
             self.macro_update_every as u64,
             self.learning_rate.to_bits(),
@@ -812,6 +865,7 @@ impl RunConfig {
             self.dt.to_bits() as u64,
             self.state_limit.to_bits() as u64,
             self.clock_probability.to_bits() as u64,
+            self.state_soft_limit.to_bits() as u64,
             self.nca_gain.to_bits() as u64,
             self.state_leak.to_bits() as u64,
             self.reaction_gain.to_bits() as u64,
@@ -833,6 +887,10 @@ impl RunConfig {
             self.loss_structure.to_bits() as u64,
             self.loss_seam.to_bits() as u64,
             self.loss_gamut.to_bits() as u64,
+            self.loss_state.to_bits() as u64,
+            self.loss_memory.to_bits() as u64,
+            self.max_saturation_fraction.to_bits() as u64,
+            self.stability_patience as u64,
         ];
         values
             .into_iter()
@@ -842,13 +900,13 @@ impl RunConfig {
     }
 
     pub fn help() -> &'static str {
-        "TITAN Image v7 - S25-first morphogenic visual dynamics\n\
+        "TITAN Image v8 - recurrently stable S25-first morphogenic visual dynamics\n\
          Usage: titan_image [options]\n\n\
          Required and lifecycle:\n\
            --corpus-dir PATH           Source PNG/JPEG/WebP directory (required)\n\
-           --output-dir PATH           v7 artifact directory\n\
+           --output-dir PATH           v8 artifact directory\n\
            --run-tag NAME              Isolate checkpoint and output artifacts\n\
-           --fresh                     Start a new v7 organism for this tag\n\
+           --fresh                     Start a new v8 organism for this tag\n\
            --render-only               Load without training; render/gallery only\n\
            --profile NAME              s25-fast | s25-balanced | s25-quality\n\
            --style NAME                alien-fluid | fractal-flame | reaction-garden | quasicrystal | pure-nca\n\
@@ -865,6 +923,7 @@ impl RunConfig {
            --episode-reset X           Seed-state blend at target changes, 0..1\n\
            --bptt N                    Recurrent gradient horizon\n\
            --core-update-every N       Full-core cadence in optimizer windows\n\
+           --memory-reset X            Independent recurrent-memory reset, 0..1\n\
            --macro-update-every N      Slow-field cadence in development steps\n\
            --snapshot-every N          Nominal step cadence; 0 disables\n\
            --checkpoint-every N        Checkpoint cadence; 0 disables periodic saves\n\
@@ -884,6 +943,8 @@ impl RunConfig {
            --morph-depth N             Active memory blocks, <= morph-layers\n\
            --interface-gain X          Spatial writeback gain, 0..1\n\
            --render-hidden N           Implicit renderer hidden width\n\
+           --morph-residual-gain X     Bounded MorphicStack residual gain\n\
+           --memory-limit X            Smooth recurrent-memory bound\n\
            --render-blocks N           Renderer residual blocks, 1..8\n\
            --coord-bands N             Global Fourier coordinate octaves, 1..8\n\
            --coord-gain X              Coordinate amplitude; low values avoid shortcuts\n\
@@ -896,6 +957,7 @@ impl RunConfig {
            --clock-probability X       Deterministic asynchronous cell rate\n\
            --nca-gain X                Learned update gain\n\n\
            --state-leak X              Contractive recurrent-state restoring gain\n\
+           --state-soft-limit X        State-energy barrier threshold\n\
            --conditioning NAME         generate | hybrid | reconstruct\n\
            --reference-fidelity-min X  Hybrid reference-strength floor, 0..1\n\
            --reference-fidelity-max X  Hybrid/reconstruction ceiling, 0..1\n\
@@ -927,6 +989,10 @@ impl RunConfig {
            --mastering-strength X      Toroidal bloom/local contrast, 0..2\n\
            --no-mastering              Save mastered image without enhancement\n\
            --no-state-atlas            Do not save micro/macro diagnostic atlases\n\
+           --loss-state X              Soft state-energy barrier weight\n\
+           --loss-memory X             Soft memory-energy barrier weight\n\
+           --max-saturation-fraction X Sustained near-bound watchdog threshold\n\
+           --stability-patience N      Violating windows before safe stop; 0 disables\n\
            --gallery N                 Interpolated-genome variants; 0 disables\n\
            --gallery-steps N           Fresh development steps per variant\n\
            --gallery-stride N          Extra development steps between variants\n\
@@ -1048,7 +1114,7 @@ mod tests {
     fn continuation_signature_tracks_training_but_not_output_size() {
         let base = RunConfig::default();
         let changed_dt = RunConfig {
-            dt: 0.12,
+            dt: 0.11,
             ..base.clone()
         };
         let changed_output = RunConfig {
@@ -1071,5 +1137,35 @@ mod tests {
             base.checkpoint_signature(),
             changed_preview.checkpoint_signature()
         );
+    }
+
+    #[test]
+    fn continuation_signature_tracks_stability_semantics() {
+        let base = RunConfig::default();
+        let changed = RunConfig {
+            memory_limit: 2.5,
+            ..base.clone()
+        };
+        assert_ne!(base.checkpoint_signature(), changed.checkpoint_signature());
+    }
+
+    #[test]
+    fn stability_controls_obey_guards() {
+        let invalid_loss = RunConfig {
+            loss_state: -0.1,
+            ..RunConfig::default()
+        };
+        assert!(invalid_loss.validate().is_err());
+        let invalid_soft_limit = RunConfig {
+            state_soft_limit: 4.0,
+            state_limit: 3.5,
+            ..RunConfig::default()
+        };
+        assert!(invalid_soft_limit.validate().is_err());
+        let disabled_watchdog = RunConfig {
+            stability_patience: 0,
+            ..RunConfig::default()
+        };
+        assert!(disabled_watchdog.validate().is_ok());
     }
 }
