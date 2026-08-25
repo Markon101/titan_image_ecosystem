@@ -1,114 +1,190 @@
-# TITAN Image v8 mathematical specification
+# TITAN Image v9 mathematical notes
 
-## State hierarchy
+This document records implemented equations. Coefficients are configuration
+values; tensor shapes and exact defaults are in `src/config.rs`.
 
-The world is W_n = (X_n, M_n, h_n), where X is the micro field, M is the
-slower macro field, and h is recurrent-interface memory.
+## Recurrent world
 
-## Recurrent interface
+At developmental step `k`, the world is:
 
-Micro state, macro state, and RGB reference pyramids are pooled to a GxG token
-grid. With fidelity r:
+~~~text
+W_k = (S_micro,k, S_macro,k, m_k, age, target, active_morph_depth)
+~~~
 
-Q_X = pool([X, r R_X])
+The micro and macro derivatives combine learned NCA, recurrent-interface
+writeback, local reference drive, contractive leak, and enabled physical
+operators:
 
-Q_M = pool([M, r R_M]).
+~~~text
+dS/dt = gain_nca F_NCA(S, context, genome)
+      + B_interface
+      + fidelity * gain_ref * tanh(P_ref(reference))
+      - state_leak * S
+      + F_reaction + F_phase + F_cyclic + F_forcing
+~~~
 
-Learned projections, genome g, normalized episode age a, and memory h produce:
+Euler and midpoint integration are supported. The proposed state is smoothly
+projected:
 
-T_0 = 0.5(P_X Q_X + P_M Q_M) + P_c[g,r,a] + h.
+~~~text
+q = S_proposed / limit
+project(S_proposed) = S_proposed / (1 + q^4)^(1/4)
+~~~
 
-One shared transformer block is applied K times:
+This is odd, smooth for finite inputs, near identity at the origin, and
+asymptotic to `+/-limit`. It does not create hard-clamp zero derivatives.
 
-A_k = softmax(Q(T_k) K(T_k)^T / sqrt(d)) V(T_k)
+The state soft barrier is:
 
-T'_k = T_k + 0.25 P_O A_k
+~~~text
+L_state = mean(max(|S|-state_soft_limit, 0)^2)
+~~~
 
-T''_k = T'_k + 0.25 P_2 swish(P_1 norm(T'_k)).
+with a corresponding memory barrier.
 
-The GRU first produces a bounded candidate, then the active morphic prefix uses
-small residual gates:
+## Recurrent interface and MorphicStack
 
-h'_0 = B_H(GRU(mean(T''_k), h_k))
+Pooled micro, macro, reference, genome, fidelity, age, and prior memory enter a
+looped shared token processor. The global token stream is capped at 8x8 for
+larger interface grids, then written back to local tokens.
 
-h'_(l+1) = B_H(h'_l + alpha / sqrt(l+1) W_2,l swish(W_1,l norm(h'_l))).
+After GRU update, active MorphicBlocks apply bounded residuals:
 
-The smooth odd bound is
+~~~text
+m_0 = GRU(token_summary, m_previous)
+m_(i+1) = m_i + morph_gain * tanh(C_i swish(E_i Norm(m_i)))
+m_next = project_memory(m_active_depth)
+~~~
 
-B_L(x) = x / (1 + (x/L)^4)^(1/4).
+New `C_i` contract weights/biases are zero, so activating a reserved block is
+an exact no-op before it learns. Projection occurs once after the active stack.
 
-It approaches +/-L without a finite-input zero derivative. The spatial
-writebacks are independently bounded:
+## Reconstruction++ rendering
 
-I_X = g_I upsample(tanh(W_X T)),  I_M = g_I upsample(tanh(W_M T)).
+The implicit renderer samples micro and macro state at one normalized spatial
+view, adds global Fourier coordinates, genome, and bounded LOD, and forms shared
+features `h`. Separate heads produce:
 
-Morphic contracts, attention/feed-forward residual outputs, NCA outputs, and
-interface write heads start at zero; normalization scales start at one and all
-biases at zero. This makes the initial recurrent system identity-like rather
-than secretly randomizing nominal zero-output modules.
+~~~text
+g = H_ground(h) + state_skip(S_micro, S_macro)
+e_raw = emergent_limit * tanh(H_emergent(h))
+e = project_emergent(B_low e_raw + B_mid e_raw + B_high e_raw)
+z(alpha) = g + alpha e
+image(alpha) = Oklab_like_to_RGB(z(alpha))
+~~~
 
-Attention is confined to G^2 tokens, so its quadratic term is independent of
-dense render resolution.
+The implemented band shaping is:
 
-## Local dynamics
+~~~text
+low  = repeated periodic low-pass(e_raw)
+mid  = low-pass(e_raw) - low
+high = e_raw - low-pass(e_raw)
+e_shaped = low_budget*low + mid_budget*mid + high
+~~~
 
-The NCA retains identity, Sobel-x, Sobel-y, and Laplacian perception at radius
-one and dilation two. Deterministic asynchronous masks are precomputed and
-scheduled without host allocation per step.
+At `alpha=0`, `z=g` exactly. The renderer has no raw-reference input.
 
-The derivative is:
+## Grounding and role objectives
 
-F(Z) = F_NCA(Z) + I(Z,h) + F_physical(Z) - lambda Z.
+For 2x area pooling `P`:
 
-Euler proposes U_(n+1) = Z_n + dt F(Z_n). Midpoint instead uses
+~~~text
+L_fine   = mean |g-y|
+L_mid    = mean |P(g)-P(y)|
+L_coarse = mean |P(P(g))-P(P(y))|
 
-k_1 = F(Z_n)
+L_ground = w_fine L_fine + w_mid L_mid + w_coarse L_coarse
+         + 0.2 L_ssim_like
+~~~
 
-k_2 = F(Z_n + dt k_1/2)
+The normal endpoint objective still exposes composite content, palette,
+gradient-distribution structure, boundary-aware seam, and gamut terms.
 
-U_(n+1) = Z_n + dt k_2.
+The residual diagnostics/regularizers are:
 
-Both finish with the smooth projection Z_(n+1) = B_L(U_(n+1)); v8 has no hard
-state clamp. At the defaults, active NCA movement is bounded by
-dt*g_NCA = 0.12*0.25 = 0.03 before other terms, while restoring movement at the
-3.5 state boundary is dt*lambda*3.5 = 0.042.
+~~~text
+actual_effect  = image(alpha) - grounded_image
+desired_effect = target - stop_gradient(grounded_image)
+L_emergent_fit = mean |actual_effect-desired_effect|
+L_emergent_low = mean(P(P(e))^2)
+L_emergent_tv  = mean spatial total variation(e)
+L_redundancy   = |corr(stop_gradient(g), e)|
+~~~
 
-## Reference conditioning
+All emergent regularizers are multiplied by the active emergence schedule.
 
-Generate mode fixes r=0. Reconstruct mode fixes r=r_max. Hybrid mode samples r
-uniformly on [r_min,r_max] and independently replaces it with zero at the
-configured dropout probability. The scalar r is supplied as input so scaling
-cannot be confused with naturally weak reference features.
+## Developmental curriculum
 
-## Objective boundary
+With normalized age `a`:
 
-v8 retains the endpoint image objective: aligned pixel L1 for single/family
-mode or normalized color/autocorrelation statistics for texture mode, plus
-palette, gradient-structure, seam, and gamut terms. It adds soft energy
-barriers rather than a zero-seeking global L2 penalty:
+~~~text
+r = clamp((a - emergence_start) / emergence_ramp, 0, 1)
+h = r^2 (3 - 2r)
+grounding_schedule = grounding_strength * (1-(1-grounding_floor)h)
+emergence_schedule = emergence_strength * h
+~~~
 
-L_state = lambda_s [E relu(|X|-s)^2 + 0.5 E relu(|M|-s)^2]
+## Coordinate-consistent detail
 
-L_memory = lambda_h E relu(|h|-H/2)^2.
+A spatial view is `(x0, y0, size, zoom)` in normalized phenotype coordinates.
+For output pixel `(i,j)` at resolution `R`:
 
-These terms are active on full-core windows; detached decoder-only dynamics do
-not falsely claim core gradients. This remains reconstruction-conditioned
-recurrent development, not score matching, denoising diffusion, or flow
-matching.
+~~~text
+x = x0 + size * (i+1/2)/R
+y = y0 + size * (j+1/2)/R
+LOD = log2(max(zoom,1))/5
+~~~
 
-## Hybrid Muon
+The same coordinates select the recurrent-field region and Fourier features.
+Source crops use the recorded center-square source transform. Lanczos target
+construction supplies antialiased supervision.
 
-For selected interface matrix gradient G, v8 forms momentum and applies
-Newton-Schulz iterations to a Frobenius-normalized matrix:
+For high render `y_2R` and low render `y_R`:
 
-X <- aX + (bXX^T + c(XX^T)^2)X,
+~~~text
+L_xres = |P(y_2R)-y_R|_1
+       + 0.5 |P(P(y_2R))-P(y_R)|_1
+       + 0.25 |edge(P(y_2R))-edge(y_R)|_1
+~~~
 
-with a=3.4445, b=-4.7750, c=2.0315. Other parameters use AdamW. Global clipping
-and decoupled weight decay precede both update geometries.
+The light default weight preserves anatomy while allowing zero-mean subpixel
+detail at the higher resolution.
 
-Muon's usefulness in this small recurrent visual model is an experimental
-question, not a consequence of the equation.
+## Conditional rectified flow
 
-Global gradient norm must be finite before any update. Muon additionally
-rejects a nonfinite direction norm before Newton-Schulz normalization instead of
-silently converting it into an arbitrary direction.
+The experimental flow endpoint is a fixed normalized Oklab transform `x1` of
+the global target. With deterministic `epsilon ~ Normal(0,I)` and
+`t ~ Uniform(0,1)`:
+
+~~~text
+x_t = (1-t) epsilon + t x1
+u_t = x1 - epsilon
+L_CFM = mean((v_theta(x_t,t,c)-u_t)^2)
+~~~
+
+`c` is formed only from sampled recurrent micro/macro fields, normalized
+interface memory, age, fidelity, emergence, and LOD. The velocity head receives
+no raw reference, target, genome, or Reconstruction++ head output.
+
+Hybrid training is:
+
+~~~text
+L_hybrid = endpoint_weight * L_Reconstruction++ + flow_weight * L_CFM
+~~~
+
+Frozen analysis sampling solves:
+
+~~~text
+dx/dt = v_theta(x,t,c), x(0)=epsilon
+~~~
+
+with fixed-step midpoint integration. ODE states are not clamped; nonfinite or
+runaway trajectories abort.
+
+## What the equations do not prove
+
+Bounded nonlinear recurrence can exhibit complex long-horizon behavior, but a
+finite rollout cannot establish a strange attractor, metaphysical strong
+emergence, homeostasis, or causal hierarchy. v9 records recurrence,
+perturbation recovery, target separation, ablation, and persistence proxies so
+those claims can be evaluated conservatively.

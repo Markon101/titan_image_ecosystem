@@ -1,21 +1,34 @@
-use crate::config::{ConditioningMode, RunConfig, SCHEMA_VERSION};
-use crate::corpus::{CorpusSourceMetadata, ImageCorpus, TargetSample};
+use crate::analysis::run_checkpoint_analysis;
+use crate::comparison::compare_v8_v9;
+use crate::config::{
+    BoundaryMode, ConditioningMode, MorphDepthMode, ObjectiveMode, RunConfig, SCHEMA_VERSION,
+};
+use crate::corpus::{CorpusSourceMetadata, CorpusSummary, ImageCorpus, TargetSample};
 use crate::dynamics::DynamicsSystem;
+use crate::flow::{build_training_sample, FlowLossOutput, RectifiedFlowRenderer};
 use crate::metrics::{image_metrics, state_metrics, tensor_rms, MetricRecord, StateDiagnostics};
-use crate::objectives::{visual_loss, LossOutput};
+use crate::objectives::{cross_resolution_consistency, visual_loss, LossOutput};
 use crate::optimizer::{OptimizerStats, PersistentAdamW};
-use crate::persistence::{load_checkpoint, save_checkpoint, write_json_atomic, ArtifactPaths};
+use crate::persistence::{
+    load_checkpoint, save_checkpoint, write_json_atomic, ArtifactPaths, CheckpointLoadReport,
+};
 use crate::render::{
     save_contact_sheet, save_mastered_png, save_png, save_state_atlas, ImplicitRenderer, RenderPlan,
 };
 use crate::state::WorldState;
-use crate::tensor_ops::{mean_abs, splitmix64};
+use crate::telemetry::{
+    append_jsonl, collect_model_statistics, tensor_fingerprint, AnatomySnapshot, GraftEvent,
+    ImageSnapshot, MorphActivationEvent, StateSnapshot, SubsystemStatistics, TargetTelemetry,
+};
+use crate::tensor_ops::{mean_abs, splitmix64, variance};
+use crate::terminal::TerminalReporter;
 use anyhow::{bail, Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde::Serialize;
+use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
@@ -40,6 +53,16 @@ struct PhaseSeconds {
     total: f64,
 }
 
+struct DecompositionDiagnostics {
+    grounded: crate::metrics::ImageDiagnostics,
+    grounded_rms: f32,
+    grounded_mean_abs: f32,
+    emergent_rms: f32,
+    emergent_mean_abs: f32,
+    emergent_variance: f32,
+    contribution_rms: f32,
+}
+
 #[derive(Serialize)]
 struct BuildProvenance {
     commit: &'static str,
@@ -60,7 +83,11 @@ struct RunMetadata<'a> {
     effective_threads: usize,
     source_images: usize,
     cached_source_images: usize,
+    active_parameter_count: usize,
+    inactive_reserve_parameters: usize,
+    parameter_subsystems: Vec<SubsystemStatistics>,
     corpus_sources: Vec<CorpusSourceMetadata>,
+    corpus_summary: CorpusSummary,
     corpus_fingerprint: String,
     config_signature: String,
     parameter_count: usize,
@@ -69,6 +96,7 @@ struct RunMetadata<'a> {
     interrupted: bool,
     stability_stopped: bool,
     resumed: bool,
+    checkpoint_recovered: bool,
     render_only: bool,
     metrics_continued: bool,
     loaded_optimizer_tensors: usize,
@@ -93,6 +121,7 @@ struct RunMetadata<'a> {
 
 pub fn run(config: RunConfig) -> Result<()> {
     config.validate()?;
+    let training_enabled = !config.render_only && !config.analysis.only;
     install_interrupt_handler()?;
     let available_threads = std::thread::available_parallelism()
         .map(|count| count.get())
@@ -107,6 +136,11 @@ pub fn run(config: RunConfig) -> Result<()> {
     std::fs::create_dir_all(&config.output_dir)
         .with_context(|| format!("cannot create {}", config.output_dir.display()))?;
     let paths = ArtifactPaths::new(&config);
+    let target_statistics_path = config.output_dir.join(format!(
+        "titan_image_target_statistics_v9{}.json",
+        config.suffix()
+    ));
+    let mut terminal_reporter = TerminalReporter::new(config.terminal, config.research_preset);
 
     let corpus_started = Instant::now();
     let mut corpus = ImageCorpus::new(&config, &device)?;
@@ -119,26 +153,26 @@ pub fn run(config: RunConfig) -> Result<()> {
     let builder = VarBuilder::from_varmap(&vars, DType::F32, &device);
     let dynamics = DynamicsSystem::new(&config, builder.pp("dynamics"), &device)?;
     let renderer = ImplicitRenderer::new(&config, builder.pp("renderer"))?;
+    let flow_renderer = RectifiedFlowRenderer::new(&config, builder.pp("flow"))?;
     deterministic_initialize(&vars, config.seed)?;
     let mut optimizer = PersistentAdamW::new(&vars, &config)?;
     let parameter_count = learned_parameter_count(&vars);
 
-    if config.render_only && !paths.checkpoint_complete() {
+    if config.render_only && !paths.recoverable_checkpoint_complete() {
         bail!(
-            "--render-only requires a complete v8 checkpoint for this output directory and run tag"
+            "--render-only requires a complete v9 checkpoint for this output directory and run tag"
         );
     }
 
-    let checkpoint_available = paths.checkpoint_complete();
-    if !config.fresh && paths.checkpoint_exists() && !checkpoint_available {
+    let checkpoint_available = paths.recoverable_checkpoint_complete();
+    if !config.fresh && paths.recoverable_checkpoint_exists() && !checkpoint_available {
         bail!(
-            "partial v8 checkpoint set in {}; use --fresh or restore all checkpoint files",
+            "partial v9 checkpoint set in {}; use --fresh or restore all checkpoint files",
             config.output_dir.display()
         );
     }
-    let (loaded_world, resumed, loaded_optimizer_tensors) = if !config.fresh && checkpoint_available
-    {
-        let (world, moments) = load_checkpoint(
+    let (loaded_world, resumed, checkpoint_load) = if !config.fresh && checkpoint_available {
+        let (world, report) = load_checkpoint(
             &paths,
             &mut vars,
             &mut optimizer,
@@ -146,10 +180,21 @@ pub fn run(config: RunConfig) -> Result<()> {
             &config,
             corpus.fingerprint(),
         )?;
-        (Some(world), true, moments)
+        (Some(world), true, report)
     } else {
-        (None, false, 0)
+        (None, false, CheckpointLoadReport::default())
     };
+    let loaded_optimizer_tensors =
+        checkpoint_load.optimizer_moments_preserved + checkpoint_load.optimizer_moments_new;
+    if checkpoint_load.recovered_previous {
+        terminal_reporter.event(
+            "RECOVERY",
+            format!(
+                "restored the previous complete checkpoint generation at world step {}",
+                loaded_world.as_ref().map_or(0, |world| world.step)
+            ),
+        );
+    }
 
     let initial_episode = loaded_world.as_ref().map_or(0, |world| world.episode);
     let mut sample = corpus.sample(initial_episode, &device)?;
@@ -172,9 +217,180 @@ pub fn run(config: RunConfig) -> Result<()> {
     };
     let start_world_step = world.step;
     let optimizer_updates_start = optimizer.updates();
+    let mut target_telemetry = TargetTelemetry::new(start_world_step);
 
-    let metrics_continued = resumed && paths.metrics.exists();
-    let mut metrics_writer = if config.render_only {
+    if checkpoint_load.model.grafted {
+        let plan = RenderPlan::new(&config, config.train_resolution, &device)?;
+        let age_phase = (world.age as f32 / config.episode_steps.max(1) as f32).clamp(0.0, 1.0);
+        let (grounding_schedule, emergence_schedule) = config.developmental_schedule(age_phase);
+        let mut old_world = world.clone();
+        old_world.morph_active_depth = checkpoint_load.model.old_active_depth;
+        let old_render = renderer.render_with_emergence(
+            &old_world.micro,
+            &old_world.macro_field,
+            &sample.genome_tensor,
+            &plan,
+            emergence_schedule,
+            false,
+        )?;
+        let new_render = renderer.render_with_emergence(
+            &world.micro,
+            &world.macro_field,
+            &sample.genome_tensor,
+            &plan,
+            emergence_schedule,
+            false,
+        )?;
+        let pre_loss = visual_loss(
+            &old_render,
+            &sample.image,
+            &old_world.micro,
+            &old_world.macro_field,
+            &old_world.memory,
+            &config,
+            grounding_schedule,
+            emergence_schedule,
+            config.detail.boundary,
+        )?;
+        let pre_micro = state_metrics(&old_world.micro, config.state_limit)?;
+        let pre_macro = state_metrics(&old_world.macro_field, config.state_limit)?;
+        let pre_image = image_metrics(&old_render.image)?;
+        let immediate_output_l1 = new_render
+            .image
+            .sub(&old_render.image)?
+            .abs()?
+            .mean_all()?
+            .to_scalar::<f32>()?;
+        let checkpoint_id_after = save_checkpoint(
+            &paths,
+            &vars,
+            &optimizer,
+            &world,
+            &config,
+            corpus.fingerprint(),
+        )?;
+        let old_generation = world.morph_generation.saturating_sub(1);
+        let old_layers = checkpoint_load.model.old_morph_layers;
+        let event = GraftEvent {
+            event_type: "morphic_graft",
+            schema_version: SCHEMA_VERSION,
+            event_id: format!(
+                "graft-{:016x}-g{}",
+                checkpoint_id_after, world.morph_generation
+            ),
+            world_step: world.step,
+            checkpoint_id_before: checkpoint_load.checkpoint_id,
+            checkpoint_id_after,
+            old_anatomy: AnatomySnapshot {
+                physical_layers: old_layers,
+                active_depth: checkpoint_load.model.old_active_depth,
+                graft_generation: old_generation,
+                block_birth_generations: world.morph_birth_generations[..old_layers].to_vec(),
+            },
+            new_anatomy: AnatomySnapshot {
+                physical_layers: config.morph_layers,
+                active_depth: world.morph_active_depth,
+                graft_generation: world.morph_generation,
+                block_birth_generations: world.morph_birth_generations.clone(),
+            },
+            copied_tensor_count: checkpoint_load.model.copied_tensors,
+            copied_parameter_count: checkpoint_load.model.copied_parameters,
+            new_tensor_count: checkpoint_load.model.new_tensors,
+            new_parameter_count: checkpoint_load.model.new_parameters,
+            resized_tensors: checkpoint_load.model.resized_tensors.clone(),
+            skipped_tensors: checkpoint_load.model.skipped_tensors.clone(),
+            optimizer_moments_preserved: checkpoint_load.optimizer_moments_preserved,
+            optimizer_moments_new: checkpoint_load.optimizer_moments_new,
+            optimizer_updates_preserved: checkpoint_load.optimizer_updates_preserved,
+            pre_graft_loss_total: pre_loss.total.to_scalar::<f32>()?,
+            pre_graft_loss_grounding: pre_loss.grounding.to_scalar::<f32>()?,
+            pre_graft_micro: StateSnapshot::from(&pre_micro),
+            pre_graft_macro: StateSnapshot::from(&pre_macro),
+            pre_graft_memory_rms: tensor_rms(&old_world.memory)?,
+            pre_graft_output_fingerprint: tensor_fingerprint(&old_render.image)?,
+            pre_graft_image: ImageSnapshot::from(&pre_image),
+            immediate_output_l1,
+            immediate_memory_rms_delta: 0.0,
+            committed: true,
+        };
+        append_jsonl(&paths.events, &event)?;
+        write_json_atomic(&paths.graft_analysis, &event)?;
+        terminal_reporter.event(
+            "GRAFT",
+            format!(
+                "committed L{}/{} -> L{}/{} | copied {} params, born {} params | preservation L1 {:.8}",
+            checkpoint_load.model.old_active_depth,
+            old_layers,
+            world.morph_active_depth,
+            config.morph_layers,
+            checkpoint_load.model.copied_parameters,
+            checkpoint_load.model.new_parameters,
+            immediate_output_l1,
+            ),
+        );
+    } else if checkpoint_load.model.new_active_depth > checkpoint_load.model.old_active_depth {
+        let mut old_world = world.clone();
+        old_world.morph_active_depth = checkpoint_load.model.old_active_depth;
+        let old_step = dynamics
+            .step(
+                &old_world,
+                &sample.genome_tensor,
+                Some(&sample.reference_micro),
+                Some(&sample.reference_macro),
+                config.reference_fidelity_max,
+                false,
+            )?
+            .world;
+        let activated_step = dynamics
+            .step(
+                &world,
+                &sample.genome_tensor,
+                Some(&sample.reference_micro),
+                Some(&sample.reference_macro),
+                config.reference_fidelity_max,
+                false,
+            )?
+            .world;
+        let preservation = mean_abs(&old_step.micro.sub(&activated_step.micro)?)?
+            + mean_abs(&old_step.macro_field.sub(&activated_step.macro_field)?)?
+            + mean_abs(&old_step.memory.sub(&activated_step.memory)?)?;
+        if preservation > 1e-6 {
+            bail!("startup morph activation was not function-preserving: delta {preservation}");
+        }
+        save_checkpoint(
+            &paths,
+            &vars,
+            &optimizer,
+            &world,
+            &config,
+            corpus.fingerprint(),
+        )?;
+        let event = MorphActivationEvent {
+            event_type: "morph_activation",
+            schema_version: SCHEMA_VERSION,
+            world_step: world.step,
+            old_active_depth: checkpoint_load.model.old_active_depth,
+            new_active_depth: world.morph_active_depth,
+            physical_layers: config.morph_layers,
+            plateau_improvement: 0.0,
+            seam_before: 0.0,
+            function_preservation_l1: preservation,
+        };
+        append_jsonl(&paths.events, &event)?;
+        terminal_reporter.event(
+            "MORPH ACTIVATION",
+            format!(
+                "startup L{} -> L{} of {} | preservation {:.8}",
+                checkpoint_load.model.old_active_depth,
+                world.morph_active_depth,
+                config.morph_layers,
+                preservation
+            ),
+        );
+    }
+
+    let metrics_continued = training_enabled && resumed && paths.metrics.exists();
+    let mut metrics_writer = if !training_enabled {
         None
     } else {
         let metrics_file = OpenOptions::new()
@@ -191,54 +407,87 @@ pub fn run(config: RunConfig) -> Result<()> {
         Some(writer)
     };
 
-    println!(
-        "TITAN Image v8: {} source image(s), {} cached, {} parameters, {} at world step {}",
-        corpus.len(),
-        corpus.cached_images(),
-        parameter_count,
-        if resumed {
-            "resuming"
-        } else {
-            "starting fresh"
-        },
-        world.step
+    terminal_reporter.event(
+        "START",
+        format!(
+            "{} source image(s), {} cached, {} parameters, {} at world step {}",
+            corpus.len(),
+            corpus.cached_images(),
+            parameter_count,
+            if resumed {
+                "resuming"
+            } else {
+                "starting fresh"
+            },
+            world.step
+        ),
     );
-    println!(
-        "Profile {:?} / {:?}: {} threads, {}ch {}x{} + {}x{}, train {}px, preview {}px every ~{} steps, endpoint loss every {} steps",
-        config.profile,
-        config.style,
-        effective_threads,
-        config.channels,
-        config.micro_size,
-        config.micro_size,
-        config.macro_size,
-        config.macro_size,
-        config.train_resolution,
-        config.snapshot_resolution,
-        config.snapshot_every,
-        config.bptt,
+    let corpus_summary = corpus.summary();
+    terminal_reporter.event(
+        "CORPUS",
+        format!(
+            "{}x{}..{}x{}, median {:.2} MP, total {:.1} MP, aspect {:.2}..{:.2}, pyramid cache {:.1} MiB",
+            corpus_summary.min_width,
+            corpus_summary.min_height,
+            corpus_summary.max_width,
+            corpus_summary.max_height,
+            corpus_summary.median_megapixels,
+            corpus_summary.total_megapixels,
+            corpus_summary.min_aspect_ratio,
+            corpus_summary.max_aspect_ratio,
+            corpus_summary.cached_pyramid_bytes as f64 / (1024.0 * 1024.0),
+        ),
     );
-    println!(
-        "Interface {}x{} tokens, width {}, {} shared loop(s), morph L{}/{}, {:?} conditioning, {:?} optimizer",
-        config.interface_grid,
-        config.interface_grid,
-        config.interface_width,
-        config.interface_loops,
-        config.morph_depth,
-        config.morph_layers,
-        config.conditioning,
-        optimizer.kind(),
+    terminal_reporter.event(
+        "PROFILE",
+        format!(
+            "{:?}/{:?}/{:?}: {} threads, {}ch {}x{} + {}x{}, global {}px/detail {}px",
+            config.profile,
+            config.style,
+            config.research_preset,
+            effective_threads,
+            config.channels,
+            config.micro_size,
+            config.micro_size,
+            config.macro_size,
+            config.macro_size,
+            config.train_resolution,
+            config.detail.resolution,
+        ),
     );
-    println!("Ctrl-C finishes the active optimizer window, saves a checkpoint, and publishes final metadata.");
+    terminal_reporter.event(
+        "ANATOMY",
+        format!(
+            "interface {}x{}, width {}, loops {}, morph L{}/{}, {:?} conditioning, {:?} optimizer",
+            config.interface_grid,
+            config.interface_grid,
+            config.interface_width,
+            config.interface_loops,
+            world.morph_active_depth,
+            config.morph_layers,
+            config.conditioning,
+            optimizer.kind(),
+        ),
+    );
+    terminal_reporter.event(
+        "SAFETY",
+        "Ctrl-C finishes the active optimizer window, saves a checkpoint, and publishes final metadata.",
+    );
 
-    let train_plan = if config.render_only {
+    let train_plan = if !training_enabled {
         None
     } else {
         Some(RenderPlan::new(&config, config.train_resolution, &device)?)
     };
     let mut snapshot_plan: Option<RenderPlan> = None;
+    let mut consistency_plan: Option<RenderPlan> = None;
     let mut output_plan: Option<RenderPlan> = None;
-    let optimizer_windows = if config.render_only {
+    let flow_plan = if config.objective.uses_flow() {
+        Some(RenderPlan::new(&config, config.flow.resolution, &device)?)
+    } else {
+        None
+    };
+    let optimizer_windows = if !training_enabled {
         0
     } else {
         config.steps / config.bptt
@@ -249,6 +498,7 @@ pub fn run(config: RunConfig) -> Result<()> {
     let mut stability_stopped = false;
     let mut saturation_windows = 0usize;
     let mut previous_image: Option<Tensor> = None;
+    let mut morph_loss_history = VecDeque::with_capacity(config.morph_growth.plateau_window);
 
     for local_window in 0..optimizer_windows {
         if stop_requested() {
@@ -269,6 +519,15 @@ pub fn run(config: RunConfig) -> Result<()> {
             metrics_writer.as_mut(),
         )?;
         let episode_started = world.age == 0;
+        if episode_started {
+            terminal_reporter.event(
+                "EPISODE",
+                format!(
+                    "episode {} target {} ({})",
+                    world.episode, sample.index, sample.name
+                ),
+            );
+        }
         let window_index = world.step / config.bptt as u64;
         let train_core = window_index.is_multiple_of(config.core_update_every as u64);
         if train_core {
@@ -281,15 +540,28 @@ pub fn run(config: RunConfig) -> Result<()> {
         let mut micro_movement_max = 0.0f32;
         let mut macro_movement_sum = 0.0f32;
         let mut macro_movement_max = 0.0f32;
+        let mut micro_reference_drive_sum = 0.0f32;
+        let mut macro_reference_drive_sum = 0.0f32;
         let mut macro_updates = 0usize;
         let reference_fidelity = reference_fidelity(&config, world.step);
+        let age_phase_start =
+            (world.age as f32 / config.episode_steps.max(1) as f32).clamp(0.0, 1.0);
+        let detail = corpus.detail_observation(
+            sample.index,
+            world.step,
+            age_phase_start,
+            &config,
+            &device,
+        )?;
         for _ in 0..config.bptt {
             let tick = Instant::now();
-            let stepped = dynamics.step(
+            let stepped = dynamics.step_with_local_reference(
                 &world,
                 &sample.genome_tensor,
                 Some(&sample.reference_micro),
                 Some(&sample.reference_macro),
+                detail.as_ref().map(|value| &value.local_reference_micro),
+                detail.as_ref().map(|value| &value.local_reference_macro),
                 reference_fidelity,
                 train_core,
             )?;
@@ -303,25 +575,140 @@ pub fn run(config: RunConfig) -> Result<()> {
             macro_movement_sum += stepped.macro_movement;
             macro_movement_max = macro_movement_max.max(stepped.macro_movement);
             macro_updates += usize::from(stepped.macro_updated);
+            micro_reference_drive_sum += stepped.micro_reference_drive_rms;
+            macro_reference_drive_sum += stepped.macro_reference_drive_rms;
             world = stepped.world;
         }
 
         let tick = Instant::now();
-        let rendered = renderer.render(
+        let detail_plan = detail
+            .as_ref()
+            .map(|observation| {
+                RenderPlan::new_view(&config, config.detail.resolution, observation.view, &device)
+            })
+            .transpose()?;
+        let active_plan = detail_plan
+            .as_ref()
+            .or(train_plan.as_ref())
+            .expect("training render plan");
+        let target = detail
+            .as_ref()
+            .map_or(&sample.image, |observation| &observation.target);
+        let boundary = if detail.is_some() {
+            BoundaryMode::Crop
+        } else {
+            config.detail.boundary
+        };
+        let age_phase = (world.age as f32 / config.episode_steps.max(1) as f32).clamp(0.0, 1.0);
+        let (grounding_schedule, emergence_schedule) = config.developmental_schedule(age_phase);
+        let rendered = renderer.render_with_emergence(
             &world.micro,
             &world.macro_field,
             &sample.genome_tensor,
-            train_plan.as_ref().expect("training has a render plan"),
+            active_plan,
+            emergence_schedule,
             true,
         )?;
-        let losses = visual_loss(
+        let mut losses = visual_loss(
             &rendered,
-            &sample.image,
+            target,
             &world.micro,
             &world.macro_field,
             &world.memory,
             &config,
+            grounding_schedule,
+            emergence_schedule,
+            boundary,
         )?;
+        if detail.is_none()
+            && config.reconstruction.loss_cross_resolution > 0.0
+            && window_index.is_multiple_of(8)
+            && config.train_resolution.is_multiple_of(2)
+        {
+            if consistency_plan.is_none() {
+                consistency_plan = Some(RenderPlan::new(
+                    &config,
+                    config.train_resolution / 2,
+                    &device,
+                )?);
+            }
+            let low = renderer.render_with_emergence(
+                &world.micro,
+                &world.macro_field,
+                &sample.genome_tensor,
+                consistency_plan
+                    .as_ref()
+                    .expect("consistency plan initialized"),
+                emergence_schedule,
+                true,
+            )?;
+            let (l1, low_frequency, edge) =
+                cross_resolution_consistency(&rendered.image, &low.image)?;
+            let weighted = l1
+                .add(&low_frequency.affine(0.5, 0.0)?)?
+                .add(&edge.affine(0.25, 0.0)?)?;
+            losses.total = losses
+                .total
+                .add(&weighted.affine(config.reconstruction.loss_cross_resolution as f64, 0.0)?)?;
+            losses.cross_resolution = l1;
+            losses.cross_resolution_low = low_frequency;
+            losses.cross_resolution_edge = edge;
+        }
+        if config.objective == ObjectiveMode::HybridFlow {
+            losses.total = losses
+                .total
+                .affine(config.flow.endpoint_weight as f64, 0.0)?;
+        }
+        let flow_active = config.objective.uses_flow()
+            && (config.objective == ObjectiveMode::Flow
+                || window_index.is_multiple_of(config.flow.cadence as u64));
+        let flow_diagnostics = if flow_active {
+            let time_seed = splitmix64(
+                config.seed
+                    ^ world.step.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                    ^ sample.fingerprint
+                    ^ 0xf10a_0001,
+            );
+            let noise_seed = splitmix64(time_seed ^ 0xf10a_5eed);
+            let flow_sample = build_training_sample(
+                &sample.flow_image,
+                time_seed,
+                noise_seed,
+                config.flow.min_time,
+                config.flow.max_time,
+            )?;
+            let flow_loss = flow_renderer.training_loss(
+                &flow_sample,
+                &world.micro,
+                &world.macro_field,
+                &world.memory,
+                flow_plan.as_ref().expect("flow plan initialized"),
+                age_phase,
+                reference_fidelity,
+                emergence_schedule,
+                true,
+            )?;
+            losses.total = losses
+                .total
+                .add(&flow_loss.loss.affine(config.flow.weight as f64, 0.0)?)?;
+            Some(flow_loss)
+        } else {
+            None
+        };
+        let decomposition = DecompositionDiagnostics {
+            grounded: image_metrics(&rendered.grounded_image.detach())?,
+            grounded_rms: tensor_rms(&rendered.grounded_image.detach())?,
+            grounded_mean_abs: mean_abs(&rendered.grounded_image.detach())?,
+            emergent_rms: tensor_rms(&rendered.emergent_lab.detach())?,
+            emergent_mean_abs: mean_abs(&rendered.emergent_lab.detach())?,
+            emergent_variance: variance(&rendered.emergent_lab.detach())?.to_scalar::<f32>()?,
+            contribution_rms: tensor_rms(
+                &rendered
+                    .image
+                    .detach()
+                    .sub(&rendered.grounded_image.detach())?,
+            )?,
+        };
         let loss_values = loss_scalars(&losses)?;
         phase.render_and_loss += seconds(tick.elapsed());
 
@@ -380,7 +767,16 @@ pub fn run(config: RunConfig) -> Result<()> {
             stability_violation,
             window_seconds,
             development_steps_per_second,
+            &config,
+            &decomposition,
+            grounding_schedule,
+            emergence_schedule,
+            detail.as_ref(),
+            micro_reference_drive_sum / config.bptt as f32,
+            macro_reference_drive_sum / config.bptt as f32,
+            flow_diagnostics.as_ref(),
         );
+        target_telemetry.observe(&sample.name, config.episode_steps, &record);
         record.write_csv(
             metrics_writer
                 .as_mut()
@@ -389,29 +785,27 @@ pub fn run(config: RunConfig) -> Result<()> {
         if (local_window + 1).is_multiple_of(config.log_every)
             || local_window + 1 == optimizer_windows
         {
-            println!(
-                "step {:>7} ep {:>3} age {:>3} | {} | loss {:.5} structure {:.5} | move u/m {:.5}/{:.5} | state u/m {:.3}/{:.3} clamp {:.3}/{:.3} mem {:.3} | image-delta {:.4} | grad-rms c/d {:.5}/{:.5} clip {:.3} | {:.2} step/s",
-                world.step,
-                world.episode,
-                world.age,
-                if train_core { "core" } else { "decode" },
-                record.loss_total,
-                record.loss_structure,
-                record.micro_movement_mean,
-                record.macro_movement_mean,
-                record.micro_state_rms,
-                record.macro_state_rms,
-                record.micro_clamp_fraction,
-                record.macro_clamp_fraction,
-                record.interface_memory_rms,
-                record.image_delta_mean,
-                record.core_gradient_rms,
-                record.decoder_gradient_rms,
-                record.gradient_clip_scale,
-                record.development_steps_per_second,
-            );
+            terminal_reporter.training(&record);
         }
         phase.metrics_and_logging += seconds(tick.elapsed());
+        morph_loss_history.push_back(record.loss_grounding);
+        while morph_loss_history.len() > config.morph_growth.plateau_window {
+            morph_loss_history.pop_front();
+        }
+        maybe_activate_morph(
+            &config,
+            &dynamics,
+            &sample,
+            reference_fidelity,
+            &optimizer_stats,
+            &vars,
+            &optimizer,
+            corpus.fingerprint(),
+            stability_violation,
+            &morph_loss_history,
+            &paths,
+            &mut world,
+        )?;
         if config.stability_patience > 0 && saturation_windows >= config.stability_patience {
             stability_stopped = true;
             interrupted = true;
@@ -449,7 +843,10 @@ pub fn run(config: RunConfig) -> Result<()> {
             )?;
             let path = snapshot_path(&config, &world);
             save_png(&snapshot.image, &path)?;
-            println!("preview step {} -> {}", world.step, path.display());
+            terminal_reporter.event(
+                "SNAPSHOT",
+                format!("step {} -> {}", world.step, path.display()),
+            );
             phase.output_rendering += seconds(tick.elapsed());
         }
         if config.checkpoint_every > 0 && world.step % config.checkpoint_every as u64 == 0 {
@@ -466,6 +863,20 @@ pub fn run(config: RunConfig) -> Result<()> {
                 &config,
                 corpus.fingerprint(),
             )?;
+            let model_stats = collect_model_statistics(
+                &vars,
+                &optimizer,
+                world.step,
+                world.morph_active_depth,
+                &world.morph_birth_generations,
+                config.objective.uses_flow(),
+            )?;
+            write_json_atomic(&paths.model_stats, &model_stats)?;
+            write_json_atomic(
+                &target_statistics_path,
+                &target_telemetry.report(world.step),
+            )?;
+            terminal_reporter.event("CHECKPOINT", format!("committed world step {}", world.step));
             phase.checkpointing += seconds(tick.elapsed());
         }
     }
@@ -483,6 +894,21 @@ pub fn run(config: RunConfig) -> Result<()> {
         )?;
         phase.checkpointing += seconds(tick.elapsed());
     }
+    let final_model_stats = collect_model_statistics(
+        &vars,
+        &optimizer,
+        world.step,
+        world.morph_active_depth,
+        &world.morph_birth_generations,
+        config.objective.uses_flow(),
+    )?;
+    write_json_atomic(&paths.model_stats, &final_model_stats)?;
+    if training_enabled {
+        write_json_atomic(
+            &target_statistics_path,
+            &target_telemetry.report(world.step),
+        )?;
+    }
 
     let output_tick = Instant::now();
     println!(
@@ -497,16 +923,55 @@ pub fn run(config: RunConfig) -> Result<()> {
         output_plan.as_ref().expect("output plan initialized"),
         false,
     )?;
-    save_png(&final_render.image, &paths.raw)?;
+    let final_raw_path = if config.analysis.only {
+        config.output_dir.join(format!(
+            "titan_image_analysis_render_v9{}.png",
+            config.suffix()
+        ))
+    } else {
+        paths.raw.clone()
+    };
+    let final_mastered_path = if config.analysis.only {
+        config.output_dir.join(format!(
+            "titan_image_analysis_mastered_v9{}.png",
+            config.suffix()
+        ))
+    } else {
+        paths.mastered.clone()
+    };
+    let final_grounded_path = if config.analysis.only {
+        config.output_dir.join(format!(
+            "titan_image_analysis_grounded_v9{}.png",
+            config.suffix()
+        ))
+    } else {
+        paths.grounded.clone()
+    };
+    let final_emergent_path = if config.analysis.only {
+        config.output_dir.join(format!(
+            "titan_image_analysis_emergent_v9{}.png",
+            config.suffix()
+        ))
+    } else {
+        paths.emergent.clone()
+    };
+    save_png(&final_render.image, &final_raw_path)?;
     save_mastered_png(
         &final_render.image,
-        &paths.mastered,
+        &final_mastered_path,
         config.mastering_strength,
     )?;
+    save_png(&final_render.grounded_image, &final_grounded_path)?;
+    save_png(&final_render.emergent_visual, &final_emergent_path)?;
     let mut outputs = vec![
-        paths.raw.display().to_string(),
-        paths.mastered.display().to_string(),
+        final_raw_path.display().to_string(),
+        final_mastered_path.display().to_string(),
+        final_grounded_path.display().to_string(),
+        final_emergent_path.display().to_string(),
     ];
+    if training_enabled {
+        outputs.push(target_statistics_path.display().to_string());
+    }
     if config.save_state_atlas {
         println!("Writing micro/macro state atlases...");
         save_state_atlas(&world.micro, &paths.micro_state)?;
@@ -514,8 +979,27 @@ pub fn run(config: RunConfig) -> Result<()> {
         outputs.push(paths.micro_state.display().to_string());
         outputs.push(paths.macro_state.display().to_string());
     }
+    if !stability_stopped && (config.analysis_requested() || config.analysis.emergence_gallery) {
+        println!("ANALYSIS: decomposition, emergence frontier, and requested frozen-state probes");
+        let _analysis = run_checkpoint_analysis(
+            &config,
+            &paths,
+            &mut corpus,
+            &dynamics,
+            &renderer,
+            &flow_renderer,
+            &world,
+            &sample,
+            &device,
+        )?;
+        outputs.push(paths.analysis.display().to_string());
+        if config.analysis.render_attribution || config.analysis.emergence_gallery {
+            outputs.push(paths.decomposition.display().to_string());
+            outputs.push(paths.emergence_frontier.display().to_string());
+        }
+    }
     interrupted |= stop_requested();
-    let (gallery_outputs, gallery_interrupted) = if stability_stopped {
+    let (gallery_outputs, gallery_interrupted) = if stability_stopped || config.analysis.only {
         (Vec::new(), false)
     } else {
         render_gallery(
@@ -569,14 +1053,19 @@ pub fn run(config: RunConfig) -> Result<()> {
         source_images: corpus.len(),
         cached_source_images: corpus.cached_images(),
         corpus_sources: corpus.source_manifest(),
+        corpus_summary: corpus.summary_snapshot()?,
         corpus_fingerprint: format!("{:016x}", corpus.fingerprint()),
         config_signature: format!("{:016x}", config.checkpoint_signature()),
         parameter_count,
+        active_parameter_count: final_model_stats.active_parameters,
+        inactive_reserve_parameters: final_model_stats.inactive_reserve_parameters,
+        parameter_subsystems: final_model_stats.subsystems.clone(),
         requested_development_steps: config.steps,
         completed_development_steps: completed_steps,
         interrupted,
         stability_stopped,
         resumed,
+        checkpoint_recovered: checkpoint_load.recovered_previous,
         render_only: config.render_only,
         metrics_continued,
         loaded_optimizer_tensors,
@@ -608,12 +1097,22 @@ pub fn run(config: RunConfig) -> Result<()> {
             "profile timings are measurements of this invocation, not universal device constants",
         ],
     };
-    let metadata_path = if config.render_only {
+    let metadata_path = if config.render_only || config.analysis.only {
         &paths.render_metadata
     } else {
         &paths.metadata
     };
     write_json_atomic(metadata_path, &metadata)?;
+    if let Some(v8_dir) = config.analysis.compare_v8_dir.as_deref() {
+        let comparison = compare_v8_v9(v8_dir, &paths)?;
+        println!(
+            "V8/V9 COMPARISON: v8 content {:?} -> v9 content {:?}, speed {:?} -> {:?}",
+            comparison.v8.reconstruction_content,
+            comparison.v9.reconstruction_content,
+            comparison.v8.development_steps_per_second,
+            comparison.v9.development_steps_per_second,
+        );
+    }
     println!(
         "{} at world step {} in {:.2}s ({:.2} development step/s). Raw: {}  Mastered: {}",
         if interrupted {
@@ -624,8 +1123,8 @@ pub fn run(config: RunConfig) -> Result<()> {
         world.step,
         phase.total,
         average_development_steps_per_second,
-        paths.raw.display(),
-        paths.mastered.display(),
+        final_raw_path.display(),
+        final_mastered_path.display(),
     );
     if gallery_completed > 0 {
         println!("Gallery: {}", paths.gallery.display());
@@ -633,6 +1132,97 @@ pub fn run(config: RunConfig) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn maybe_activate_morph(
+    config: &RunConfig,
+    dynamics: &DynamicsSystem,
+    sample: &TargetSample,
+    reference_fidelity: f32,
+    optimizer_stats: &OptimizerStats,
+    vars: &VarMap,
+    optimizer: &PersistentAdamW,
+    corpus_fingerprint: u64,
+    stability_violation: bool,
+    history: &VecDeque<f32>,
+    paths: &ArtifactPaths,
+    world: &mut WorldState,
+) -> Result<bool> {
+    if config.morph_growth.mode != MorphDepthMode::Adaptive
+        || world.morph_active_depth >= config.morph_growth.max_depth
+        || world.morph_active_depth >= config.morph_layers
+        || !world
+            .step
+            .is_multiple_of(config.morph_growth.interval as u64)
+        || history.len() < config.morph_growth.plateau_window
+        || stability_violation
+        || optimizer_stats.clip_scale < 0.05
+    {
+        return Ok(false);
+    }
+    let split = history.len() / 2;
+    let early = history.iter().take(split).sum::<f32>() / split.max(1) as f32;
+    let late = history.iter().skip(split).sum::<f32>() / (history.len() - split).max(1) as f32;
+    let improvement = (early - late) / early.abs().max(1e-6);
+    if improvement > config.morph_growth.plateau_epsilon {
+        return Ok(false);
+    }
+
+    let old_depth = world.morph_active_depth;
+    let mut old_world = world.clone();
+    old_world.morph_active_depth = old_depth;
+    let mut activated_world = world.clone();
+    activated_world.morph_active_depth = old_depth + 1;
+    let old_step = dynamics
+        .step(
+            &old_world,
+            &sample.genome_tensor,
+            Some(&sample.reference_micro),
+            Some(&sample.reference_macro),
+            reference_fidelity,
+            false,
+        )?
+        .world;
+    let activated_step = dynamics
+        .step(
+            &activated_world,
+            &sample.genome_tensor,
+            Some(&sample.reference_micro),
+            Some(&sample.reference_macro),
+            reference_fidelity,
+            false,
+        )?
+        .world;
+    let preservation = mean_abs(&old_step.micro.sub(&activated_step.micro)?)?
+        + mean_abs(&old_step.macro_field.sub(&activated_step.macro_field)?)?
+        + mean_abs(&old_step.memory.sub(&activated_step.memory)?)?;
+    if preservation > 1e-6 {
+        bail!("reserved morph activation was not function-preserving: delta {preservation}");
+    }
+    world.morph_active_depth = old_depth + 1;
+    save_checkpoint(paths, vars, optimizer, world, config, corpus_fingerprint)?;
+    let event = MorphActivationEvent {
+        event_type: "morph_activation",
+        schema_version: SCHEMA_VERSION,
+        world_step: world.step,
+        old_active_depth: old_depth,
+        new_active_depth: world.morph_active_depth,
+        physical_layers: config.morph_layers,
+        plateau_improvement: improvement,
+        seam_before: 0.0,
+        function_preservation_l1: preservation,
+    };
+    append_jsonl(&paths.events, &event)?;
+    println!(
+        "MORPH ACTIVATION: L{}/{} -> L{}/{} | plateau {:.5} | preservation {:.8}",
+        old_depth,
+        config.morph_layers,
+        world.morph_active_depth,
+        config.morph_layers,
+        improvement,
+        preservation,
+    );
+    Ok(true)
+}
 fn select_episode_if_needed(
     config: &RunConfig,
     corpus: &mut ImageCorpus,
@@ -673,14 +1263,41 @@ fn metric_record(
     image_delta_mean: f32,
     image_delta_rms: f32,
     image: &crate::metrics::ImageDiagnostics,
-    loss: [f32; 8],
+    loss: [f32; 21],
     optimizer: &OptimizerStats,
     reference_fidelity: f32,
     interface_memory_rms: f32,
     stability_violation: bool,
     window_seconds: f64,
     development_steps_per_second: f64,
+    config: &RunConfig,
+    decomposition: &DecompositionDiagnostics,
+    grounding_schedule: f32,
+    emergence_schedule: f32,
+    detail: Option<&crate::corpus::DetailObservation>,
+    micro_reference_drive_rms: f32,
+    macro_reference_drive_rms: f32,
+    flow: Option<&FlowLossOutput>,
 ) -> MetricRecord {
+    let objective = match config.objective {
+        ObjectiveMode::Endpoint => "endpoint",
+        ObjectiveMode::ReconstructionPlus => "reconstruction-plus",
+        ObjectiveMode::Flow => "flow",
+        ObjectiveMode::HybridFlow => "hybrid-flow",
+    };
+    let flow_values = flow.map_or((false, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), |value| {
+        (
+            true,
+            value.loss_value,
+            value.time,
+            value.interpolant_rms,
+            value.predicted_velocity_rms,
+            value.target_velocity_rms,
+            value.velocity_cosine,
+            value.one_step_endpoint_l1,
+            value.condition_rms,
+        )
+    });
     MetricRecord {
         step: world.step,
         age: world.age,
@@ -744,10 +1361,57 @@ fn metric_record(
         decoder_updated_parameters: optimizer.decoder_updated_parameters,
         development_steps_per_second,
         stability_violation,
+        objective,
+        supervision: if detail.is_some() { "crop" } else { "global" },
+        active_morph_depth: world.morph_active_depth,
+        physical_morph_layers: config.morph_layers,
+        morph_generation: world.morph_generation,
+        grounding_schedule,
+        emergence_schedule,
+        detail_zoom: detail.map_or(1.0, |value| value.zoom),
+        pyramid_level: detail.map_or(0, |value| value.pyramid_level),
+        micro_reference_drive_rms,
+        macro_reference_drive_rms,
+        loss_endpoint: loss[8],
+        loss_grounding: loss[9],
+        loss_ground_coarse: loss[10],
+        loss_ground_mid: loss[11],
+        loss_ground_fine: loss[12],
+        loss_ssim: loss[13],
+        loss_emergent_fit: loss[14],
+        loss_emergent_low: loss[15],
+        loss_emergent_tv: loss[16],
+        head_redundancy: loss[17],
+        cross_resolution_l1: loss[18],
+        cross_resolution_low: loss[19],
+        cross_resolution_edge: loss[20],
+        grounded_output_rms: decomposition.grounded_rms,
+        grounded_output_mean_abs: decomposition.grounded_mean_abs,
+        grounded_output_variance: decomposition.grounded.variance,
+        emergent_output_rms: decomposition.emergent_rms,
+        emergent_output_mean_abs: decomposition.emergent_mean_abs,
+        emergent_output_variance: decomposition.emergent_variance,
+        emergent_contribution_rms: decomposition.contribution_rms,
+        grounded_gradient_rms: optimizer.grounded_gradient_rms,
+        emergent_gradient_rms: optimizer.emergent_gradient_rms,
+        flow_gradient_rms: optimizer.flow_gradient_rms,
+        grounded_update_rms: optimizer.grounded_update_rms,
+        emergent_update_rms: optimizer.emergent_update_rms,
+        grounded_update_weight_ratio: optimizer.grounded_update_weight_ratio,
+        emergent_update_weight_ratio: optimizer.emergent_update_weight_ratio,
+        flow_active: flow_values.0,
+        flow_loss: flow_values.1,
+        flow_time: flow_values.2,
+        flow_interpolant_rms: flow_values.3,
+        flow_pred_velocity_rms: flow_values.4,
+        flow_target_velocity_rms: flow_values.5,
+        flow_velocity_cosine: flow_values.6,
+        flow_one_step_endpoint_l1: flow_values.7,
+        flow_condition_rms: flow_values.8,
     }
 }
 
-fn loss_scalars(loss: &LossOutput) -> Result<[f32; 8]> {
+fn loss_scalars(loss: &LossOutput) -> Result<[f32; 21]> {
     let values = Tensor::stack(
         &[
             &loss.total,
@@ -758,11 +1422,26 @@ fn loss_scalars(loss: &LossOutput) -> Result<[f32; 8]> {
             &loss.gamut,
             &loss.state,
             &loss.memory,
+            &loss.endpoint,
+            &loss.grounding,
+            &loss.ground_coarse,
+            &loss.ground_mid,
+            &loss.ground_fine,
+            &loss.ssim,
+            &loss.emergent_fit,
+            &loss.emergent_low,
+            &loss.emergent_tv,
+            &loss.head_redundancy,
+            &loss.cross_resolution,
+            &loss.cross_resolution_low,
+            &loss.cross_resolution_edge,
         ],
         0,
     )?
     .to_vec1::<f32>()?;
-    Ok(values.try_into().expect("eight loss tensors were stacked"))
+    Ok(values
+        .try_into()
+        .expect("twenty-one loss tensors were stacked"))
 }
 
 fn ensure_render_plan(
@@ -831,6 +1510,7 @@ fn render_gallery(
 fn zero_initialized_parameter(name: &str) -> bool {
     name.ends_with(".bias")
         || name.contains("micro_ca.output")
+        || name.contains("renderer.emergent.weight")
         || name.contains("macro_ca.output")
         || name.contains("micro_write.weight")
         || name.contains("macro_write.weight")
@@ -853,7 +1533,7 @@ fn deterministic_initialize(varmap: &VarMap, seed: u64) -> Result<()> {
         let count = variable.elem_count();
         let zero_initialized = zero_initialized_parameter(name);
         let unit_initialized = unit_initialized_parameter(name);
-        let small_color_head = name.contains("renderer.oklab.weight");
+        let small_color_head = name.contains("renderer.grounded.weight");
         let mut rng = ChaCha8Rng::seed_from_u64(parameter_seed(seed, name));
         let values = if zero_initialized {
             vec![0.0f32; count]
@@ -971,7 +1651,7 @@ fn peak_rss_kib() -> Option<u64> {
 
 fn snapshot_path(config: &RunConfig, world: &WorldState) -> PathBuf {
     config.output_dir.join(format!(
-        "titan_image_snapshot_v8{}_{:09}_ep{:05}_age{:04}_target{:04}.png",
+        "titan_image_snapshot_v9{}_{:09}_ep{:05}_age{:04}_target{:04}.png",
         config.suffix(),
         world.step,
         world.episode,
@@ -982,7 +1662,7 @@ fn snapshot_path(config: &RunConfig, world: &WorldState) -> PathBuf {
 
 fn gallery_path(config: &RunConfig, variant: usize, mastered: bool) -> PathBuf {
     config.output_dir.join(format!(
-        "titan_image_variant_v8{}_{:03}_{}.png",
+        "titan_image_variant_v9{}_{:03}_{}.png",
         config.suffix(),
         variant + 1,
         if mastered { "mastered" } else { "raw" }
@@ -1011,9 +1691,34 @@ mod tests {
             coord_bands: 2,
             train_resolution: 24,
             output_resolution: 24,
+            snapshot_resolution: 24,
             episode_steps: 4,
             bptt: 1,
             snapshot_every: 0,
+            interface_grid: 3,
+            interface_width: 32,
+            interface_loops: 1,
+            morph_layers: 2,
+            morph_depth: 1,
+            morph_growth: crate::config::MorphGrowthConfig {
+                min_depth: 1,
+                max_depth: 2,
+                ..RunConfig::default().morph_growth
+            },
+            flow: crate::config::FlowConfig {
+                hidden: 16,
+                resolution: 16,
+                ..RunConfig::default().flow
+            },
+            detail: crate::config::DetailConfig {
+                probability: 0.0,
+                resolution: 32,
+                ..RunConfig::default().detail
+            },
+            analysis: crate::config::AnalysisConfig {
+                emergence_gallery: false,
+                ..RunConfig::default().analysis
+            },
             checkpoint_every: 0,
             log_every: 1,
             gallery: 0,
@@ -1026,7 +1731,7 @@ mod tests {
     #[test]
     fn fresh_and_resumed_training_write_complete_artifacts() -> Result<()> {
         let root = std::env::temp_dir().join(format!(
-            "titan-image-v8-test-{}-{}",
+            "titan-image-v9-test-{}-{}",
             std::process::id(),
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
         ));
@@ -1069,10 +1774,118 @@ mod tests {
         for row in rows {
             assert_eq!(row.split(',').count(), columns, "CSV column mismatch");
         }
+        let checkpoint_before = [
+            std::fs::read(&paths.model)?,
+            std::fs::read(&paths.optimizer)?,
+            std::fs::read(&paths.world)?,
+            std::fs::read(&paths.checkpoint_manifest)?,
+        ];
+        let metrics_before = std::fs::read(&paths.metrics)?;
+        let metadata_before = std::fs::read(&paths.metadata)?;
+        let mut analysis = config.clone();
+        analysis.fresh = false;
+        analysis.analysis.only = true;
+        analysis.analysis.render_attribution = true;
+        run(analysis)?;
+        assert_eq!(checkpoint_before[0], std::fs::read(&paths.model)?);
+        assert_eq!(checkpoint_before[1], std::fs::read(&paths.optimizer)?);
+        assert_eq!(checkpoint_before[2], std::fs::read(&paths.world)?);
+        assert_eq!(
+            checkpoint_before[3],
+            std::fs::read(&paths.checkpoint_manifest)?
+        );
+        assert_eq!(metrics_before, std::fs::read(&paths.metrics)?);
+        assert_eq!(metadata_before, std::fs::read(&paths.metadata)?);
+        assert!(paths.analysis.exists());
+        assert!(paths.render_metadata.exists());
+        assert!(paths.previous_checkpoint().checkpoint_complete());
+
+        std::fs::write(&paths.model, b"interrupted checkpoint component")?;
+        let mut recovery = config.clone();
+        recovery.fresh = false;
+        recovery.analysis.only = true;
+        recovery.analysis.render_attribution = false;
+        run(recovery)?;
+        let recovery_metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&paths.render_metadata)?)?;
+        assert_eq!(recovery_metadata["checkpoint_recovered"], true);
+        assert_eq!(recovery_metadata["completed_world_step"], 2);
+        let recovered_manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&paths.checkpoint_manifest)?)?;
+        assert_eq!(recovered_manifest["world_step"], 2);
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
 
+    #[test]
+    fn append_only_morph_graft_preserves_model_and_optimizer_prefix() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "titan-image-v9-graft-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        let corpus = root.join("corpus");
+        let output = root.join("output");
+        std::fs::create_dir_all(&corpus)?;
+        image::RgbImage::from_fn(24, 24, |x, y| {
+            image::Rgb([(x * 7) as u8, (y * 9) as u8, ((x + 2 * y) * 3) as u8])
+        })
+        .save(corpus.join("source.png"))?;
+        let config = tiny_config(corpus, output);
+        run(config.clone())?;
+        let paths = ArtifactPaths::new(&config);
+        let old_model = candle_core::safetensors::load(&paths.model, &Device::Cpu)?;
+        let old_optimizer = candle_core::safetensors::load(&paths.optimizer, &Device::Cpu)?;
+
+        let grown = RunConfig {
+            fresh: false,
+            steps: 0,
+            morph_layers: 3,
+            morph_growth: crate::config::MorphGrowthConfig {
+                max_depth: 3,
+                ..config.morph_growth.clone()
+            },
+            analysis: crate::config::AnalysisConfig {
+                only: true,
+                emergence_gallery: false,
+                ..config.analysis.clone()
+            },
+            ..config.clone()
+        };
+        run(grown)?;
+        let new_model = candle_core::safetensors::load(&paths.model, &Device::Cpu)?;
+        let new_optimizer = candle_core::safetensors::load(&paths.optimizer, &Device::Cpu)?;
+        for (name, tensor) in &old_model {
+            if name.starts_with("checkpoint.") {
+                continue;
+            }
+            assert_eq!(
+                tensor.flatten_all()?.to_vec1::<f32>()?,
+                new_model[name].flatten_all()?.to_vec1::<f32>()?,
+                "model tensor changed during append graft: {name}"
+            );
+        }
+        for (name, tensor) in &old_optimizer {
+            if !name.starts_with("optimizer.m.") && !name.starts_with("optimizer.v.") {
+                continue;
+            }
+            assert_eq!(
+                tensor.flatten_all()?.to_vec1::<f32>()?,
+                new_optimizer[name].flatten_all()?.to_vec1::<f32>()?,
+                "optimizer moment changed during append graft: {name}"
+            );
+        }
+        let world = candle_core::safetensors::load(&paths.world, &Device::Cpu)?;
+        assert_eq!(world["world.morph_generation"].to_scalar::<i64>()?, 1);
+        assert_eq!(
+            world["world.morph_birth_generations"].to_vec1::<i64>()?,
+            vec![0, 0, 1]
+        );
+        let events = std::fs::read_to_string(&paths.events)?;
+        assert!(events.contains("\"event_type\":\"morphic_graft\""));
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
     #[test]
     fn parameter_initialization_is_seed_deterministic() -> Result<()> {
         let device = Device::Cpu;
@@ -1133,8 +1946,8 @@ mod tests {
         let _dynamics = DynamicsSystem::new(&config, builder.pp("dynamics"), &device)?;
         let _renderer = ImplicitRenderer::new(&config, builder.pp("renderer"))?;
         let count = learned_parameter_count(&vars);
-        assert_eq!(count, 682_851);
-        assert!((3.8..=4.1).contains(&(count as f64 / 172_595.0)));
+        assert_eq!(count, 815_606);
+        assert!((4.6..=4.9).contains(&(count as f64 / 172_595.0)));
         Ok(())
     }
 
@@ -1169,6 +1982,7 @@ mod tests {
             cyclic_gain: 0.0,
             train_resolution: 24,
             output_resolution: 24,
+            snapshot_resolution: 24,
             ..RunConfig::default()
         };
         let vars = VarMap::new();

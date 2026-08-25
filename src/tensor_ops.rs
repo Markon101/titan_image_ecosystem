@@ -119,16 +119,27 @@ pub fn deterministic_clock_mask(
 }
 
 /// Global octave Fourier coordinates. v4's 64-cycle cell coordinates visibly
-/// stamped the decoder lattice into output; v8 uses only canvas-scale bands.
+/// stamped the decoder lattice into output; v9 uses only canvas-scale bands.
 pub fn coordinate_features(resolution: usize, bands: usize, device: &Device) -> Result<Tensor> {
+    coordinate_features_window(resolution, bands, 0.0, 0.0, 1.0, device)
+}
+
+pub fn coordinate_features_window(
+    resolution: usize,
+    bands: usize,
+    x0: f32,
+    y0: f32,
+    size: f32,
+    device: &Device,
+) -> Result<Tensor> {
     let channels = bands * 4;
     let plane = resolution * resolution;
     let mut values = vec![0.0f32; channels * plane];
     for y in 0..resolution {
         for x in 0..resolution {
             let index = y * resolution + x;
-            let nx = (x as f32 + 0.5) / resolution as f32;
-            let ny = (y as f32 + 0.5) / resolution as f32;
+            let nx = x0 + size * (x as f32 + 0.5) / resolution as f32;
+            let ny = y0 + size * (y as f32 + 0.5) / resolution as f32;
             for band in 0..bands {
                 let frequency = (1usize << band) as f32;
                 let phase_x = std::f32::consts::TAU * frequency * nx;
@@ -186,6 +197,30 @@ impl PeriodicUpsampler {
         })
     }
 
+    pub fn new_bounded(
+        input_h: usize,
+        input_w: usize,
+        output_h: usize,
+        output_w: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        let (x0, x1, wx0, wx1) = Self::interpolation_axis_bounded(input_w, output_w);
+        let (y0, y1, wy0, wy1) = Self::interpolation_axis_bounded(input_h, output_h);
+        Ok(Self {
+            input_h,
+            input_w,
+            output_h,
+            output_w,
+            x0: Tensor::from_vec(x0, output_w, device)?,
+            x1: Tensor::from_vec(x1, output_w, device)?,
+            wx0: Tensor::from_vec(wx0, (1, 1, 1, output_w), device)?,
+            wx1: Tensor::from_vec(wx1, (1, 1, 1, output_w), device)?,
+            y0: Tensor::from_vec(y0, output_h, device)?,
+            y1: Tensor::from_vec(y1, output_h, device)?,
+            wy0: Tensor::from_vec(wy0, (1, 1, output_h, 1), device)?,
+            wy1: Tensor::from_vec(wy1, (1, 1, output_h, 1), device)?,
+        })
+    }
     pub fn apply(&self, x: &Tensor) -> Result<Tensor> {
         let (_, _, input_h, input_w) = x.dims4()?;
         if input_h != self.input_h || input_w != self.input_w {
@@ -209,6 +244,32 @@ impl PeriodicUpsampler {
                     .index_select(&self.y1, 2)?
                     .broadcast_mul(&self.wy1)?,
             )
+    }
+
+    fn interpolation_axis_bounded(
+        input: usize,
+        output: usize,
+    ) -> (Vec<u32>, Vec<u32>, Vec<f32>, Vec<f32>) {
+        let mut lower = Vec::with_capacity(output);
+        let mut upper = Vec::with_capacity(output);
+        let mut lower_weight = Vec::with_capacity(output);
+        let mut upper_weight = Vec::with_capacity(output);
+        for position in 0..output {
+            let source = (position as f32 + 0.5) * input as f32 / output as f32 - 0.5;
+            let floor = source.floor();
+            let base = (floor as isize).clamp(0, input.saturating_sub(1) as isize) as usize;
+            let next = (base + 1).min(input - 1);
+            let fraction = if source < 0.0 || source >= (input - 1) as f32 {
+                0.0
+            } else {
+                source - floor
+            };
+            lower.push(base as u32);
+            upper.push(next as u32);
+            lower_weight.push(1.0 - fraction);
+            upper_weight.push(fraction);
+        }
+        (lower, upper, lower_weight, upper_weight)
     }
 }
 

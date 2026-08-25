@@ -1,10 +1,11 @@
-use crate::config::{RunConfig, TrainingMode};
+use crate::config::{BoundaryMode, ObjectiveMode, RunConfig, TrainingMode};
 use crate::render::{channel_moments, seam_energy, RenderOutput};
 use crate::tensor_ops::periodic_shift;
 use candle_core::{Result, Tensor};
 
 pub struct LossOutput {
     pub total: Tensor,
+    pub endpoint: Tensor,
     pub content: Tensor,
     pub palette: Tensor,
     pub structure: Tensor,
@@ -12,8 +13,21 @@ pub struct LossOutput {
     pub gamut: Tensor,
     pub state: Tensor,
     pub memory: Tensor,
+    pub grounding: Tensor,
+    pub ground_coarse: Tensor,
+    pub ground_mid: Tensor,
+    pub ground_fine: Tensor,
+    pub ssim: Tensor,
+    pub emergent_fit: Tensor,
+    pub emergent_low: Tensor,
+    pub emergent_tv: Tensor,
+    pub head_redundancy: Tensor,
+    pub cross_resolution: Tensor,
+    pub cross_resolution_low: Tensor,
+    pub cross_resolution_edge: Tensor,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn visual_loss(
     rendered: &RenderOutput,
     target: &Tensor,
@@ -21,6 +35,9 @@ pub fn visual_loss(
     macro_field: &Tensor,
     memory: &Tensor,
     config: &RunConfig,
+    grounding_schedule: f32,
+    emergence_schedule: f32,
+    boundary: BoundaryMode,
 ) -> Result<LossOutput> {
     let image = &rendered.image;
     let target = target.detach();
@@ -30,21 +47,74 @@ pub fn visual_loss(
     };
     let palette = moment_loss(image, &target)?;
     let structure = gradient_distribution_loss(image, &target)?;
-    let seam = seam_energy(image)?;
+    let seam = if boundary == BoundaryMode::Periodic {
+        seam_energy(image)?
+    } else {
+        Tensor::new(0.0f32, image.device())?
+    };
     let gamut = rendered.gamut_excess.clone();
     let state = stability_barrier(micro, config.state_soft_limit)?
         .add(&stability_barrier(macro_field, config.state_soft_limit)?.affine(0.5, 0.0)?)?;
     let memory = stability_barrier(memory, 0.5 * config.memory_limit)?;
-    let total = content
+    let (ground_fine, ground_mid, ground_coarse) =
+        multiscale_l1(&rendered.grounded_image, &target)?;
+    let ssim = ssim_loss(&rendered.grounded_image, &target)?;
+    let grounding = ground_coarse
+        .affine(config.reconstruction.loss_ground_coarse as f64, 0.0)?
+        .add(&ground_mid.affine(config.reconstruction.loss_ground_mid as f64, 0.0)?)?
+        .add(&ground_fine.affine(config.reconstruction.loss_ground_fine as f64, 0.0)?)?
+        .add(&ssim.affine(0.2, 0.0)?)?;
+    let actual_effect = image.sub(&rendered.grounded_image)?;
+    let desired_effect = target.sub(&rendered.grounded_image.detach())?;
+    let emergent_fit = actual_effect.sub(&desired_effect)?.abs()?.mean_all()?;
+    let emergent_low = low_frequency_energy(&rendered.emergent_lab)?;
+    let emergent_tv = total_variation(&rendered.emergent_lab)?;
+    let head_redundancy =
+        absolute_correlation(&rendered.grounded_lab.detach(), &rendered.emergent_lab)?;
+
+    let endpoint = content
         .affine(config.loss_content as f64, 0.0)?
         .add(&palette.affine(config.loss_palette as f64, 0.0)?)?
         .add(&structure.affine(config.loss_structure as f64, 0.0)?)?
         .add(&seam.affine(config.loss_seam as f64, 0.0)?)?
-        .add(&gamut.affine(config.loss_gamut as f64, 0.0)?)?
+        .add(&gamut.affine(config.loss_gamut as f64, 0.0)?)?;
+    let endpoint_gain = f64::from(config.objective.uses_endpoint());
+    let reconstruction_plus = matches!(
+        config.objective,
+        ObjectiveMode::ReconstructionPlus | ObjectiveMode::HybridFlow
+    );
+    let reconstruction_gain = f64::from(reconstruction_plus);
+    let emergence_gain = reconstruction_gain * emergence_schedule as f64;
+    let total = endpoint
+        .affine(
+            endpoint_gain * config.reconstruction.loss_composite as f64,
+            0.0,
+        )?
+        .add(&grounding.affine(reconstruction_gain * grounding_schedule as f64, 0.0)?)?
+        .add(&emergent_fit.affine(
+            emergence_gain * config.reconstruction.loss_emergent_fit as f64,
+            0.0,
+        )?)?
+        .add(&emergent_low.affine(
+            emergence_gain * config.reconstruction.loss_emergent_low as f64,
+            0.0,
+        )?)?
+        .add(&emergent_tv.affine(
+            emergence_gain * config.reconstruction.loss_emergent_tv as f64,
+            0.0,
+        )?)?
+        .add(&head_redundancy.affine(
+            emergence_gain * config.reconstruction.loss_head_redundancy as f64,
+            0.0,
+        )?)?
         .add(&state.affine(config.loss_state as f64, 0.0)?)?
         .add(&memory.affine(config.loss_memory as f64, 0.0)?)?;
     Ok(LossOutput {
+        cross_resolution: Tensor::new(0.0f32, image.device())?,
+        cross_resolution_low: Tensor::new(0.0f32, image.device())?,
+        cross_resolution_edge: Tensor::new(0.0f32, image.device())?,
         total,
+        endpoint,
         content,
         palette,
         structure,
@@ -52,9 +122,129 @@ pub fn visual_loss(
         gamut,
         state,
         memory,
+        grounding,
+        ground_coarse,
+        ground_mid,
+        ground_fine,
+        ssim,
+        emergent_fit,
+        emergent_low,
+        emergent_tv,
+        head_redundancy,
     })
 }
 
+pub fn cross_resolution_consistency(
+    high_resolution: &Tensor,
+    low_resolution: &Tensor,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let pooled = average_pool2(high_resolution)?;
+    if pooled.dims4()? != low_resolution.dims4()? {
+        candle_core::bail!("cross-resolution comparison requires exactly 2x matching views");
+    }
+    let l1 = pooled.sub(low_resolution)?.abs()?.mean_all()?;
+    let low = average_pool2(&pooled)?
+        .sub(&average_pool2(low_resolution)?)?
+        .abs()?
+        .mean_all()?;
+    let edge = edge_map(&pooled)?
+        .sub(&edge_map(low_resolution)?)?
+        .abs()?
+        .mean_all()?;
+    Ok((l1, low, edge))
+}
+
+fn edge_map(value: &Tensor) -> Result<Tensor> {
+    let (_, _, height, width) = value.dims4()?;
+    let dx = value
+        .narrow(3, 1, width - 1)?
+        .sub(&value.narrow(3, 0, width - 1)?)?
+        .narrow(2, 0, height - 1)?;
+    let dy = value
+        .narrow(2, 1, height - 1)?
+        .sub(&value.narrow(2, 0, height - 1)?)?
+        .narrow(3, 0, width - 1)?;
+    dx.sqr()?.add(&dy.sqr()?)?.affine(1.0, 1e-8)?.sqrt()
+}
+fn multiscale_l1(image: &Tensor, target: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+    let fine = image.sub(target)?.abs()?.mean_all()?;
+    let image_mid = average_pool2(image)?;
+    let target_mid = average_pool2(target)?;
+    let mid = image_mid.sub(&target_mid)?.abs()?.mean_all()?;
+    let image_coarse = average_pool2(&image_mid)?;
+    let target_coarse = average_pool2(&target_mid)?;
+    let coarse = image_coarse.sub(&target_coarse)?.abs()?.mean_all()?;
+    Ok((fine, mid, coarse))
+}
+
+fn average_pool2(value: &Tensor) -> Result<Tensor> {
+    let (batch, channels, height, width) = value.dims4()?;
+    let height = height - height % 2;
+    let width = width - width % 2;
+    value
+        .narrow(2, 0, height)?
+        .narrow(3, 0, width)?
+        .reshape((batch, channels, height / 2, 2, width / 2, 2))?
+        .mean(5)?
+        .mean(3)
+}
+
+fn ssim_loss(image: &Tensor, target: &Tensor) -> Result<Tensor> {
+    let (_, channels, height, width) = image.dims4()?;
+    let flat_image = image.reshape((channels, height * width))?;
+    let flat_target = target.reshape((channels, height * width))?;
+    let mean_image = flat_image.mean(1)?;
+    let mean_target = flat_target.mean(1)?;
+    let centered_image = flat_image.broadcast_sub(&mean_image.unsqueeze(1)?)?;
+    let centered_target = flat_target.broadcast_sub(&mean_target.unsqueeze(1)?)?;
+    let variance_image = centered_image.sqr()?.mean(1)?;
+    let variance_target = centered_target.sqr()?.mean(1)?;
+    let covariance = centered_image.mul(&centered_target)?.mean(1)?;
+    let numerator = mean_image
+        .mul(&mean_target)?
+        .affine(2.0, 1e-4)?
+        .mul(&covariance.affine(2.0, 9e-4)?)?;
+    let denominator = mean_image
+        .sqr()?
+        .add(&mean_target.sqr()?)?
+        .affine(1.0, 1e-4)?
+        .mul(&variance_image.add(&variance_target)?.affine(1.0, 9e-4)?)?;
+    numerator.div(&denominator)?.mean_all()?.affine(-1.0, 1.0)
+}
+
+fn low_frequency_energy(value: &Tensor) -> Result<Tensor> {
+    average_pool2(&average_pool2(value)?)?.sqr()?.mean_all()
+}
+
+fn total_variation(value: &Tensor) -> Result<Tensor> {
+    let (_, _, height, width) = value.dims4()?;
+    let dx = value
+        .narrow(3, 1, width - 1)?
+        .sub(&value.narrow(3, 0, width - 1)?)?
+        .abs()?
+        .mean_all()?;
+    let dy = value
+        .narrow(2, 1, height - 1)?
+        .sub(&value.narrow(2, 0, height - 1)?)?
+        .abs()?
+        .mean_all()?;
+    dx.add(&dy)?.affine(0.5, 0.0)
+}
+
+fn absolute_correlation(first: &Tensor, second: &Tensor) -> Result<Tensor> {
+    let first = first.flatten_all()?;
+    let second = second.flatten_all()?;
+    let first = first.broadcast_sub(&first.mean_all()?)?;
+    let second = second.broadcast_sub(&second.mean_all()?)?;
+    let covariance = first.mul(&second)?.mean_all()?;
+    let scale = first
+        .sqr()?
+        .mean_all()?
+        .mul(&second.sqr()?.mean_all()?)?
+        .affine(1.0, 1e-8)?
+        .sqrt()?;
+    covariance.div(&scale)?.abs()
+}
 /// Color covariance plus multi-lag spatial autocorrelation. The v4 RGB Gram
 /// loss was blind to arrangement; lags 1/2/4/8 make texture scale observable
 /// while remaining much cheaper than a learned perceptual network on a phone.
@@ -211,10 +401,27 @@ mod tests {
         let rendered = RenderOutput {
             image: image.clone(),
             gamut_excess: Tensor::new(0.0f32, &Device::Cpu)?,
+            grounded_image: image.clone(),
+            emergent_visual: Tensor::zeros_like(&image)?,
+            grounded_lab: Tensor::zeros_like(&image)?,
+            emergent_lab: Tensor::zeros_like(&image)?,
+            emergence_strength: 0.0,
+            state_only_image: None,
+            learned_only_image: None,
         };
         let state = Tensor::zeros((1, 12, 16, 16), DType::F32, &Device::Cpu)?;
         let memory = Tensor::zeros((1, 32), DType::F32, &Device::Cpu)?;
-        let loss = visual_loss(&rendered, &image, &state, &state, &memory, &config)?;
+        let loss = visual_loss(
+            &rendered,
+            &image,
+            &state,
+            &state,
+            &memory,
+            &config,
+            1.0,
+            0.0,
+            BoundaryMode::Natural,
+        )?;
         assert!(loss.total.to_scalar::<f32>()? < 1e-7);
         Ok(())
     }

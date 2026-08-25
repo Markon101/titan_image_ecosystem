@@ -115,7 +115,7 @@ pub struct RecurrentInterface {
     grid: usize,
     width: usize,
     loops: usize,
-    morph_depth: usize,
+    attention_grid: usize,
     morph_residual_gain: f32,
     memory_limit: f32,
     gain: f32,
@@ -220,7 +220,7 @@ impl RecurrentInterface {
             grid: config.interface_grid,
             width: config.interface_width,
             loops: config.interface_loops,
-            morph_depth: config.morph_depth,
+            attention_grid: config.interface_grid.min(8),
             gain: config.interface_gain,
             morph_residual_gain: config.morph_residual_gain,
             memory_limit: config.memory_limit,
@@ -239,6 +239,7 @@ impl RecurrentInterface {
         fidelity: f32,
         age_phase: f32,
         tracked: bool,
+        active_morph_depth: usize,
     ) -> Result<InterfaceOutput> {
         let reference_micro = reference_micro.affine(fidelity as f64, 0.0)?;
         let reference_macro = reference_macro.affine(fidelity as f64, 0.0)?;
@@ -259,11 +260,20 @@ impl RecurrentInterface {
             Tensor::cat(&[genome, &condition_scalars], 0)?.reshape((1, genome.dim(0)? + 2))?;
         let condition = linear_mode(&self.conditioning_projection, &condition, tracked)?;
 
-        let mut tokens = micro_tokens
+        anyhow::ensure!(
+            active_morph_depth <= self.morphic.len(),
+            "active morph depth exceeds physical MorphicStack capacity"
+        );
+        let local_tokens = micro_tokens
             .add(&macro_tokens)?
             .affine(0.5, 0.0)?
             .broadcast_add(&condition)?
             .broadcast_add(memory)?;
+        let mut tokens = if self.grid > self.attention_grid {
+            pool_token_grid(&local_tokens, self.grid, self.attention_grid, self.width)?
+        } else {
+            local_tokens.clone()
+        };
         let mut next_memory = memory.clone();
         for _ in 0..self.loops {
             let normalized = self.attention_norm.forward(&tokens)?;
@@ -294,19 +304,27 @@ impl RecurrentInterface {
                 tracked,
             )?;
             next_memory = smooth_limit(&next_memory, self.memory_limit)?;
-            for (index, block) in self.morphic.iter().take(self.morph_depth).enumerate() {
+            for (index, block) in self.morphic.iter().take(active_morph_depth).enumerate() {
                 next_memory =
                     block.forward(&next_memory, index, self.morph_residual_gain, tracked)?;
-                next_memory = smooth_limit(&next_memory, self.memory_limit)?;
             }
             tokens = tokens.broadcast_add(&next_memory.affine(0.10, 0.0)?)?;
+            next_memory = smooth_limit(&next_memory, self.memory_limit)?;
         }
 
-        let micro_grid = linear_mode(&self.micro_write, &tokens, tracked)?
+        let write_tokens = if self.grid > self.attention_grid {
+            let global = upsample_token_grid(&tokens, self.attention_grid, self.grid, self.width)?;
+            local_tokens
+                .affine(0.5, 0.0)?
+                .add(&global.affine(0.5, 0.0)?)?
+        } else {
+            tokens
+        };
+        let micro_grid = linear_mode(&self.micro_write, &write_tokens, tracked)?
             .tanh()?
             .t()?
             .reshape((1, self.micro_write.weight().dim(0)?, self.grid, self.grid))?;
-        let macro_grid = linear_mode(&self.macro_write, &tokens, tracked)?
+        let macro_grid = linear_mode(&self.macro_write, &write_tokens, tracked)?
             .tanh()?
             .t()?
             .reshape((1, self.macro_write.weight().dim(0)?, self.grid, self.grid))?;
@@ -345,6 +363,46 @@ fn spatial_tokens(field: &Tensor, grid: usize) -> candle_core::Result<Tensor> {
         .reshape((grid * grid, channels))
 }
 
+fn pool_token_grid(
+    tokens: &Tensor,
+    source_grid: usize,
+    target_grid: usize,
+    width: usize,
+) -> candle_core::Result<Tensor> {
+    if source_grid == target_grid {
+        return Ok(tokens.clone());
+    }
+    if !source_grid.is_multiple_of(target_grid) {
+        candle_core::bail!("hierarchical token grid must divide the source grid");
+    }
+    let factor = source_grid / target_grid;
+    tokens
+        .reshape((target_grid, factor, target_grid, factor, width))?
+        .mean(3)?
+        .mean(1)?
+        .reshape((target_grid * target_grid, width))
+}
+
+fn upsample_token_grid(
+    tokens: &Tensor,
+    source_grid: usize,
+    target_grid: usize,
+    width: usize,
+) -> candle_core::Result<Tensor> {
+    if source_grid == target_grid {
+        return Ok(tokens.clone());
+    }
+    if !target_grid.is_multiple_of(source_grid) {
+        candle_core::bail!("hierarchical token grid must divide the target grid");
+    }
+    let factor = target_grid / source_grid;
+    tokens
+        .reshape((source_grid, source_grid, width))?
+        .unsqueeze(1)?
+        .unsqueeze(3)?
+        .broadcast_as((source_grid, factor, source_grid, factor, width))?
+        .reshape((target_grid * target_grid, width))
+}
 fn linear_mode(linear: &Linear, input: &Tensor, tracked: bool) -> candle_core::Result<Tensor> {
     if tracked {
         return linear.forward(input);
@@ -407,6 +465,7 @@ mod tests {
             0.5,
             0.25,
             true,
+            config.morph_depth,
         )?;
         assert_eq!(output.micro_bias.dims4()?, (1, 12, 24, 24));
         assert_eq!(output.macro_bias.dims4()?, (1, 12, 12, 12));
@@ -456,6 +515,7 @@ mod tests {
                 0.0,
                 (step % 64) as f32 / 64.0,
                 false,
+                config.morph_depth,
             )?;
             memory = output.memory;
             assert!(
@@ -468,6 +528,74 @@ mod tests {
                 "micro writeback escaped its tanh bound at step {step}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn zero_contract_activation_is_function_preserving() -> Result<()> {
+        let device = Device::Cpu;
+        let config = RunConfig {
+            micro_size: 24,
+            macro_size: 12,
+            channels: 12,
+            genome_dim: 4,
+            interface_grid: 3,
+            interface_width: 32,
+            interface_loops: 2,
+            morph_layers: 3,
+            morph_depth: 1,
+            train_resolution: 24,
+            output_resolution: 24,
+            ..RunConfig::default()
+        };
+        let variables = VarMap::new();
+        let interface = RecurrentInterface::new(
+            &config,
+            VarBuilder::from_varmap(&variables, DType::F32, &device),
+            &device,
+        )?;
+        let micro = Tensor::zeros((1, 12, 24, 24), DType::F32, &device)?;
+        let macro_field = Tensor::zeros((1, 12, 12, 12), DType::F32, &device)?;
+        let reference_micro = Tensor::zeros((1, 3, 24, 24), DType::F32, &device)?;
+        let reference_macro = Tensor::zeros((1, 3, 12, 12), DType::F32, &device)?;
+        let genome = Tensor::zeros(4, DType::F32, &device)?;
+        let memory = Tensor::zeros((1, 32), DType::F32, &device)?;
+        let first = interface.forward(
+            &micro,
+            &macro_field,
+            &reference_micro,
+            &reference_macro,
+            &genome,
+            &memory,
+            0.0,
+            1.0,
+            false,
+            1,
+        )?;
+        let activated = interface.forward(
+            &micro,
+            &macro_field,
+            &reference_micro,
+            &reference_macro,
+            &genome,
+            &memory,
+            0.0,
+            1.0,
+            false,
+            2,
+        )?;
+        assert_eq!(
+            first.memory.flatten_all()?.to_vec1::<f32>()?,
+            activated.memory.flatten_all()?.to_vec1::<f32>()?
+        );
+        assert_eq!(
+            first.micro_bias.flatten_all()?.to_vec1::<f32>()?,
+            activated.micro_bias.flatten_all()?.to_vec1::<f32>()?
+        );
+        assert_eq!(
+            first.macro_bias.flatten_all()?.to_vec1::<f32>()?,
+            activated.macro_bias.flatten_all()?.to_vec1::<f32>()?
+        );
         Ok(())
     }
 }

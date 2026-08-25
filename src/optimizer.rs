@@ -3,7 +3,7 @@ use anyhow::{bail, Context, Result};
 use candle_core::{backprop::GradStore, Device, Tensor, Var};
 use candle_nn::{ParamsAdamW, VarMap};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
 
@@ -11,6 +11,7 @@ const MUON_A: f64 = 3.4445;
 const MUON_B: f64 = -4.7750;
 const MUON_C: f64 = 2.0315;
 const MUON_EPSILON: f64 = 1e-7;
+pub const OPTIMIZER_LAYOUT_VERSION: u32 = 1;
 
 struct AdamVariable {
     name: String,
@@ -41,12 +42,30 @@ pub struct OptimizerStats {
     pub decoder_gradient_rms: f32,
     pub core_updated_parameters: usize,
     pub decoder_updated_parameters: usize,
+    pub grounded_gradient_rms: f32,
+    pub emergent_gradient_rms: f32,
+    pub flow_gradient_rms: f32,
+    pub grounded_update_rms: f32,
+    pub emergent_update_rms: f32,
+    pub grounded_update_weight_ratio: f32,
+    pub emergent_update_weight_ratio: f32,
+    pub grounded_updated_parameters: usize,
+    pub emergent_updated_parameters: usize,
     pub effective_learning_rate: f64,
     pub updated_variables: usize,
     pub updated_parameters: usize,
     pub muon_variables: usize,
     pub backward_seconds: f64,
     pub step_seconds: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct OptimizerMigrationReport {
+    pub preserved_moment_pairs: usize,
+    pub new_moment_pairs: usize,
+    pub preserved_moment_elements: usize,
+    pub new_moment_elements: usize,
+    pub updates_preserved: u64,
 }
 
 impl PersistentAdamW {
@@ -117,6 +136,12 @@ impl PersistentAdamW {
         let mut core_updated_parameters = 0usize;
         let mut decoder_updated_parameters = 0usize;
         let mut updated_parameters = 0usize;
+        let mut grounded_squared_norm = 0.0f64;
+        let mut emergent_squared_norm = 0.0f64;
+        let mut flow_squared_norm = 0.0f64;
+        let mut grounded_parameters = 0usize;
+        let mut emergent_parameters = 0usize;
+        let mut flow_parameters = 0usize;
         let mut muon_variables = 0usize;
         for state in &self.variables {
             if let Some(gradient) = gradients.get(state.variable.as_tensor()) {
@@ -131,6 +156,16 @@ impl PersistentAdamW {
                 }
                 updated_variables += 1;
                 updated_parameters += gradient.elem_count();
+                if state.name.starts_with("renderer.grounded.") {
+                    grounded_squared_norm += gradient_energy;
+                    grounded_parameters += gradient.elem_count();
+                } else if state.name.starts_with("renderer.emergent.") {
+                    emergent_squared_norm += gradient_energy;
+                    emergent_parameters += gradient.elem_count();
+                } else if state.name.starts_with("flow.") {
+                    flow_squared_norm += gradient_energy;
+                    flow_parameters += gradient.elem_count();
+                }
                 muon_variables += usize::from(state.use_muon);
             }
         }
@@ -156,6 +191,10 @@ impl PersistentAdamW {
         let params = &self.params;
         let first_bias = 1.0 / (1.0 - params.beta1.powi(next_update as i32));
         let second_bias = 1.0 / (1.0 - params.beta2.powi(next_update as i32));
+        let mut grounded_update_energy = 0.0f64;
+        let mut emergent_update_energy = 0.0f64;
+        let mut grounded_weight_energy = 0.0f64;
+        let mut emergent_weight_energy = 0.0f64;
         for state in &self.variables {
             let Some(raw_gradient) = gradients.get(state.variable.as_tensor()) else {
                 continue;
@@ -165,7 +204,7 @@ impl PersistentAdamW {
                 .variable
                 .as_tensor()
                 .affine(1.0 - learning_rate * params.weight_decay, 0.0)?;
-            if state.use_muon {
+            let next_value = if state.use_muon {
                 let next_momentum = state
                     .first
                     .as_tensor()
@@ -176,14 +215,9 @@ impl PersistentAdamW {
                     .add(&gradient.affine(1.0 - self.muon_momentum, 0.0)?)?;
                 let orthogonal = zeropower_newton_schulz(&nesterov, self.muon_ns_steps)?;
                 let (rows, columns) = gradient.dims2()?;
-                // Match the RMS convention used by current hybrid-Muon
-                // implementations so the AdamW learning-rate scale remains a
-                // useful starting point for an ablation.
                 let adjustment = 0.2 * (rows.max(columns) as f64).sqrt();
-                state
-                    .variable
-                    .set(&decayed.sub(&orthogonal.affine(learning_rate * adjustment, 0.0)?)?)?;
                 state.first.set(&next_momentum)?;
+                decayed.sub(&orthogonal.affine(learning_rate * adjustment, 0.0)?)?
             } else {
                 let next_first = state
                     .first
@@ -201,12 +235,36 @@ impl PersistentAdamW {
                         .sqrt()?
                         .affine(1.0, params.eps)?,
                 )?;
-                state
-                    .variable
-                    .set(&decayed.sub(&adjusted.affine(learning_rate, 0.0)?)?)?;
                 state.first.set(&next_first)?;
                 state.second.set(&next_second)?;
+                decayed.sub(&adjusted.affine(learning_rate, 0.0)?)?
+            };
+            if state.name.starts_with("renderer.grounded.") {
+                grounded_update_energy += next_value
+                    .sub(state.variable.as_tensor())?
+                    .sqr()?
+                    .sum_all()?
+                    .to_scalar::<f32>()? as f64;
+                grounded_weight_energy += state
+                    .variable
+                    .as_tensor()
+                    .sqr()?
+                    .sum_all()?
+                    .to_scalar::<f32>()? as f64;
+            } else if state.name.starts_with("renderer.emergent.") {
+                emergent_update_energy += next_value
+                    .sub(state.variable.as_tensor())?
+                    .sqr()?
+                    .sum_all()?
+                    .to_scalar::<f32>()? as f64;
+                emergent_weight_energy += state
+                    .variable
+                    .as_tensor()
+                    .sqr()?
+                    .sum_all()?
+                    .to_scalar::<f32>()? as f64;
             }
+            state.variable.set(&next_value)?;
         }
         self.updates = next_update;
         Ok(OptimizerStats {
@@ -222,6 +280,39 @@ impl PersistentAdamW {
             } else {
                 0.0
             },
+            grounded_gradient_rms: if grounded_parameters > 0 {
+                (grounded_squared_norm / grounded_parameters as f64).sqrt() as f32
+            } else {
+                0.0
+            },
+            emergent_gradient_rms: if emergent_parameters > 0 {
+                (emergent_squared_norm / emergent_parameters as f64).sqrt() as f32
+            } else {
+                0.0
+            },
+            flow_gradient_rms: if flow_parameters > 0 {
+                (flow_squared_norm / flow_parameters as f64).sqrt() as f32
+            } else {
+                0.0
+            },
+            grounded_update_rms: if grounded_parameters > 0 {
+                (grounded_update_energy / grounded_parameters as f64).sqrt() as f32
+            } else {
+                0.0
+            },
+            emergent_update_rms: if emergent_parameters > 0 {
+                (emergent_update_energy / emergent_parameters as f64).sqrt() as f32
+            } else {
+                0.0
+            },
+            grounded_update_weight_ratio: (grounded_update_energy
+                / grounded_weight_energy.max(1e-20))
+            .sqrt() as f32,
+            emergent_update_weight_ratio: (emergent_update_energy
+                / emergent_weight_energy.max(1e-20))
+            .sqrt() as f32,
+            grounded_updated_parameters: grounded_parameters,
+            emergent_updated_parameters: emergent_parameters,
             clip_scale: clip_scale as f32,
             effective_learning_rate: learning_rate,
             updated_variables,
@@ -234,8 +325,35 @@ impl PersistentAdamW {
         })
     }
 
-    pub fn save(&self, path: &Path, world_step: u64, device: &Device) -> Result<()> {
-        let mut tensors = HashMap::with_capacity(self.variables.len() * 2 + 3);
+    pub fn moment_rms(&self) -> Result<HashMap<String, (f32, f32)>> {
+        let mut output = HashMap::with_capacity(self.variables.len());
+        for state in &self.variables {
+            let first = state
+                .first
+                .as_tensor()
+                .sqr()?
+                .mean_all()?
+                .sqrt()?
+                .to_scalar::<f32>()?;
+            let second = state
+                .second
+                .as_tensor()
+                .sqr()?
+                .mean_all()?
+                .sqrt()?
+                .to_scalar::<f32>()?;
+            output.insert(state.name.clone(), (first, second));
+        }
+        Ok(output)
+    }
+    pub fn save(
+        &self,
+        path: &Path,
+        world_step: u64,
+        checkpoint_id: u64,
+        device: &Device,
+    ) -> Result<()> {
+        let mut tensors = HashMap::with_capacity(self.variables.len() * 2 + 5);
         tensors.insert(
             "optimizer.updates".to_owned(),
             Tensor::new(self.updates as i64, device)?,
@@ -243,6 +361,14 @@ impl PersistentAdamW {
         tensors.insert(
             "optimizer.world_step".to_owned(),
             Tensor::new(world_step as i64, device)?,
+        );
+        tensors.insert(
+            "optimizer.checkpoint_id".to_owned(),
+            Tensor::new(checkpoint_id as i64, device)?,
+        );
+        tensors.insert(
+            "optimizer.layout_version".to_owned(),
+            Tensor::new(OPTIMIZER_LAYOUT_VERSION as i64, device)?,
         );
         tensors.insert(
             "optimizer.kind".to_owned(),
@@ -261,52 +387,132 @@ impl PersistentAdamW {
         atomic_safetensors(&tensors, path)
     }
 
-    pub fn load(
+    pub fn load_migrating(
         &mut self,
         path: &Path,
         expected_world_step: u64,
+        expected_checkpoint_id: u64,
+        new_parameter_names: &[String],
         device: &Device,
-    ) -> Result<usize> {
+    ) -> Result<OptimizerMigrationReport> {
         let tensors = candle_core::safetensors::load(path, device)
             .with_context(|| format!("cannot load optimizer {}", path.display()))?;
-        let world_step = tensors
-            .get("optimizer.world_step")
-            .context("optimizer has no world step")?
-            .to_scalar::<i64>()? as u64;
-        if world_step != expected_world_step {
-            bail!("optimizer/world mismatch: optimizer {world_step}, world {expected_world_step}");
+        let scalar = |name: &str| -> Result<u64> {
+            Ok(tensors
+                .get(name)
+                .with_context(|| format!("optimizer missing {name}"))?
+                .to_scalar::<i64>()? as u64)
+        };
+        if scalar("optimizer.world_step")? != expected_world_step {
+            bail!("optimizer/world step mismatch");
         }
-        let saved_kind = tensors
-            .get("optimizer.kind")
-            .context("optimizer has no optimizer-kind marker")?
-            .to_scalar::<i64>()?;
-        if saved_kind != self.optimizer_kind as i64 {
-            bail!("optimizer kind does not match the requested v8 configuration");
+        if scalar("optimizer.checkpoint_id")? != expected_checkpoint_id {
+            bail!("optimizer checkpoint transaction does not match manifest");
         }
-        let updates = tensors
-            .get("optimizer.updates")
-            .context("optimizer has no update counter")?
-            .to_scalar::<i64>()? as u64;
-        let mut loaded = 0;
-        for state in &self.variables {
-            let first = tensors
-                .get(&format!("optimizer.m.{}", state.name))
-                .with_context(|| format!("missing first moment for {}", state.name))?;
-            let second = tensors
-                .get(&format!("optimizer.v.{}", state.name))
-                .with_context(|| format!("missing second moment for {}", state.name))?;
-            if first.dims() != state.variable.dims() || second.dims() != state.variable.dims() {
-                bail!("optimizer moment shape mismatch for {}", state.name);
+        if scalar("optimizer.layout_version")? != OPTIMIZER_LAYOUT_VERSION as u64 {
+            bail!("optimizer routing/layout version is incompatible");
+        }
+        if scalar("optimizer.kind")? != self.optimizer_kind as u64 {
+            bail!("optimizer kind does not match the requested v9 configuration");
+        }
+        let updates = scalar("optimizer.updates")?;
+        let current_names: HashSet<&str> = self
+            .variables
+            .iter()
+            .map(|state| state.name.as_str())
+            .collect();
+        let allowed_new: HashSet<&str> = new_parameter_names.iter().map(String::as_str).collect();
+        let saved_names: HashSet<&str> = tensors
+            .keys()
+            .filter_map(|name| name.strip_prefix("optimizer.m."))
+            .collect();
+        for saved in &saved_names {
+            if !current_names.contains(saved) {
+                bail!("saved optimizer moment refers to removed or unknown parameter {saved}");
             }
-            state.first.set(first)?;
-            state.second.set(second)?;
-            loaded += 1;
+            if !tensors.contains_key(&format!("optimizer.v.{saved}")) {
+                bail!("optimizer has only one moment tensor for {saved}");
+            }
+        }
+        for name in tensors
+            .keys()
+            .filter_map(|name| name.strip_prefix("optimizer.v."))
+        {
+            if !saved_names.contains(name) {
+                bail!("optimizer has a second moment without a first moment for {name}");
+            }
+        }
+
+        let mut report = OptimizerMigrationReport {
+            updates_preserved: updates,
+            ..OptimizerMigrationReport::default()
+        };
+        for state in &self.variables {
+            let first_name = format!("optimizer.m.{}", state.name);
+            let second_name = format!("optimizer.v.{}", state.name);
+            match (tensors.get(&first_name), tensors.get(&second_name)) {
+                (Some(_), Some(_)) if allowed_new.contains(state.name.as_str()) => {
+                    bail!(
+                        "optimizer unexpectedly contains moments for newly grafted parameter {}",
+                        state.name
+                    );
+                }
+                (Some(first), Some(second)) => {
+                    if first.dims() != state.variable.dims()
+                        || second.dims() != state.variable.dims()
+                        || first.dtype() != state.variable.dtype()
+                        || second.dtype() != state.variable.dtype()
+                    {
+                        bail!("optimizer moment shape/dtype mismatch for {}", state.name);
+                    }
+                    ensure_finite_tensor(first, "first optimizer moment", &state.name)?;
+                    ensure_finite_tensor(second, "second optimizer moment", &state.name)?;
+                    state.first.set(first)?;
+                    state.second.set(second)?;
+                    report.preserved_moment_pairs += 1;
+                    report.preserved_moment_elements += 2 * first.elem_count();
+                }
+                (None, None) if allowed_new.contains(state.name.as_str()) => {
+                    let first_max = state
+                        .first
+                        .as_tensor()
+                        .abs()?
+                        .max_all()?
+                        .to_scalar::<f32>()?;
+                    let second_max = state
+                        .second
+                        .as_tensor()
+                        .abs()?
+                        .max_all()?
+                        .to_scalar::<f32>()?;
+                    if first_max != 0.0 || second_max != 0.0 {
+                        bail!("new optimizer moments were not zero for {}", state.name);
+                    }
+                    report.new_moment_pairs += 1;
+                    report.new_moment_elements += 2 * state.variable.elem_count();
+                }
+                (None, None) => {
+                    bail!(
+                        "missing optimizer moments for copied parameter {}",
+                        state.name
+                    );
+                }
+                _ => bail!("optimizer has an incomplete moment pair for {}", state.name),
+            }
         }
         self.updates = updates;
-        Ok(loaded)
+        Ok(report)
     }
 }
 
+fn ensure_finite_tensor(tensor: &Tensor, role: &str, name: &str) -> Result<()> {
+    let rms = tensor.sqr()?.mean_all()?.sqrt()?.to_scalar::<f32>()?;
+    let maximum = tensor.abs()?.max_all()?.to_scalar::<f32>()?;
+    if !rms.is_finite() || !maximum.is_finite() {
+        bail!("non-finite {role} for {name}");
+    }
+    Ok(())
+}
 fn muon_candidate(name: &str, tensor: &Tensor) -> bool {
     if tensor.dims().len() != 2 || !name.ends_with(".weight") {
         return false;
@@ -394,6 +600,167 @@ mod tests {
         let loss = linear.forward(&input)?.sqr()?.mean_all()?;
         let stats = optimizer.backward_step(&loss)?;
         assert_eq!(stats.muon_variables, 1);
+        Ok(())
+    }
+
+    fn optimizer_test_path(label: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "titan-image-v9-optimizer-{label}-{}-{nonce}.safetensors",
+            std::process::id()
+        ))
+    }
+
+    fn add_test_linear(vars: &VarMap, name: &str, device: &Device) -> Result<()> {
+        let builder = VarBuilder::from_varmap(vars, DType::F32, device).pp(name);
+        let _ = candle_nn::linear(2, 2, builder)?;
+        Ok(())
+    }
+
+    #[test]
+    fn optimizer_migration_preserves_old_moments_and_zeros_new_moments() -> Result<()> {
+        let device = Device::Cpu;
+        let config = RunConfig::default();
+        let old_vars = VarMap::new();
+        add_test_linear(&old_vars, "kept", &device)?;
+        let mut old = PersistentAdamW::new(&old_vars, &config)?;
+        let mut expected = HashMap::new();
+        for (index, state) in old.variables.iter().enumerate() {
+            let first_value = index as f64 + 1.25;
+            let second_value = index as f64 + 11.5;
+            let first = Tensor::ones(
+                state.variable.shape().clone(),
+                state.variable.dtype(),
+                &device,
+            )?
+            .affine(first_value, 0.0)?;
+            let second = Tensor::ones(
+                state.variable.shape().clone(),
+                state.variable.dtype(),
+                &device,
+            )?
+            .affine(second_value, 0.0)?;
+            state.first.set(&first)?;
+            state.second.set(&second)?;
+            expected.insert(
+                state.name.clone(),
+                (
+                    first.flatten_all()?.to_vec1::<f32>()?,
+                    second.flatten_all()?.to_vec1::<f32>()?,
+                ),
+            );
+        }
+        old.updates = 37;
+        let path = optimizer_test_path("roundtrip");
+        old.save(&path, 91, 0x1234, &device)?;
+
+        let current_vars = VarMap::new();
+        add_test_linear(&current_vars, "kept", &device)?;
+        add_test_linear(&current_vars, "grafted", &device)?;
+        let mut current = PersistentAdamW::new(&current_vars, &config)?;
+        let new_names: Vec<String> = current
+            .variables
+            .iter()
+            .filter(|state| state.name.starts_with("grafted."))
+            .map(|state| state.name.clone())
+            .collect();
+        let report = current.load_migrating(&path, 91, 0x1234, &new_names, &device)?;
+        assert_eq!(report.updates_preserved, 37);
+        assert_eq!(report.preserved_moment_pairs, expected.len());
+        assert_eq!(report.new_moment_pairs, new_names.len());
+        for state in &current.variables {
+            let first = state.first.as_tensor().flatten_all()?.to_vec1::<f32>()?;
+            let second = state.second.as_tensor().flatten_all()?.to_vec1::<f32>()?;
+            if let Some((expected_first, expected_second)) = expected.get(&state.name) {
+                assert_eq!(
+                    &first, expected_first,
+                    "first moment changed for {}",
+                    state.name
+                );
+                assert_eq!(
+                    &second, expected_second,
+                    "second moment changed for {}",
+                    state.name
+                );
+            } else {
+                assert!(first.iter().all(|value| *value == 0.0));
+                assert!(second.iter().all(|value| *value == 0.0));
+            }
+        }
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn optimizer_migration_rejects_unknown_and_missing_moments() -> Result<()> {
+        let device = Device::Cpu;
+        let config = RunConfig::default();
+
+        let saved_vars = VarMap::new();
+        add_test_linear(&saved_vars, "kept", &device)?;
+        add_test_linear(&saved_vars, "retired", &device)?;
+        let saved = PersistentAdamW::new(&saved_vars, &config)?;
+        let unknown_path = optimizer_test_path("unknown");
+        saved.save(&unknown_path, 7, 11, &device)?;
+        let current_vars = VarMap::new();
+        add_test_linear(&current_vars, "kept", &device)?;
+        let mut current = PersistentAdamW::new(&current_vars, &config)?;
+        let error = current
+            .load_migrating(&unknown_path, 7, 11, &[], &device)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("removed or unknown parameter"), "{error}");
+        std::fs::remove_file(unknown_path)?;
+
+        let complete = PersistentAdamW::new(&current_vars, &config)?;
+        let missing_path = optimizer_test_path("missing");
+        complete.save(&missing_path, 8, 12, &device)?;
+        let mut tensors = candle_core::safetensors::load(&missing_path, &device)?;
+        tensors.remove("optimizer.v.kept.bias");
+        atomic_safetensors(&tensors, &missing_path)?;
+        let mut current = PersistentAdamW::new(&current_vars, &config)?;
+        let error = current
+            .load_migrating(&missing_path, 8, 12, &[], &device)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("only one moment tensor"), "{error}");
+        std::fs::remove_file(missing_path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn optimizer_migration_rejects_transaction_mismatch_and_saved_new_moments() -> Result<()> {
+        let device = Device::Cpu;
+        let config = RunConfig::default();
+        let vars = VarMap::new();
+        add_test_linear(&vars, "kept", &device)?;
+        add_test_linear(&vars, "grafted", &device)?;
+        let saved = PersistentAdamW::new(&vars, &config)?;
+        let path = optimizer_test_path("transaction");
+        saved.save(&path, 13, 21, &device)?;
+
+        let mut current = PersistentAdamW::new(&vars, &config)?;
+        let error = current
+            .load_migrating(&path, 13, 22, &[], &device)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("transaction"), "{error}");
+
+        let declared_new = current
+            .variables
+            .iter()
+            .filter(|state| state.name.starts_with("grafted."))
+            .map(|state| state.name.clone())
+            .collect::<Vec<_>>();
+        let error = current
+            .load_migrating(&path, 13, 21, &declared_new, &device)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("newly grafted parameter"), "{error}");
+        std::fs::remove_file(path)?;
         Ok(())
     }
 }

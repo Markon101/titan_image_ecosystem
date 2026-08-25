@@ -2,8 +2,130 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 pub const MIN_PHYSICAL_CHANNELS: usize = 12;
+const CLI_HELP_V9: &str = r#"TITAN Image 0.9.0 (schema 9) - compact recurrent morphogenic learner
+Usage: titan_image --corpus-dir PATH [options]
+
+Lifecycle and presets:
+  --corpus-dir PATH             PNG/JPEG/WebP corpus (required)
+  --output-dir PATH             v9 artifact directory
+  --run-tag NAME                Artifact/checkpoint namespace
+  --fresh                       Start a new v9 organism
+  --render-only                 Load checkpoint and render without training
+  --analysis-only               Load checkpoint and run frozen-state analysis
+  --profile NAME                s25-fast | s25-balanced | s25-quality
+  --style NAME                  alien-fluid | fractal-flame | reaction-garden | quasicrystal | pure-nca
+  --research-preset NAME        strict-reconstruct | reconstruction-plus | grounded-emergent | free-morph | flow-reconstruct
+  --list-presets                Explain compute/style/research presets
+
+Reconstruction++:
+  --objective NAME              endpoint | reconstruction-plus | flow | hybrid-flow
+  --conditioning NAME           generate | hybrid | reconstruct
+  --grounding-strength X        Early grounded-objective scale
+  --grounding-floor X           Mature fraction of grounding retained
+  --emergence-strength X        Mature residual contribution
+  --emergence-start X           Normalized developmental start age
+  --emergence-ramp X            Smooth-ramp width
+  --emergent-limit X            Smooth residual-state bound
+  --emergence-low-budget X      Low-frequency residual access, 0..1
+  --emergence-mid-budget X      Mesoscale residual access, 0..1
+  --local-reference-gain X      Bounded direct RGB-to-state drive gain
+  --loss-ground-coarse X        Coarse grounded reconstruction weight
+  --loss-ground-mid X           Medium grounded reconstruction weight
+  --loss-ground-fine X          Fine grounded reconstruction weight
+  --loss-emergent-fit X         Compatible residual-fit weight
+  --loss-emergent-low X         Low-band residual regularizer
+  --loss-emergent-tv X          Residual total-variation regularizer
+  --loss-head-redundancy X      Ground/emergent correlation penalty
+  --loss-cross-resolution X     Scheduled same-anatomy consistency weight
+
+Native detail and boundaries:
+  --detail-crop-probability X   Mature probability of a native-detail window
+  --detail-resolution N         Differentiable crop render edge
+  --detail-min-zoom X           Minimum crop zoom
+  --detail-max-zoom X           Maximum crop zoom
+  --detail-curriculum-start X   Normalized age before crop windows begin
+  --pyramid-cache-max-level N   Largest cached source pyramid edge
+  --pyramid-cache-dir PATH      Persistent pyramid cache override
+  --target-boundary NAME        natural | periodic | crop
+
+Morphic capacity:
+  --morph-layers N              Allocated append-preserving blocks
+  --morph-depth N               Fresh fixed-mode active depth
+  --morph-depth-mode NAME       fixed | capacity | adaptive
+  --morph-min-depth N           Fresh adaptive starting depth
+  --morph-max-depth N           Maximum active reserve
+  --morph-growth-interval N     Conservative activation check cadence
+  --morph-plateau-window N      Grounding-history window
+  --morph-plateau-epsilon X     Maximum improvement treated as plateau
+  --morph-seam-threshold X      Assimilation seam safety threshold
+
+Experimental conditional rectified flow:
+  --flow-weight X               Conditional flow-loss weight
+  --flow-endpoint-weight X      Hybrid Reconstruction++ weight
+  --flow-resolution N           Global Oklab flow edge (balanced: 64)
+  --flow-cadence N              Hybrid active-window cadence
+  --flow-min-time X             Minimum sampled path time
+  --flow-max-time X             Maximum sampled path time
+  --flow-hidden N               Velocity-head width
+  --flow-sample-steps N         Analysis midpoint ODE steps
+
+Analysis:
+  --render-attribution          Frozen-state decomposition and emergence sweep
+  --model-stats                 Request checkpoint model statistics
+  --autonomous-rollout N        Mature frozen-weight continuation horizon
+  --perturbation-analysis N     Deterministic damage/recovery horizon
+  --dynamics-ablation N         Causal cloned-trajectory horizon
+  --analysis-stride N           Heavy-analysis sampling stride
+  --benchmark                   Asymmetric deterministic reconstruction suite
+  --compare-v8-dir PATH         Compare compatible saved v8/v9 run artifacts
+  --no-emergence-gallery        Disable final decomposition/frontier sweep
+
+Training, architecture, and phone controls:
+  --mode MODE                   single | family | texture
+  --steps N                     Additional development steps
+  -t, --threads N               CPU threads
+  --terminal MODE               compact | rich | quiet
+  --train-resolution N          Whole-image supervision edge
+  --output-resolution N         Final/gallery edge
+  --snapshot-resolution N       Preview/ladder edge
+  --episode-steps N --bptt N --core-update-every N
+  --snapshot-every N --checkpoint-every N --log-every N
+  --micro-size N --macro-size N --channels N --genome-dim N
+  --interface-grid N            2..16; 8 is balanced reconstruction default
+  --interface-width N --interface-loops N --interface-gain X
+  --render-hidden N --render-blocks N --coord-bands N --coord-gain X
+  --state-skip X --chroma X --gamma X
+  --reference-fidelity-min X --reference-fidelity-max X --reference-dropout X
+
+Stability and optimizer:
+  --dt X --nca-gain X --state-leak X --state-limit X --state-soft-limit X
+  --loss-state X --loss-memory X --grad-clip X --stability-patience N
+  --optimizer adamw|hybrid-muon --learning-rate X --weight-decay X
+  --warmup-updates N --muon-momentum X --muon-ns-steps N
+
+Dynamics/output flags remain available; use README.md for equations and full examples.
+  -h, --help                    Show this help
+  -V, --version                 Show package/schema version"#;
+
+const PRESETS_HELP_V9: &str = r#"Compute profiles:
+  s25-fast      48/24 fields, 16ch, 4x4 interface, morph L2/4, 128px global, 96px crop
+  s25-balanced  64/32 fields, 24ch, 8x8 interface, morph L3/6, 192px global, 128px crop
+  s25-quality   80/40 fields, 32ch, 8x8 interface, morph L4/8, 256px global, 192px crop
+
+Research presets:
+  strict-reconstruct    maximum grounding, minimal synthesis
+  reconstruction-plus  stable grounded/emergent default
+  grounded-emergent     more late and mesoscale freedom
+  free-morph            weak reference, synthesis-oriented
+  flow-reconstruct      experimental endpoint + exact conditional rectified flow
+
+Style bases:
+  alien-fluid | fractal-flame | reaction-garden | quasicrystal | pure-nca
+
+Preset categories are resolved in profile -> style -> research order, then every
+explicit scalar flag overrides them regardless of CLI argument order."#;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -123,6 +245,191 @@ impl OptimizerKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ObjectiveMode {
+    Endpoint,
+    ReconstructionPlus,
+    Flow,
+    HybridFlow,
+}
+
+impl ObjectiveMode {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "endpoint" => Ok(Self::Endpoint),
+            "reconstruction-plus" | "reconstruction++" | "reconstruction" => {
+                Ok(Self::ReconstructionPlus)
+            }
+            "flow" | "flow-matching" => Ok(Self::Flow),
+            "hybrid-flow" | "endpoint-flow" => Ok(Self::HybridFlow),
+            _ => bail!(
+                "invalid --objective {value}; expected endpoint, reconstruction-plus, flow, or hybrid-flow"
+            ),
+        }
+    }
+
+    pub fn uses_endpoint(self) -> bool {
+        !matches!(self, Self::Flow)
+    }
+
+    pub fn uses_flow(self) -> bool {
+        matches!(self, Self::Flow | Self::HybridFlow)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MorphDepthMode {
+    Fixed,
+    Capacity,
+    Adaptive,
+}
+
+impl MorphDepthMode {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "fixed" => Ok(Self::Fixed),
+            "capacity" => Ok(Self::Capacity),
+            "adaptive" => Ok(Self::Adaptive),
+            _ => bail!("invalid --morph-depth-mode {value}; expected fixed, capacity, or adaptive"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BoundaryMode {
+    Natural,
+    Periodic,
+    Crop,
+}
+
+impl BoundaryMode {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "natural" => Ok(Self::Natural),
+            "periodic" | "texture" => Ok(Self::Periodic),
+            "crop" | "interior" => Ok(Self::Crop),
+            _ => bail!("invalid --target-boundary {value}; expected natural, periodic, or crop"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalMode {
+    Compact,
+    Rich,
+    Quiet,
+}
+
+impl TerminalMode {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "compact" => Ok(Self::Compact),
+            "rich" => Ok(Self::Rich),
+            "quiet" => Ok(Self::Quiet),
+            _ => bail!("invalid --terminal {value}; expected compact, rich, or quiet"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResearchPreset {
+    StrictReconstruct,
+    ReconstructionPlus,
+    GroundedEmergent,
+    FreeMorph,
+    FlowReconstruct,
+}
+
+impl ResearchPreset {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "strict-reconstruct" => Ok(Self::StrictReconstruct),
+            "reconstruction-plus" | "default" => Ok(Self::ReconstructionPlus),
+            "grounded-emergent" => Ok(Self::GroundedEmergent),
+            "free-morph" => Ok(Self::FreeMorph),
+            "flow-reconstruct" => Ok(Self::FlowReconstruct),
+            _ => bail!(
+                "invalid --research-preset {value}; expected strict-reconstruct, reconstruction-plus, grounded-emergent, free-morph, or flow-reconstruct"
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReconstructionConfig {
+    pub grounding_strength: f32,
+    pub emergence_strength: f32,
+    pub emergence_start: f32,
+    pub emergence_ramp: f32,
+    pub grounding_floor: f32,
+    pub emergent_limit: f32,
+    pub emergence_low_budget: f32,
+    pub emergence_mid_budget: f32,
+    pub local_reference_gain: f32,
+    pub loss_composite: f32,
+    pub loss_ground_coarse: f32,
+    pub loss_ground_mid: f32,
+    pub loss_ground_fine: f32,
+    pub loss_emergent_low: f32,
+    pub loss_emergent_tv: f32,
+    pub loss_emergent_fit: f32,
+    pub loss_head_redundancy: f32,
+    pub loss_cross_resolution: f32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DetailConfig {
+    pub probability: f32,
+    pub resolution: usize,
+    pub min_zoom: f32,
+    pub max_zoom: f32,
+    pub curriculum_start: f32,
+    pub cache_max_level: usize,
+    pub cache_dir: Option<PathBuf>,
+    pub boundary: BoundaryMode,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MorphGrowthConfig {
+    pub mode: MorphDepthMode,
+    pub min_depth: usize,
+    pub max_depth: usize,
+    pub interval: usize,
+    pub plateau_window: usize,
+    pub plateau_epsilon: f32,
+    pub seam_threshold: f32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FlowConfig {
+    pub weight: f32,
+    pub endpoint_weight: f32,
+    pub resolution: usize,
+    pub cadence: usize,
+    pub min_time: f32,
+    pub max_time: f32,
+    pub hidden: usize,
+    pub sample_steps: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AnalysisConfig {
+    pub only: bool,
+    pub render_attribution: bool,
+    pub model_stats: bool,
+    pub autonomous_horizon: usize,
+    pub perturbation_horizon: usize,
+    pub dynamics_horizon: usize,
+    pub stride: usize,
+    pub emergence_gallery: bool,
+    pub benchmark: bool,
+    pub compare_v8_dir: Option<PathBuf>,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunConfig {
     pub corpus_dir: PathBuf,
@@ -131,6 +438,13 @@ pub struct RunConfig {
     pub mode: TrainingMode,
     pub profile: PhoneProfile,
     pub style: StylePreset,
+    pub research_preset: ResearchPreset,
+    pub objective: ObjectiveMode,
+    pub reconstruction: ReconstructionConfig,
+    pub detail: DetailConfig,
+    pub morph_growth: MorphGrowthConfig,
+    pub flow: FlowConfig,
+    pub analysis: AnalysisConfig,
     pub steps: usize,
     pub threads: usize,
     pub seed: u64,
@@ -170,6 +484,7 @@ pub struct RunConfig {
     pub snapshot_every: usize,
     pub checkpoint_every: usize,
     pub log_every: usize,
+    pub terminal: TerminalMode,
     pub image_cache: usize,
     pub recursive_corpus: bool,
     pub learning_rate: f64,
@@ -229,11 +544,74 @@ impl Default for RunConfig {
             .unwrap_or(4);
         let mut config = Self {
             corpus_dir: PathBuf::from("/sdcard/Download/titan_image_sources"),
-            output_dir: PathBuf::from("/sdcard/Download/titan_image_v8"),
+            output_dir: PathBuf::from("/sdcard/Download/titan_image_v9"),
             run_tag: None,
-            mode: TrainingMode::Texture,
+            mode: TrainingMode::Family,
             profile: PhoneProfile::S25Balanced,
             style: StylePreset::AlienFluid,
+            research_preset: ResearchPreset::ReconstructionPlus,
+            objective: ObjectiveMode::ReconstructionPlus,
+            reconstruction: ReconstructionConfig {
+                grounding_strength: 1.0,
+                emergence_strength: 0.35,
+                emergence_start: 0.25,
+                emergence_ramp: 0.50,
+                grounding_floor: 0.70,
+                emergent_limit: 0.30,
+                emergence_low_budget: 0.05,
+                emergence_mid_budget: 0.35,
+                local_reference_gain: 0.12,
+                loss_composite: 1.0,
+                loss_ground_coarse: 2.5,
+                loss_ground_mid: 1.5,
+                loss_ground_fine: 0.75,
+                loss_emergent_low: 0.20,
+                loss_emergent_tv: 0.015,
+                loss_emergent_fit: 0.25,
+                loss_head_redundancy: 0.01,
+                loss_cross_resolution: 0.05,
+            },
+            detail: DetailConfig {
+                probability: 0.20,
+                resolution: 128,
+                min_zoom: 2.0,
+                max_zoom: 8.0,
+                curriculum_start: 0.35,
+                cache_max_level: 1536,
+                cache_dir: None,
+                boundary: BoundaryMode::Natural,
+            },
+            morph_growth: MorphGrowthConfig {
+                mode: MorphDepthMode::Fixed,
+                min_depth: 3,
+                max_depth: 6,
+                interval: 512,
+                plateau_window: 128,
+                plateau_epsilon: 0.002,
+                seam_threshold: 0.05,
+            },
+            flow: FlowConfig {
+                weight: 0.10,
+                endpoint_weight: 1.0,
+                min_time: 0.0,
+                max_time: 1.0,
+                hidden: 64,
+                sample_steps: 16,
+                resolution: 64,
+                cadence: 4,
+            },
+            analysis: AnalysisConfig {
+                only: false,
+                render_attribution: false,
+                model_stats: false,
+                autonomous_horizon: 0,
+                perturbation_horizon: 0,
+                dynamics_horizon: 0,
+                stride: 32,
+                emergence_gallery: true,
+                benchmark: false,
+                compare_v8_dir: None,
+            },
             steps: 1600,
             threads,
             seed: 42,
@@ -244,15 +622,15 @@ impl Default for RunConfig {
             ca_hidden: 128,
             render_hidden: 128,
             render_blocks: 4,
-            interface_grid: 4,
+            interface_grid: 8,
             interface_width: 128,
             interface_loops: 3,
-            morph_layers: 4,
+            morph_layers: 6,
             morph_depth: 3,
             morph_residual_gain: 0.02,
             memory_limit: 3.0,
             interface_gain: 0.18,
-            conditioning: ConditioningMode::Hybrid,
+            conditioning: ConditioningMode::Reconstruct,
             reference_fidelity_min: 0.15,
             reference_fidelity_max: 0.85,
             reference_dropout: 0.15,
@@ -273,6 +651,7 @@ impl Default for RunConfig {
             snapshot_every: 50,
             checkpoint_every: 400,
             log_every: 10,
+            terminal: TerminalMode::Compact,
             image_cache: 32,
             recursive_corpus: false,
             learning_rate: 6e-4,
@@ -326,6 +705,7 @@ impl Default for RunConfig {
         };
         config.apply_profile(PhoneProfile::S25Balanced);
         config.apply_style(StylePreset::AlienFluid);
+        config.apply_research_preset(ResearchPreset::ReconstructionPlus);
         config
     }
 }
@@ -375,6 +755,96 @@ impl RunConfig {
                 "--style" => {
                     let _ = StylePreset::parse(&value()?)?;
                 }
+                "--research-preset" => {
+                    let _ = ResearchPreset::parse(&value()?)?;
+                }
+                "--objective" => cfg.objective = ObjectiveMode::parse(&value()?)?,
+                "--grounding-strength" => {
+                    cfg.reconstruction.grounding_strength = parse(&value()?, flag)?
+                }
+                "--emergence-strength" => {
+                    cfg.reconstruction.emergence_strength = parse(&value()?, flag)?
+                }
+                "--emergence-low-budget" => {
+                    cfg.reconstruction.emergence_low_budget = parse(&value()?, flag)?
+                }
+                "--emergence-mid-budget" => {
+                    cfg.reconstruction.emergence_mid_budget = parse(&value()?, flag)?
+                }
+                "--emergence-start" => cfg.reconstruction.emergence_start = parse(&value()?, flag)?,
+                "--emergence-ramp" => cfg.reconstruction.emergence_ramp = parse(&value()?, flag)?,
+                "--grounding-floor" => cfg.reconstruction.grounding_floor = parse(&value()?, flag)?,
+                "--emergent-limit" => cfg.reconstruction.emergent_limit = parse(&value()?, flag)?,
+                "--local-reference-gain" => {
+                    cfg.reconstruction.local_reference_gain = parse(&value()?, flag)?
+                }
+                "--loss-composite" => cfg.reconstruction.loss_composite = parse(&value()?, flag)?,
+                "--loss-ground-coarse" => {
+                    cfg.reconstruction.loss_ground_coarse = parse(&value()?, flag)?
+                }
+                "--loss-ground-mid" => cfg.reconstruction.loss_ground_mid = parse(&value()?, flag)?,
+                "--loss-ground-fine" => {
+                    cfg.reconstruction.loss_ground_fine = parse(&value()?, flag)?
+                }
+                "--loss-emergent-low" => {
+                    cfg.reconstruction.loss_emergent_low = parse(&value()?, flag)?
+                }
+                "--loss-emergent-tv" => {
+                    cfg.reconstruction.loss_emergent_tv = parse(&value()?, flag)?
+                }
+                "--detail-crop-probability" => cfg.detail.probability = parse(&value()?, flag)?,
+                "--loss-emergent-fit" => {
+                    cfg.reconstruction.loss_emergent_fit = parse(&value()?, flag)?
+                }
+                "--loss-head-redundancy" => {
+                    cfg.reconstruction.loss_head_redundancy = parse(&value()?, flag)?
+                }
+                "--loss-cross-resolution" => {
+                    cfg.reconstruction.loss_cross_resolution = parse(&value()?, flag)?
+                }
+                "--detail-resolution" => cfg.detail.resolution = parse(&value()?, flag)?,
+                "--detail-min-zoom" => cfg.detail.min_zoom = parse(&value()?, flag)?,
+                "--detail-max-zoom" => cfg.detail.max_zoom = parse(&value()?, flag)?,
+                "--detail-curriculum-start" => {
+                    cfg.detail.curriculum_start = parse(&value()?, flag)?
+                }
+                "--pyramid-cache-max-level" => cfg.detail.cache_max_level = parse(&value()?, flag)?,
+                "--pyramid-cache-dir" => cfg.detail.cache_dir = Some(PathBuf::from(value()?)),
+                "--target-boundary" => cfg.detail.boundary = BoundaryMode::parse(&value()?)?,
+                "--morph-depth-mode" => cfg.morph_growth.mode = MorphDepthMode::parse(&value()?)?,
+                "--morph-min-depth" => cfg.morph_growth.min_depth = parse(&value()?, flag)?,
+                "--morph-max-depth" => cfg.morph_growth.max_depth = parse(&value()?, flag)?,
+                "--morph-growth-interval" => cfg.morph_growth.interval = parse(&value()?, flag)?,
+                "--morph-plateau-window" => {
+                    cfg.morph_growth.plateau_window = parse(&value()?, flag)?
+                }
+                "--morph-plateau-epsilon" => {
+                    cfg.morph_growth.plateau_epsilon = parse(&value()?, flag)?
+                }
+                "--morph-seam-threshold" => {
+                    cfg.morph_growth.seam_threshold = parse(&value()?, flag)?
+                }
+                "--flow-weight" => cfg.flow.weight = parse(&value()?, flag)?,
+                "--flow-endpoint-weight" => cfg.flow.endpoint_weight = parse(&value()?, flag)?,
+                "--flow-min-time" => cfg.flow.min_time = parse(&value()?, flag)?,
+                "--flow-max-time" => cfg.flow.max_time = parse(&value()?, flag)?,
+                "--flow-hidden" => cfg.flow.hidden = parse(&value()?, flag)?,
+                "--flow-resolution" => cfg.flow.resolution = parse(&value()?, flag)?,
+                "--flow-cadence" => cfg.flow.cadence = parse(&value()?, flag)?,
+                "--flow-sample-steps" => cfg.flow.sample_steps = parse(&value()?, flag)?,
+                "--terminal" => cfg.terminal = TerminalMode::parse(&value()?)?,
+                "--analysis-only" => cfg.analysis.only = true,
+                "--render-attribution" => cfg.analysis.render_attribution = true,
+                "--model-stats" => cfg.analysis.model_stats = true,
+                "--benchmark" => cfg.analysis.benchmark = true,
+                "--compare-v8-dir" => cfg.analysis.compare_v8_dir = Some(PathBuf::from(value()?)),
+                "--autonomous-rollout" => cfg.analysis.autonomous_horizon = parse(&value()?, flag)?,
+                "--perturbation-analysis" => {
+                    cfg.analysis.perturbation_horizon = parse(&value()?, flag)?
+                }
+                "--dynamics-ablation" => cfg.analysis.dynamics_horizon = parse(&value()?, flag)?,
+                "--analysis-stride" => cfg.analysis.stride = parse(&value()?, flag)?,
+                "--no-emergence-gallery" => cfg.analysis.emergence_gallery = false,
                 "--steps" => cfg.steps = parse(&value()?, flag)?,
                 "--threads" | "-t" => cfg.threads = parse(&value()?, flag)?,
                 "--seed" => cfg.seed = parse(&value()?, flag)?,
@@ -499,13 +969,17 @@ impl RunConfig {
                 self.interface_grid = 4;
                 self.interface_width = 96;
                 self.interface_loops = 2;
-                self.morph_layers = 3;
+                self.morph_layers = 4;
                 self.morph_depth = 2;
                 self.render_hidden = 80;
                 self.render_blocks = 3;
                 self.coord_bands = 3;
                 self.train_resolution = 128;
                 self.output_resolution = 512;
+                self.morph_growth.min_depth = 2;
+                self.morph_growth.max_depth = 4;
+                self.detail.resolution = 96;
+                self.detail.probability = 0.15;
                 self.snapshot_resolution = 256;
                 self.bptt = 4;
                 self.core_update_every = 2;
@@ -521,16 +995,20 @@ impl RunConfig {
                 self.genome_dim = 8;
                 self.ca_hidden = 128;
                 self.render_hidden = 128;
-                self.interface_grid = 4;
+                self.interface_grid = 8;
                 self.interface_width = 128;
                 self.interface_loops = 3;
-                self.morph_layers = 4;
+                self.morph_layers = 6;
                 self.morph_depth = 3;
                 self.render_blocks = 4;
                 self.coord_bands = 4;
                 self.train_resolution = 192;
                 self.output_resolution = 768;
                 self.snapshot_resolution = 384;
+                self.morph_growth.min_depth = 3;
+                self.morph_growth.max_depth = 6;
+                self.detail.resolution = 128;
+                self.detail.probability = 0.20;
                 self.bptt = 4;
                 self.core_update_every = 2;
                 self.episode_steps = 64;
@@ -545,10 +1023,10 @@ impl RunConfig {
                 self.genome_dim = 12;
                 self.ca_hidden = 192;
                 self.render_hidden = 160;
-                self.interface_grid = 5;
+                self.interface_grid = 8;
                 self.interface_width = 160;
                 self.interface_loops = 4;
-                self.morph_layers = 6;
+                self.morph_layers = 8;
                 self.morph_depth = 4;
                 self.render_blocks = 5;
                 self.coord_bands = 5;
@@ -558,6 +1036,10 @@ impl RunConfig {
                 self.bptt = 4;
                 self.core_update_every = 1;
                 self.episode_steps = 80;
+                self.morph_growth.min_depth = 4;
+                self.morph_growth.max_depth = 8;
+                self.detail.resolution = 192;
+                self.detail.probability = 0.25;
                 self.snapshot_every = 50;
                 self.checkpoint_every = 400;
                 self.gallery_steps = 80;
@@ -621,14 +1103,110 @@ impl RunConfig {
         }
     }
 
+    fn apply_research_preset(&mut self, preset: ResearchPreset) {
+        self.research_preset = preset;
+        match preset {
+            ResearchPreset::StrictReconstruct => {
+                self.objective = ObjectiveMode::ReconstructionPlus;
+                self.conditioning = ConditioningMode::Reconstruct;
+                self.reference_fidelity_max = 1.0;
+                self.reconstruction.grounding_strength = 1.25;
+                self.reconstruction.emergence_strength = 0.05;
+                self.reconstruction.grounding_floor = 0.95;
+                self.reconstruction.emergence_low_budget = 0.0;
+                self.reconstruction.emergence_mid_budget = 0.10;
+                self.reconstruction.loss_ground_coarse = 3.0;
+                self.reconstruction.loss_ground_mid = 2.0;
+                self.reconstruction.loss_ground_fine = 1.25;
+                self.detail.probability = 0.25;
+            }
+            ResearchPreset::ReconstructionPlus => {
+                self.objective = ObjectiveMode::ReconstructionPlus;
+                self.conditioning = ConditioningMode::Reconstruct;
+                self.reference_fidelity_max = 1.0;
+            }
+            ResearchPreset::GroundedEmergent => {
+                self.objective = ObjectiveMode::ReconstructionPlus;
+                self.conditioning = ConditioningMode::Reconstruct;
+                self.reference_fidelity_max = 1.0;
+                self.reconstruction.emergence_strength = 0.70;
+                self.reconstruction.emergence_start = 0.20;
+                self.reconstruction.grounding_floor = 0.65;
+                self.reconstruction.loss_emergent_low = 0.08;
+                self.reconstruction.emergence_low_budget = 0.15;
+                self.reconstruction.emergence_mid_budget = 0.65;
+                self.morph_growth.mode = MorphDepthMode::Adaptive;
+            }
+            ResearchPreset::FreeMorph => {
+                self.objective = ObjectiveMode::ReconstructionPlus;
+                self.conditioning = ConditioningMode::Hybrid;
+                self.reference_fidelity_min = 0.0;
+                self.reference_fidelity_max = 0.45;
+                self.reference_dropout = 0.35;
+                self.reconstruction.emergence_strength = 1.0;
+                self.reconstruction.emergence_start = 0.10;
+                self.reconstruction.grounding_floor = 0.25;
+                self.reconstruction.loss_emergent_low = 0.02;
+                self.reconstruction.emergence_low_budget = 0.50;
+                self.reconstruction.emergence_mid_budget = 1.0;
+                self.morph_growth.mode = MorphDepthMode::Adaptive;
+            }
+            ResearchPreset::FlowReconstruct => {
+                self.objective = ObjectiveMode::HybridFlow;
+                self.conditioning = ConditioningMode::Reconstruct;
+                self.reference_fidelity_max = 1.0;
+                self.reconstruction.emergence_strength = 0.20;
+                self.flow.weight = 0.10;
+                self.flow.endpoint_weight = 1.0;
+            }
+        }
+    }
+
+    pub fn developmental_schedule(&self, age_phase: f32) -> (f32, f32) {
+        let x = ((age_phase - self.reconstruction.emergence_start)
+            / self.reconstruction.emergence_ramp.max(1e-6))
+        .clamp(0.0, 1.0);
+        let smooth = x * x * (3.0 - 2.0 * x);
+        let grounding = self.reconstruction.grounding_strength
+            * (1.0 - (1.0 - self.reconstruction.grounding_floor) * smooth);
+        let emergence = self.reconstruction.emergence_strength * smooth;
+        (grounding, emergence)
+    }
+
+    pub fn initial_morph_depth(&self) -> usize {
+        match self.morph_growth.mode {
+            MorphDepthMode::Fixed => self.morph_depth,
+            MorphDepthMode::Capacity => self.morph_growth.max_depth,
+            MorphDepthMode::Adaptive => self.morph_growth.min_depth,
+        }
+        .min(self.morph_layers)
+    }
+
+    pub fn pyramid_cache_root(&self) -> PathBuf {
+        self.detail
+            .cache_dir
+            .clone()
+            .unwrap_or_else(|| self.output_dir.join("pyramid_cache_v9"))
+    }
+
+    pub fn analysis_requested(&self) -> bool {
+        self.analysis.only
+            || self.analysis.render_attribution
+            || self.analysis.model_stats
+            || self.analysis.autonomous_horizon > 0
+            || self.analysis.perturbation_horizon > 0
+            || self.analysis.benchmark
+            || self.analysis.compare_v8_dir.is_some()
+            || self.analysis.dynamics_horizon > 0
+    }
     pub fn validate(&self) -> Result<()> {
-        if !self.render_only && self.steps == 0 {
-            bail!("--steps must be positive unless --render-only is selected");
+        if !self.render_only && !self.analysis.only && self.steps == 0 {
+            bail!("--steps must be positive unless render-only or analysis-only is selected");
         }
         if self.bptt == 0 || self.episode_steps == 0 {
             bail!("--bptt and --episode-steps must be positive");
         }
-        if !self.render_only && !self.steps.is_multiple_of(self.bptt) {
+        if !self.render_only && !self.analysis.only && !self.steps.is_multiple_of(self.bptt) {
             bail!("--steps must be a multiple of --bptt");
         }
         if !self.episode_steps.is_multiple_of(self.bptt) {
@@ -653,19 +1231,155 @@ impl RunConfig {
         {
             bail!("architecture controls exceed their safe phone ranges");
         }
-        if !(2..=8).contains(&self.interface_grid)
+        if !(2..=16).contains(&self.interface_grid)
             || !self.micro_size.is_multiple_of(self.interface_grid)
             || !self.macro_size.is_multiple_of(self.interface_grid)
         {
-            bail!("--interface-grid must be 2..=8 and divide both field sizes");
+            bail!("--interface-grid must be 2..=16 and divide both field sizes");
         }
         if !(32..=512).contains(&self.interface_width)
             || !self.interface_width.is_multiple_of(32)
             || !(1..=8).contains(&self.interface_loops)
-            || !(1..=16).contains(&self.morph_layers)
+            || !(1..=32).contains(&self.morph_layers)
             || !(1..=self.morph_layers).contains(&self.morph_depth)
         {
             bail!("recurrent-interface controls exceed their safe phone ranges");
+        }
+        if !(1..=self.morph_layers).contains(&self.morph_growth.min_depth)
+            || !(self.morph_growth.min_depth..=self.morph_layers)
+                .contains(&self.morph_growth.max_depth)
+        {
+            bail!("morph growth depths must satisfy 1 <= min <= max <= morph-layers");
+        }
+        if self.morph_growth.mode == MorphDepthMode::Fixed
+            && !(self.morph_growth.min_depth..=self.morph_growth.max_depth)
+                .contains(&self.morph_depth)
+        {
+            bail!("fixed --morph-depth must lie inside morph min/max depth");
+        }
+        if self.morph_growth.interval == 0 || self.morph_growth.plateau_window < 4 {
+            bail!("morph growth interval must be positive and plateau window >= 4");
+        }
+        finite_range(
+            self.morph_growth.plateau_epsilon,
+            0.0,
+            1.0,
+            "--morph-plateau-epsilon",
+        )?;
+        finite_range(
+            self.morph_growth.seam_threshold,
+            0.0,
+            10.0,
+            "--morph-seam-threshold",
+        )?;
+        for (name, value) in [
+            (
+                "--grounding-strength",
+                self.reconstruction.grounding_strength,
+            ),
+            (
+                "--emergence-strength",
+                self.reconstruction.emergence_strength,
+            ),
+            ("--emergence-start", self.reconstruction.emergence_start),
+            ("--emergence-ramp", self.reconstruction.emergence_ramp),
+            ("--grounding-floor", self.reconstruction.grounding_floor),
+            ("--emergent-limit", self.reconstruction.emergent_limit),
+            (
+                "--local-reference-gain",
+                self.reconstruction.local_reference_gain,
+            ),
+        ] {
+            finite_range(value, 0.0, 4.0, name)?;
+        }
+        finite_range(
+            self.reconstruction.emergence_low_budget,
+            0.0,
+            1.0,
+            "--emergence-low-budget",
+        )?;
+        finite_range(
+            self.reconstruction.emergence_mid_budget,
+            0.0,
+            1.0,
+            "--emergence-mid-budget",
+        )?;
+        if self.reconstruction.emergence_start > 1.0
+            || self.reconstruction.emergence_ramp <= 0.0
+            || self.reconstruction.emergence_start + self.reconstruction.emergence_ramp > 2.0
+            || self.reconstruction.grounding_floor > 1.0
+        {
+            bail!("reconstruction curriculum must use normalized, nonzero schedule controls");
+        }
+        for (name, value) in [
+            ("--loss-composite", self.reconstruction.loss_composite),
+            (
+                "--loss-ground-coarse",
+                self.reconstruction.loss_ground_coarse,
+            ),
+            ("--loss-ground-mid", self.reconstruction.loss_ground_mid),
+            ("--loss-ground-fine", self.reconstruction.loss_ground_fine),
+            ("--loss-emergent-low", self.reconstruction.loss_emergent_low),
+            ("--loss-emergent-tv", self.reconstruction.loss_emergent_tv),
+            ("--loss-emergent-fit", self.reconstruction.loss_emergent_fit),
+            (
+                "--loss-head-redundancy",
+                self.reconstruction.loss_head_redundancy,
+            ),
+            (
+                "--loss-cross-resolution",
+                self.reconstruction.loss_cross_resolution,
+            ),
+        ] {
+            finite_range(value, 0.0, 100.0, name)?;
+        }
+        finite_range(
+            self.detail.probability,
+            0.0,
+            1.0,
+            "--detail-crop-probability",
+        )?;
+        if !(32..=384).contains(&self.detail.resolution)
+            || self.detail.min_zoom < 1.0
+            || self.detail.max_zoom < self.detail.min_zoom
+            || self.detail.max_zoom > 32.0
+            || !(64..=4096).contains(&self.detail.cache_max_level)
+        {
+            bail!("native-detail resolution/zoom/cache controls exceed safe ranges");
+        }
+        finite_range(
+            self.detail.curriculum_start,
+            0.0,
+            1.0,
+            "--detail-curriculum-start",
+        )?;
+        if !(16..=512).contains(&self.flow.hidden)
+            || !(1..=256).contains(&self.flow.sample_steps)
+            || !(16..=128).contains(&self.flow.resolution)
+            || self.flow.cadence == 0
+        {
+            bail!("flow hidden/resolution/cadence/sample-step controls exceed safe ranges");
+        }
+        finite_range(self.flow.weight, 0.0, 100.0, "--flow-weight")?;
+        finite_range(
+            self.flow.endpoint_weight,
+            0.0,
+            100.0,
+            "--flow-endpoint-weight",
+        )?;
+        finite_range(self.flow.min_time, 0.0, 1.0, "--flow-min-time")?;
+        finite_range(
+            self.flow.max_time,
+            self.flow.min_time,
+            1.0,
+            "--flow-max-time",
+        )?;
+        if self.analysis.stride == 0
+            || self.analysis.autonomous_horizon > 4096
+            || self.analysis.perturbation_horizon > 4096
+            || self.analysis.dynamics_horizon > 4096
+        {
+            bail!("analysis stride must be positive and horizons <= 4096");
         }
         finite_range(self.interface_gain, 0.0, 1.0, "--interface-gain")?;
         finite_range(self.morph_residual_gain, 0.0, 0.25, "--morph-residual-gain")?;
@@ -783,8 +1497,8 @@ impl RunConfig {
         if self.gallery > 64 || self.gallery_steps > 1024 || self.gallery_stride > 256 {
             bail!("--gallery must be <= 64, --gallery-steps <= 1024, and --gallery-stride <= 256");
         }
-        if self.render_only && self.fresh {
-            bail!("--render-only and --fresh are mutually exclusive");
+        if (self.render_only || self.analysis.only) && self.fresh {
+            bail!("render-only/analysis-only and --fresh are mutually exclusive");
         }
         Ok(())
     }
@@ -820,6 +1534,45 @@ impl RunConfig {
             mode,
             integrator,
             style,
+            self.objective as u64,
+            self.reconstruction.grounding_strength.to_bits() as u64,
+            self.reconstruction.emergence_strength.to_bits() as u64,
+            self.reconstruction.emergence_start.to_bits() as u64,
+            self.reconstruction.emergence_ramp.to_bits() as u64,
+            self.reconstruction.grounding_floor.to_bits() as u64,
+            self.reconstruction.emergent_limit.to_bits() as u64,
+            self.reconstruction.emergence_low_budget.to_bits() as u64,
+            self.reconstruction.emergence_mid_budget.to_bits() as u64,
+            self.reconstruction.local_reference_gain.to_bits() as u64,
+            self.reconstruction.loss_composite.to_bits() as u64,
+            self.reconstruction.loss_ground_coarse.to_bits() as u64,
+            self.reconstruction.loss_ground_mid.to_bits() as u64,
+            self.reconstruction.loss_ground_fine.to_bits() as u64,
+            self.reconstruction.loss_emergent_low.to_bits() as u64,
+            self.reconstruction.loss_emergent_tv.to_bits() as u64,
+            self.reconstruction.loss_emergent_fit.to_bits() as u64,
+            self.reconstruction.loss_head_redundancy.to_bits() as u64,
+            self.reconstruction.loss_cross_resolution.to_bits() as u64,
+            self.detail.probability.to_bits() as u64,
+            self.detail.resolution as u64,
+            self.detail.min_zoom.to_bits() as u64,
+            self.detail.max_zoom.to_bits() as u64,
+            self.detail.curriculum_start.to_bits() as u64,
+            self.detail.cache_max_level as u64,
+            self.detail.boundary as u64,
+            self.morph_growth.mode as u64,
+            self.morph_growth.interval as u64,
+            self.morph_growth.plateau_window as u64,
+            self.morph_growth.plateau_epsilon.to_bits() as u64,
+            self.morph_growth.seam_threshold.to_bits() as u64,
+            self.flow.weight.to_bits() as u64,
+            self.flow.endpoint_weight.to_bits() as u64,
+            self.flow.min_time.to_bits() as u64,
+            self.flow.max_time.to_bits() as u64,
+            self.flow.hidden as u64,
+            self.flow.sample_steps as u64,
+            self.flow.resolution as u64,
+            self.flow.cadence as u64,
             self.seed,
             self.micro_size as u64,
             self.macro_size as u64,
@@ -829,8 +1582,6 @@ impl RunConfig {
             self.interface_grid as u64,
             self.interface_width as u64,
             self.interface_loops as u64,
-            self.morph_layers as u64,
-            self.morph_depth as u64,
             self.morph_residual_gain.to_bits() as u64,
             self.memory_limit.to_bits() as u64,
             self.interface_gain.to_bits() as u64,
@@ -899,14 +1650,30 @@ impl RunConfig {
             })
     }
 
+    pub fn resolved_config_signature(&self) -> u64 {
+        [
+            self.checkpoint_signature(),
+            self.morph_layers as u64,
+            self.morph_depth as u64,
+            self.morph_growth.min_depth as u64,
+            self.morph_growth.max_depth as u64,
+            self.research_preset as u64,
+        ]
+        .into_iter()
+        .fold(0xcbf2_9ce4_8422_2325, |hash, value| {
+            (hash ^ value).wrapping_mul(0x100_0000_01b3)
+        })
+    }
     pub fn help() -> &'static str {
-        "TITAN Image v8 - recurrently stable S25-first morphogenic visual dynamics\n\
+        CLI_HELP_V9
+        /* v8/v9-pre-R++ help retained in source history only:
+        "TITAN Image v9 - recurrently stable S25-first morphogenic visual dynamics\n\
          Usage: titan_image [options]\n\n\
          Required and lifecycle:\n\
            --corpus-dir PATH           Source PNG/JPEG/WebP directory (required)\n\
-           --output-dir PATH           v8 artifact directory\n\
+           --output-dir PATH           v9 artifact directory\n\
            --run-tag NAME              Isolate checkpoint and output artifacts\n\
-           --fresh                     Start a new v8 organism for this tag\n\
+           --fresh                     Start a new v9 organism for this tag\n\
            --render-only               Load without training; render/gallery only\n\
            --profile NAME              s25-fast | s25-balanced | s25-quality\n\
            --style NAME                alien-fluid | fractal-flame | reaction-garden | quasicrystal | pure-nca\n\
@@ -999,9 +1766,12 @@ impl RunConfig {
            --gallery-seed N            Deterministic gallery seed\n\
            -h, --help                  Show this help\n\
            -V, --version               Show program/schema version"
+        */
     }
 
     fn presets_help() -> &'static str {
+        PRESETS_HELP_V9
+        /* legacy preset text:
         "Compute profiles:\n\
            s25-fast      48/24 fields, 16 channels, 96/80x3 model, 128 train\n\
            s25-balanced  64/32 fields, 24 channels, 128/128x4 model, 192 train\n\
@@ -1013,25 +1783,47 @@ impl RunConfig {
            quasicrystal     incommensurate forcing and interference\n\
            pure-nca         learned near/far NCA only, useful as a control\n\n\
          Presets are applied before explicit flags regardless of argument order."
+        */
     }
 }
 
 fn preapply_presets(args: &[String], config: &mut RunConfig) -> Result<()> {
+    let mut profile = None;
+    let mut style = None;
+    let mut research = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--profile" => {
                 let value = args.get(i + 1).context("missing value for --profile")?;
-                config.apply_profile(PhoneProfile::parse(value)?);
+                profile = Some(PhoneProfile::parse(value)?);
                 i += 2;
             }
             "--style" => {
                 let value = args.get(i + 1).context("missing value for --style")?;
-                config.apply_style(StylePreset::parse(value)?);
+                style = Some(StylePreset::parse(value)?);
+                i += 2;
+            }
+            "--research-preset" => {
+                let value = args
+                    .get(i + 1)
+                    .context("missing value for --research-preset")?;
+                research = Some(ResearchPreset::parse(value)?);
                 i += 2;
             }
             _ => i += 1,
         }
+    }
+    // Apply categories in a stable order, then let the normal parser apply all
+    // explicit scalar flags. CLI order must never change resolved semantics.
+    if let Some(profile) = profile {
+        config.apply_profile(profile);
+    }
+    if let Some(style) = style {
+        config.apply_style(style);
+    }
+    if let Some(research) = research {
+        config.apply_research_preset(research);
     }
     Ok(())
 }
@@ -1102,6 +1894,79 @@ mod tests {
         assert_eq!(config.micro_size, 48);
         assert_eq!(config.fractal_gain, 0.34);
         Ok(())
+    }
+
+    #[test]
+    fn preset_category_order_is_deterministic() -> Result<()> {
+        let mut first = RunConfig::default();
+        preapply_presets(
+            &[
+                "--research-preset".to_owned(),
+                "grounded-emergent".to_owned(),
+                "--profile".to_owned(),
+                "s25-fast".to_owned(),
+                "--style".to_owned(),
+                "pure-nca".to_owned(),
+            ],
+            &mut first,
+        )?;
+        let mut second = RunConfig::default();
+        preapply_presets(
+            &[
+                "--style".to_owned(),
+                "pure-nca".to_owned(),
+                "--profile".to_owned(),
+                "s25-fast".to_owned(),
+                "--research-preset".to_owned(),
+                "grounded-emergent".to_owned(),
+            ],
+            &mut second,
+        )?;
+        assert_eq!(
+            first.resolved_config_signature(),
+            second.resolved_config_signature()
+        );
+        assert_eq!(first.interface_grid, 4);
+        assert_eq!(first.reaction_gain, 0.0);
+        assert_eq!(first.reconstruction.emergence_strength, 0.70);
+        assert_eq!(first.morph_growth.mode, MorphDepthMode::Adaptive);
+        Ok(())
+    }
+
+    #[test]
+    fn research_presets_resolve_distinct_operating_regimes() {
+        let mut strict = RunConfig::default();
+        strict.apply_research_preset(ResearchPreset::StrictReconstruct);
+        let mut balanced = RunConfig::default();
+        balanced.apply_research_preset(ResearchPreset::ReconstructionPlus);
+        let mut free = RunConfig::default();
+        free.apply_research_preset(ResearchPreset::FreeMorph);
+        let mut flow = RunConfig::default();
+        flow.apply_research_preset(ResearchPreset::FlowReconstruct);
+
+        assert!(strict.reconstruction.grounding_floor > balanced.reconstruction.grounding_floor);
+        assert!(
+            strict.reconstruction.emergence_strength < balanced.reconstruction.emergence_strength
+        );
+        assert!(
+            free.reconstruction.emergence_low_budget > balanced.reconstruction.emergence_low_budget
+        );
+        assert!(free.reference_fidelity_max < balanced.reference_fidelity_max);
+        assert_eq!(flow.objective, ObjectiveMode::HybridFlow);
+        assert_eq!(flow.flow.weight, 0.10);
+    }
+
+    #[test]
+    fn append_only_morph_capacity_has_separate_resolved_signature() {
+        let base = RunConfig::default();
+        let mut expanded = base.clone();
+        expanded.morph_layers += 2;
+        expanded.morph_growth.max_depth += 2;
+        assert_eq!(base.checkpoint_signature(), expanded.checkpoint_signature());
+        assert_ne!(
+            base.resolved_config_signature(),
+            expanded.resolved_config_signature()
+        );
     }
 
     #[test]

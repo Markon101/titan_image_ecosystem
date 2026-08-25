@@ -1,63 +1,180 @@
 use crate::config::{RunConfig, StylePreset};
 use crate::tensor_ops::{
-    broadcast_vector, coordinate_features, pixelwise_linear_mode, PeriodicUpsampler,
+    broadcast_vector, coordinate_features, coordinate_features_window, periodic_shift,
+    pixelwise_linear_mode, smooth_limit, PeriodicUpsampler,
 };
 use anyhow::{Context, Result};
 use candle_core::{Device, Tensor, D};
-use candle_nn::{Linear, VarBuilder};
+use candle_nn::{Init, Linear, VarBuilder};
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub struct ImplicitRenderer {
     input: Linear,
     blocks: Vec<Linear>,
-    output: Linear,
+    grounded_head: Linear,
+    emergent_head: Linear,
+    default_emergence_strength: f32,
+    emergent_limit: f32,
+    emergence_low_budget: f32,
+    emergence_mid_budget: f32,
     state_skip: f32,
     chroma: f32,
     gamma: f64,
     style: StylePreset,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SpatialView {
+    pub x: f32,
+    pub y: f32,
+    pub size: f32,
+    pub zoom: f32,
+}
+
+impl SpatialView {
+    pub const fn full() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            size: 1.0,
+            zoom: 1.0,
+        }
+    }
+
+    pub fn is_full(self) -> bool {
+        self.x == 0.0 && self.y == 0.0 && self.size == 1.0
+    }
+}
+
+struct FieldObservation {
+    start_x: usize,
+    start_y: usize,
+    cells: usize,
+    upsampler: PeriodicUpsampler,
+}
+
+impl FieldObservation {
+    fn new(
+        field_size: usize,
+        resolution: usize,
+        view: SpatialView,
+        device: &Device,
+    ) -> Result<Self> {
+        if view.is_full() {
+            return Ok(Self {
+                start_x: 0,
+                start_y: 0,
+                cells: field_size,
+                upsampler: PeriodicUpsampler::new(
+                    field_size, field_size, resolution, resolution, device,
+                )?,
+            });
+        }
+        let cells = ((field_size as f32 * view.size).round() as usize).clamp(2, field_size);
+        let max_start = field_size - cells;
+        let start_x = ((view.x * field_size as f32).round() as usize).min(max_start);
+        let start_y = ((view.y * field_size as f32).round() as usize).min(max_start);
+        Ok(Self {
+            start_x,
+            start_y,
+            cells,
+            upsampler: PeriodicUpsampler::new_bounded(
+                cells, cells, resolution, resolution, device,
+            )?,
+        })
+    }
+
+    fn apply(&self, field: &Tensor) -> candle_core::Result<Tensor> {
+        let cropped = field
+            .narrow(2, self.start_y, self.cells)?
+            .narrow(3, self.start_x, self.cells)?
+            .contiguous()?;
+        self.upsampler.apply(&cropped)
+    }
+}
+
 pub struct RenderPlan {
     pub resolution: usize,
-    micro: PeriodicUpsampler,
-    macro_field: PeriodicUpsampler,
+    micro: FieldObservation,
+    macro_field: FieldObservation,
     coordinates: Tensor,
+    lod: Tensor,
+    pub view: SpatialView,
 }
 
 pub struct RenderOutput {
     pub image: Tensor,
+    pub grounded_image: Tensor,
+    pub emergent_visual: Tensor,
+    pub grounded_lab: Tensor,
+    pub emergent_lab: Tensor,
+    pub emergence_strength: f32,
     /// Mean excursion of pre-clipped linear RGB outside [0, 1]. This stays in
     /// the loss graph so saturated output heads retain a corrective gradient.
     pub gamut_excess: Tensor,
+    pub state_only_image: Option<Tensor>,
+    pub learned_only_image: Option<Tensor>,
 }
 
 impl RenderPlan {
     pub fn new(config: &RunConfig, resolution: usize, device: &Device) -> Result<Self> {
+        Self::new_view(config, resolution, SpatialView::full(), device)
+    }
+
+    pub fn new_view(
+        config: &RunConfig,
+        resolution: usize,
+        view: SpatialView,
+        device: &Device,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            view.x >= 0.0
+                && view.y >= 0.0
+                && view.size > 0.0
+                && view.x + view.size <= 1.0 + 1e-6
+                && view.y + view.size <= 1.0 + 1e-6,
+            "render view must lie inside normalized phenotype coordinates"
+        );
+        let coordinate_tensor = if view.is_full() {
+            coordinate_features(resolution, config.coord_bands, device)?
+        } else {
+            coordinate_features_window(
+                resolution,
+                config.coord_bands,
+                view.x,
+                view.y,
+                view.size,
+                device,
+            )?
+        };
+        let lod_value = view.zoom.max(1.0).log2() / 5.0;
         Ok(Self {
             resolution,
-            micro: PeriodicUpsampler::new(
-                config.micro_size,
-                config.micro_size,
-                resolution,
-                resolution,
-                device,
-            )?,
-            macro_field: PeriodicUpsampler::new(
-                config.macro_size,
-                config.macro_size,
-                resolution,
-                resolution,
-                device,
-            )?,
-            coordinates: coordinate_features(resolution, config.coord_bands, device)?
-                .affine(config.coord_gain as f64, 0.0)?,
+            micro: FieldObservation::new(config.micro_size, resolution, view, device)?,
+            macro_field: FieldObservation::new(config.macro_size, resolution, view, device)?,
+            coordinates: coordinate_tensor.affine(config.coord_gain as f64, 0.0)?,
+            lod: Tensor::new(lod_value, device)?
+                .reshape((1, 1, 1, 1))?
+                .broadcast_as((1, 1, resolution, resolution))?,
+            view,
         })
     }
-}
 
+    pub fn observe_fields(&self, micro: &Tensor, macro_field: &Tensor) -> Result<(Tensor, Tensor)> {
+        Ok((
+            self.micro.apply(micro)?,
+            self.macro_field.apply(macro_field)?,
+        ))
+    }
+
+    pub fn lod_value(&self) -> f32 {
+        self.view.zoom.max(1.0).log2() / 5.0
+    }
+}
 impl ImplicitRenderer {
     pub fn new(config: &RunConfig, vb: VarBuilder<'_>) -> Result<Self> {
-        let input_features = config.channels * 2 + config.genome_dim + config.coord_bands * 4;
+        let input_features = config.channels * 2 + config.genome_dim + config.coord_bands * 4 + 1;
         let input = candle_nn::linear(input_features, config.render_hidden, vb.pp("input"))?;
         let mut blocks = Vec::with_capacity(config.render_blocks);
         for index in 0..config.render_blocks {
@@ -70,11 +187,16 @@ impl ImplicitRenderer {
         Ok(Self {
             input,
             blocks,
-            output: candle_nn::linear(config.render_hidden, 3, vb.pp("oklab"))?,
+            grounded_head: candle_nn::linear(config.render_hidden, 3, vb.pp("grounded"))?,
+            emergent_head: zero_linear(config.render_hidden, 3, vb.pp("emergent"))?,
             state_skip: config.state_skip,
             chroma: config.chroma,
             gamma: config.gamma as f64,
             style: config.style,
+            default_emergence_strength: config.reconstruction.emergence_strength,
+            emergent_limit: config.reconstruction.emergent_limit,
+            emergence_low_budget: config.reconstruction.emergence_low_budget,
+            emergence_mid_budget: config.reconstruction.emergence_mid_budget,
         })
     }
 
@@ -86,16 +208,88 @@ impl ImplicitRenderer {
         plan: &RenderPlan,
         tracked: bool,
     ) -> Result<RenderOutput> {
+        self.render_with_emergence(
+            micro,
+            macro_field,
+            genome,
+            plan,
+            self.default_emergence_strength,
+            tracked,
+        )
+    }
+
+    pub fn render_with_emergence(
+        &self,
+        micro: &Tensor,
+        macro_field: &Tensor,
+        genome: &Tensor,
+        plan: &RenderPlan,
+        emergence_strength: f32,
+        tracked: bool,
+    ) -> Result<RenderOutput> {
+        self.render_internal(
+            micro,
+            macro_field,
+            genome,
+            plan,
+            emergence_strength,
+            tracked,
+            false,
+        )
+    }
+
+    pub fn render_attribution(
+        &self,
+        micro: &Tensor,
+        macro_field: &Tensor,
+        genome: &Tensor,
+        plan: &RenderPlan,
+        emergence_strength: f32,
+    ) -> Result<RenderOutput> {
+        self.render_internal(
+            micro,
+            macro_field,
+            genome,
+            plan,
+            emergence_strength,
+            false,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_internal(
+        &self,
+        micro: &Tensor,
+        macro_field: &Tensor,
+        genome: &Tensor,
+        plan: &RenderPlan,
+        emergence_strength: f32,
+        tracked: bool,
+        include_attribution: bool,
+    ) -> Result<RenderOutput> {
         let micro_up = plan.micro.apply(micro)?;
         let macro_up = plan.macro_field.apply(macro_field)?;
         let genome_field = broadcast_vector(genome, plan.resolution, plan.resolution)?;
-        let features = Tensor::cat(&[&micro_up, &macro_up, &plan.coordinates, &genome_field], 1)?;
+        let features = Tensor::cat(
+            &[
+                &micro_up,
+                &macro_up,
+                &plan.coordinates,
+                &genome_field,
+                &plan.lod,
+            ],
+            1,
+        )?;
         let mut hidden = swish(&pixelwise_linear_mode(&features, &self.input, tracked)?)?;
         for block in &self.blocks {
             let residual = swish(&pixelwise_linear_mode(&hidden, block, tracked)?)?;
             hidden = hidden.add(&residual.affine(0.5, 0.0)?)?;
         }
-        let learned_lab = pixelwise_linear_mode(&hidden, &self.output, tracked)?;
+        let grounded_learned = pixelwise_linear_mode(&hidden, &self.grounded_head, tracked)?;
+        let emergent_raw = pixelwise_linear_mode(&hidden, &self.emergent_head, tracked)?
+            .tanh()?
+            .affine(self.emergent_limit as f64, 0.0)?;
         // A bounded, parameter-free path makes the actual organism observable
         // and prevents a coordinate-only decoder from satisfying statistics
         // while ignoring morphogenesis.
@@ -193,30 +387,100 @@ impl ImplicitRenderer {
         let state_lab = Tensor::cat(&[&lightness_basis, &a_basis, &b_basis], 1)?
             .tanh()?
             .affine(self.state_skip as f64, 0.0)?;
-        let lab_raw = learned_lab.add(&state_lab)?;
-        let l = candle_nn::ops::sigmoid(&lab_raw.narrow(1, 0, 1)?)?.affine(0.84, 0.08)?;
-        let a = lab_raw
-            .narrow(1, 1, 1)?
-            .tanh()?
-            .affine(self.chroma as f64, 0.0)?;
-        let b = lab_raw
-            .narrow(1, 2, 1)?
-            .tanh()?
-            .affine(self.chroma as f64, 0.0)?;
-        let rgb_linear = oklab_to_linear_rgb(&l, &a, &b)?;
-        let clipped = rgb_linear.clamp(0.0f32, 1.0f32)?;
-        let gamut_excess = rgb_linear.sub(&clipped)?.abs()?.mean_all()?;
-        let image = clipped
-            .affine(1.0, 1e-6)?
-            .powf(1.0 / self.gamma)?
+        let grounded_lab = grounded_learned.add(&state_lab)?;
+        let emergent_shaped = scale_dependent_residual(
+            &emergent_raw,
+            self.emergence_low_budget,
+            self.emergence_mid_budget,
+        )?;
+        let emergent_lab = smooth_limit(&emergent_shaped, self.emergent_limit)?;
+        let composite_lab =
+            grounded_lab.add(&emergent_lab.affine(emergence_strength as f64, 0.0)?)?;
+        let (grounded_image, _) = lab_to_image(&grounded_lab, self.chroma, self.gamma)?;
+        let (image, gamut_excess) = lab_to_image(&composite_lab, self.chroma, self.gamma)?;
+        let emergent_visual = emergent_lab
+            .affine(0.5 / self.emergent_limit.max(1e-6) as f64, 0.5)?
             .clamp(0.0f32, 1.0f32)?;
+        let (state_only_image, learned_only_image) = if include_attribution {
+            let learned_lab =
+                grounded_learned.add(&emergent_lab.affine(emergence_strength as f64, 0.0)?)?;
+            (
+                Some(lab_to_image(&state_lab, self.chroma, self.gamma)?.0),
+                Some(lab_to_image(&learned_lab, self.chroma, self.gamma)?.0),
+            )
+        } else {
+            (None, None)
+        };
         Ok(RenderOutput {
             image,
+            grounded_image,
+            emergent_visual,
+            grounded_lab,
+            emergent_lab,
+            emergence_strength,
             gamut_excess,
+            state_only_image,
+            learned_only_image,
         })
     }
 }
 
+fn scale_dependent_residual(
+    residual: &Tensor,
+    low_budget: f32,
+    mid_budget: f32,
+) -> candle_core::Result<Tensor> {
+    let mid_lowpass = periodic_tensor_blur(residual)?;
+    let mut low = mid_lowpass.clone();
+    for _ in 0..3 {
+        low = periodic_tensor_blur(&low)?;
+    }
+    let mid = mid_lowpass.sub(&low)?;
+    let high = residual.sub(&mid_lowpass)?;
+    low.affine(low_budget as f64, 0.0)?
+        .add(&mid.affine(mid_budget as f64, 0.0)?)?
+        .add(&high)
+}
+
+fn periodic_tensor_blur(value: &Tensor) -> candle_core::Result<Tensor> {
+    let (_, _, height, width) = value.dims4()?;
+    value
+        .affine(0.5, 0.0)?
+        .add(&periodic_shift(value, 0, 1)?.affine(0.125, 0.0)?)?
+        .add(&periodic_shift(value, 0, width - 1)?.affine(0.125, 0.0)?)?
+        .add(&periodic_shift(value, 1, 0)?.affine(0.125, 0.0)?)?
+        .add(&periodic_shift(value, height - 1, 0)?.affine(0.125, 0.0)?)
+}
+
+fn lab_to_image(
+    lab_raw: &Tensor,
+    chroma: f32,
+    gamma: f64,
+) -> candle_core::Result<(Tensor, Tensor)> {
+    let l = candle_nn::ops::sigmoid(&lab_raw.narrow(1, 0, 1)?)?.affine(0.84, 0.08)?;
+    let a = lab_raw
+        .narrow(1, 1, 1)?
+        .tanh()?
+        .affine(chroma as f64, 0.0)?;
+    let b = lab_raw
+        .narrow(1, 2, 1)?
+        .tanh()?
+        .affine(chroma as f64, 0.0)?;
+    let rgb_linear = oklab_to_linear_rgb(&l, &a, &b)?;
+    let clipped = rgb_linear.clamp(0.0f32, 1.0f32)?;
+    let gamut_excess = rgb_linear.sub(&clipped)?.abs()?.mean_all()?;
+    let image = clipped
+        .affine(1.0, 1e-6)?
+        .powf(1.0 / gamma)?
+        .clamp(0.0f32, 1.0f32)?;
+    Ok((image, gamut_excess))
+}
+
+fn zero_linear(input: usize, output: usize, vb: VarBuilder<'_>) -> Result<Linear> {
+    let weight = vb.get_with_hints((output, input), "weight", Init::Const(0.0))?;
+    let bias = vb.get_with_hints(output, "bias", Init::Const(0.0))?;
+    Ok(Linear::new(weight, Some(bias)))
+}
 fn swish(x: &Tensor) -> candle_core::Result<Tensor> {
     x.mul(&candle_nn::ops::sigmoid(x)?)
 }
@@ -437,6 +701,40 @@ pub fn save_contact_sheet(images: &[PathBuf], path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn save_contact_sheet_resized(images: &[PathBuf], path: &Path, tile_size: u32) -> Result<()> {
+    if images.is_empty() {
+        return Ok(());
+    }
+    let decoded: Vec<image::RgbImage> = images
+        .iter()
+        .map(|image_path| {
+            image::open(image_path)
+                .with_context(|| format!("cannot reopen diagnostic image {}", image_path.display()))
+                .map(|image| {
+                    image
+                        .resize_to_fill(tile_size, tile_size, image::imageops::FilterType::Lanczos3)
+                        .to_rgb8()
+                })
+        })
+        .collect::<Result<_>>()?;
+    let columns = (images.len() as f64).sqrt().ceil() as u32;
+    let rows = (images.len() as u32).div_ceil(columns);
+    let mut sheet = image::RgbImage::new(tile_size * columns, tile_size * rows);
+    for (index, image) in decoded.iter().enumerate() {
+        let x = index as u32 % columns;
+        let y = index as u32 / columns;
+        image::imageops::overlay(
+            &mut sheet,
+            image,
+            i64::from(x * tile_size),
+            i64::from(y * tile_size),
+        );
+    }
+    let temporary = png_temporary_path(path);
+    sheet.save_with_format(&temporary, image::ImageFormat::Png)?;
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
 pub fn seam_energy(image: &Tensor) -> candle_core::Result<Tensor> {
     let (_, _, h, w) = image.dims4()?;
     let horizontal = image
@@ -472,6 +770,77 @@ mod tests {
     fn constant_image_has_zero_seam_energy() -> candle_core::Result<()> {
         let image = Tensor::ones((1, 3, 16, 16), DType::F32, &Device::Cpu)?;
         assert!(seam_energy(&image)?.to_scalar::<f32>()? < 1e-8);
+        Ok(())
+    }
+
+    #[test]
+    fn zero_emergence_has_exactly_zero_composite_influence() -> Result<()> {
+        let config = RunConfig {
+            micro_size: 24,
+            macro_size: 12,
+            channels: 12,
+            genome_dim: 4,
+            render_hidden: 32,
+            render_blocks: 1,
+            coord_bands: 2,
+            train_resolution: 24,
+            output_resolution: 24,
+            ..RunConfig::default()
+        };
+        let variables = candle_nn::VarMap::new();
+        let renderer = ImplicitRenderer::new(
+            &config,
+            candle_nn::VarBuilder::from_varmap(&variables, DType::F32, &Device::Cpu).pp("renderer"),
+        )?;
+        let plan = RenderPlan::new(&config, 24, &Device::Cpu)?;
+        let micro = Tensor::zeros((1, 12, 24, 24), DType::F32, &Device::Cpu)?;
+        let macro_field = Tensor::zeros((1, 12, 12, 12), DType::F32, &Device::Cpu)?;
+        let genome = Tensor::zeros(4, DType::F32, &Device::Cpu)?;
+        let rendered =
+            renderer.render_with_emergence(&micro, &macro_field, &genome, &plan, 0.0, true)?;
+        assert_eq!(
+            rendered
+                .image
+                .sub(&rendered.grounded_image)?
+                .abs()?
+                .max_all()?
+                .to_scalar::<f32>()?,
+            0.0
+        );
+        assert_eq!(
+            rendered.emergent_lab.abs()?.max_all()?.to_scalar::<f32>()?,
+            0.0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn crop_plan_uses_global_coordinates_and_requested_shape() -> Result<()> {
+        let config = RunConfig {
+            micro_size: 24,
+            macro_size: 12,
+            channels: 12,
+            genome_dim: 4,
+            render_hidden: 32,
+            render_blocks: 1,
+            coord_bands: 2,
+            train_resolution: 24,
+            output_resolution: 24,
+            ..RunConfig::default()
+        };
+        let view = SpatialView {
+            x: 0.5,
+            y: 0.25,
+            size: 0.25,
+            zoom: 4.0,
+        };
+        let plan = RenderPlan::new_view(&config, 32, view, &Device::Cpu)?;
+        let micro = Tensor::zeros((1, 12, 24, 24), DType::F32, &Device::Cpu)?;
+        let macro_field = Tensor::zeros((1, 12, 12, 12), DType::F32, &Device::Cpu)?;
+        let (micro, macro_field) = plan.observe_fields(&micro, &macro_field)?;
+        assert_eq!(micro.dims4()?, (1, 12, 32, 32));
+        assert_eq!(macro_field.dims4()?, (1, 12, 32, 32));
+        assert_eq!(plan.view, view);
         Ok(())
     }
 }

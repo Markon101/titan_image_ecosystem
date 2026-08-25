@@ -1,96 +1,173 @@
-# TITAN Image v8 metrics and experiment protocol
+# TITAN Image v9 metrics and experiment protocol
 
-v8 writes one CSV row per optimizer window. No scalar proves image quality,
-learning, novelty, generalization, or an attractor; inspect raw outputs, state
-atlases, trajectories, and matched controls.
+No scalar proves reconstruction, useful emergence, homeostasis, or an
+attractor. v9 keeps grounding, emergence, coherence, separability, stability,
+and cost visible as distinct measurements.
 
-## New v8 evidence
+## Per-window CSV
 
-- `reference_fidelity`: actual reference strength used for that window. It is
-  zero after hybrid conditioning dropout.
-- `interface_memory_rms`: RMS of persisted bounded GRU/MorphicStack memory.
-- `loss_state` and `loss_memory`: unweighted soft-barrier energies. Multiply
-  them by the configured weights when comparing their contribution to total
-  loss.
-- `core_gradient_rms` and `decoder_gradient_rms`: separately normalized
-  gradient energy. Decoder-only rows correctly report zero core parameters and
-  zero core gradient RMS.
-- `core_updated_parameters` and `decoder_updated_parameters`: make a dead
-  core distinguishable from a renderer-only update.
-- `stability_violation`: the current row exceeded the configured near-bound
-  occupancy threshold.
-- `development_steps_per_second`: development steps divided by full optimizer
-  window wall time, including forward, render/loss, backward, optimizer, and
-  diagnostics.
-- `muon_variables`: matrices updated through Muon. It is zero under AdamW and
-  on decoder-only windows.
+`titan_image_metrics_v9_<tag>.csv` has one row per optimizer window.
 
-`image_variance` is now the mean of the three within-channel spatial
-variances. A spatially uniform cyan frame therefore reports zero rather than a
-false high value caused only by differences between RGB channel means.
-`micro_clamp_fraction` and `macro_clamp_fraction` retain their CSV names for
-continuity but now mean occupancy above 99% of the smooth state bound; there is
-no hard state clamp in v8.
+Identity and schedule:
 
-## Conditioning interpretation
+- `step`, `episode`, `age`, `target_index`, `optimizer_update`;
+- `objective`, `core_trained`, `macro_updates`, `episode_started`;
+- `supervision` (`global` or `crop`), `detail_zoom`, `pyramid_level`;
+- `grounding_schedule`, `emergence_schedule`, `reference_fidelity`;
+- `active_morph_depth`, `physical_morph_layers`, `morph_generation`.
 
-Compare like with like. Reconstruction windows have easier input than
-null-reference generation windows. Report losses grouped by fidelity:
+Grounding:
 
-- null: f = 0;
-- loose: 0 < f < 0.4;
-- balanced: 0.4 <= f < 0.75;
-- faithful: f >= 0.75.
+- `loss_content`: composite raw endpoint error;
+- `loss_grounding`: weighted grounded-only multiscale objective;
+- `loss_ground_coarse`, `loss_ground_mid`, `loss_ground_fine`;
+- `loss_ssim`, `loss_palette`, `loss_structure`;
+- `cross_resolution_l1`, `cross_resolution_low`,
+  `cross_resolution_edge` on scheduled global consistency windows;
+- `loss_endpoint` and `loss_total` remain separate so flow or regularizers
+  cannot hide worsening endpoint behavior.
 
-A declining reconstruction loss does not prove autonomous generation improved.
-Hybrid training succeeds only when null-reference quality, conditioned
-reconstruction, and seed diversity remain viable.
+Emergent-head role and contribution:
 
-## Recurrent-interface interpretation
+- `grounded_output_rms`, mean absolute value, and spatial variance;
+- `emergent_output_rms`, mean absolute value, and variance;
+- `emergent_contribution_rms`: actual composite-minus-grounded image effect;
+- `loss_emergent_fit`, `loss_emergent_low`, `loss_emergent_tv`;
+- `head_redundancy`: absolute grounded/emergent correlation;
+- grounded and emergent gradient RMS, actual update RMS, and update/weight
+  ratios.
 
-The interface write heads start at zero, so early runs initially preserve the
-parent local architecture. Useful-interface evidence includes reached
-variables, bounded memory RMS, lower clamp reliance, fixed-probe improvement,
-and global changes that palette matching alone cannot reproduce.
+These are role-collapse diagnostics, not an instruction to maximize residual
+energy. A useful residual should increase coherent detail while grounding and
+cross-resolution anatomy remain healthy.
 
-Higher memory RMS, more loops, or more morph blocks is not evidence of better
-global reasoning.
+State and coherence:
 
-## Stability interpretation
+- micro/macro mean and maximum movement;
+- state RMS, mean absolute value, near-bound fraction, and channel RMS range;
+- interface memory RMS;
+- image delta mean/RMS with an explicit validity bit;
+- image variance and edge energy;
+- seam energy and gamut excess;
+- state/memory barrier losses and the stability-watchdog flag;
+- local micro/macro reference-drive RMS.
 
-A healthy run keeps memory below `memory_limit`, near-bound occupancy low,
-core gradient RMS nonzero on full-core windows, and image spatial variance and
-edge energy above numerical zero. A renderer can still lower image loss while
-the organism is frozen, so output loss alone is not sufficient.
+Optimizer and cost:
 
-After `stability_patience` consecutive violating windows, training stops at a
-window boundary, flushes metrics, saves model/world/optimizer/manifest, writes
-final diagnostics, and skips additional gallery development. The checkpoint is
-structurally resumable, but continuing unchanged is normally inappropriate;
-inspect it with `--render-only` or start a corrected fresh tag.
+- global/core/decoder/grounded/emergent/flow gradient RMS;
+- global gradient norm and clip scale;
+- effective learning rate, updated tensors/parameters, Muon tensor count;
+- window seconds and development steps/second.
 
-## Muon protocol
+Flow windows add:
 
-A Muon claim requires matched AdamW and hybrid-Muon runs with identical corpus,
-seed, architecture, conditioning schedule, augmentation, update count, and
-thermal policy. Compare quality per wall-clock hour, optimizer and total time,
-clipping/nonfinite updates, fidelity strata, and at least three seeds.
+- exact conditional flow loss and sampled time;
+- interpolant, predicted velocity, and target velocity RMS;
+- velocity cosine alignment;
+- one-step endpoint L1;
+- recurrent condition RMS.
 
-## Minimum architecture ablations
+## Per-target report
 
-1. Interface disabled with --interface-gain 0.
-2. One versus the profile loop count.
-3. --morph-depth 1 versus the profile default.
-4. generate, hybrid, and reconstruct conditioning.
-5. AdamW versus hybrid Muon.
-6. Physical-operator ablations under identical interface settings.
+`titan_image_target_statistics_v9_<tag>.json` accumulates per-invocation target
+means for total, grounding, content, structure, palette, flow, gradient demand,
+clip rate, movement, and memory. Global and detail grounding are split. Mature
+episode windows receive separate loss and movement summaries, and grounding
+adaptation per window is reported.
 
-Changing a style preset changes multiple controls and is not a single-variable
-ablation.
+Fixed-seed/age family separability analysis adds pairwise:
 
-## Evidence still missing
+- output L1;
+- low-frequency image distance;
+- edge distance;
+- micro-state, macro-state, memory, and emergent-residual distances;
+- mean/minimum output distance and nearest/confusable target pair.
 
-v8 still needs a family-disjoint manifest, fixed development/validation probes,
-nearest-training-image distance, seed-diversity distance, and fidelity-stratum
-summaries. Until those exist, reconstruction and gallery results are
-developmental rather than held-out generalization evidence.
+An attractive shared phenotype with weak target separation should therefore be
+immediately visible.
+
+## Model statistics
+
+`titan_image_model_stats_v9_<tag>.json` inventories every parameter tensor:
+
+- subsystem and MorphicBlock identity;
+- allocated/active parameter count and inactive reserve;
+- birth generation;
+- weight RMS, maximum absolute value, and exact-zero fraction;
+- row-energy participation ratio for matrices;
+- first- and second-optimizer-moment RMS.
+
+Normal windows supply head/subsystem gradient and update telemetry. Full
+per-layer activation hooks and expensive singular-value decompositions are not
+run continuously on the phone.
+
+## Variable-shape JSONL events
+
+`titan_image_events_v9_<tag>.jsonl` is the append-only developmental record.
+Graft events include transaction IDs, old/new anatomy, birth generations,
+copied/new tensors and parameters, preserved/new moments, explicit empty
+resized/skipped lists, pre-graft losses/state/output fingerprint, and immediate
+preservation error. Morph activation events record depth, plateau behavior,
+seam, and function-preservation L1.
+
+## Emergence frontier
+
+`titan_image_emergence_frontier_v9_<tag>.json` evaluates one frozen state at
+five residual strengths. Each point records content and multiscale grounding,
+structure, residual magnitude/low-band/TV/redundancy, seam, gamut, variance,
+and edge energy. The corresponding montage uses the same state and seed.
+
+Interpret this as a tradeoff curve. Do not select the point with maximum
+residual energy. Prefer the largest coherent elaboration whose coarse identity,
+target separation, gamut, and stability remain acceptable.
+
+## Autonomous and perturbation analysis
+
+Autonomous rollout records offset, micro/macro movement and RMS, memory RMS,
+image delta, nearest prior-state signature distance, output fingerprint, and a
+conservative approximate-cycle flag. Continued wandering alone is not labeled
+a strange attractor.
+
+Perturbation analysis evolves one untouched mature control beside deterministic
+micro, macro, and memory noise plus localized micro/macro erased patches. It
+reports initial/final state distance, output L1 from control, recovery ratio,
+and optional half-recovery time. The JSON uses
+`perturbation_recovery_observed=true` only when final state distance is below
+half its initial value; phenotype-family recovery can still differ from exact
+raster recovery.
+
+## Attribution versus causality
+
+The decomposition montage renders the exact same frozen world as target,
+grounded, residual, composite, state-only, learned-only, micro-zero, and
+macro-zero variants. These answer where information is currently exposed.
+
+Dynamics ablations clone and continue the world with interface, micro, macro,
+NCA, reaction, phase, cyclic, or external forcing disabled/frozen. These answer
+which mechanisms affect continued development. Render-time zeroing is not
+described as causal proof.
+
+## Deterministic benchmark
+
+`--benchmark` uses seven asymmetric synthetic targets: circle, offset square,
+diagonal, checker/grid, nested shapes, asymmetric blobs, and branching form.
+It records raw L1, coarse spatial L1, edge L1, development-age convergence, and
+candidate separability. The asymmetry specifically prevents palette/statistics
+matching from masquerading as target-specific reconstruction.
+
+## Recommended experiment sequence
+
+1. Run `strict-reconstruct` to establish literal global and target-specific
+   fidelity.
+2. Compare `reconstruction-plus` with identical corpus, seed, steps, and wall
+   conditions.
+3. Evaluate the emergence frontier and decomposition montage.
+4. Run target separability and resolution ladder analysis.
+5. Only then test `grounded-emergent`, adaptive depth, perturbation recovery,
+   and autonomous rollout.
+6. Test `flow-reconstruct` as a separate matched experiment; do not compare a
+   flow sample to the canonical phenotype without labeling it.
+
+Use world-step or wall-clock matched runs and compare peak RSS and measured
+development steps/second. Termux background load is part of the observation,
+not a constant device property.

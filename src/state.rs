@@ -14,6 +14,9 @@ pub struct WorldState {
     /// Development age of the current seeded organism.
     pub age: u64,
     pub episode: u64,
+    pub morph_active_depth: usize,
+    pub morph_generation: u64,
+    pub morph_birth_generations: Vec<u64>,
     pub target_index: usize,
 }
 
@@ -32,6 +35,9 @@ impl WorldState {
             age: 0,
             episode: 0,
             target_index: 0,
+            morph_active_depth: config.initial_morph_depth(),
+            morph_generation: 0,
+            morph_birth_generations: vec![0; config.morph_layers],
         })
     }
 
@@ -53,6 +59,9 @@ impl WorldState {
                 step: self.step,
                 age: self.age,
                 episode,
+                morph_active_depth: self.morph_active_depth,
+                morph_generation: self.morph_generation,
+                morph_birth_generations: self.morph_birth_generations.clone(),
                 target_index,
             });
         }
@@ -76,6 +85,9 @@ impl WorldState {
                 .affine(1.0 - config.memory_reset as f64, 0.0)?,
             step: self.step,
             age: 0,
+            morph_active_depth: self.morph_active_depth,
+            morph_generation: self.morph_generation,
+            morph_birth_generations: self.morph_birth_generations.clone(),
             episode,
             target_index,
         })
@@ -89,6 +101,9 @@ impl WorldState {
             step: self.step,
             age: self.age,
             episode: self.episode,
+            morph_active_depth: self.morph_active_depth,
+            morph_generation: self.morph_generation,
+            morph_birth_generations: self.morph_birth_generations.clone(),
             target_index: self.target_index,
         }
     }
