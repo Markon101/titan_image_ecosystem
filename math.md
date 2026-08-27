@@ -98,7 +98,9 @@ L_ground = w_fine L_fine + w_mid L_mid + w_coarse L_coarse
 ~~~
 
 The normal endpoint objective still exposes composite content, palette,
-gradient-distribution structure, boundary-aware seam, and gamut terms.
+target-aligned signed-gradient L1 structure, boundary-aware seam, and gamut
+terms. Texture mode deliberately retains translation-invariant gradient
+statistics instead.
 
 The residual diagnostics/regularizers are:
 

@@ -1,6 +1,6 @@
 # TITAN Image Ecosystem v9
 
-TITAN Image 0.9.0 is a phone-first compact morphogenic learner centered on
+TITAN Image 0.9.1 is a phone-first compact morphogenic learner centered on
 Reconstruction++: reconstruct the source's grounded organization, then permit
 a recurrent developmental organism to add bounded, coherent elaboration
 without surrendering source identity.
@@ -56,7 +56,7 @@ grounded image and emergent residual visualization are saved separately. At
 image even if the residual head itself is nonzero.
 
 The grounded path is trained with fine, medium, and coarse reconstruction,
-SSIM-like structure, palette, gradient structure, gamut, state, and memory
+SSIM-like structure, palette, target-aligned spatial edges, gamut, state, and memory
 terms. Coarse and medium scales receive the strongest default grounding. The
 emergent head is zero-initialized, magnitude-bounded, monitored separately,
 regularized against redundant head behavior, and shaped by low/mid/high
@@ -302,6 +302,48 @@ Checkpoint analysis and render attribution:
   --run-tag reconstruction-plus-v9-01
 ~~~
 
+Held-out natural-image transfer and reference-free probe:
+
+~~~sh
+./target/release/titan_image \
+  --corpus-dir /sdcard/Download/titan_image_sources \
+  --probe-dir /sdcard/Download/titan_image_unseen_probes \
+  --output-dir /sdcard/Download/titan_image_v9 \
+  --run-tag v9-grounded-emergent-c81-01 \
+  --profile s25-balanced \
+  --style alien-fluid \
+  --research-preset grounded-emergent \
+  --seed 42 \
+  --threads 7 \
+  --analysis-only \
+  --probe-ages 1,8,16,32,64 \
+  --probe-reference-fidelities 1.0,0.5,0.25,0.1,0.0
+~~~
+
+`--corpus-dir` must still name the exact training corpus so the saved checkpoint
+can pass its normal corpus fingerprint validation. `--probe-dir` is loaded only
+after that checkpoint succeeds; it never joins the training schedule, never
+changes the checkpoint signature or training-corpus fingerprint, and is
+rejected if any source bytes match the training corpus. Probe mode requires
+`--analysis-only` and a complete checkpoint. It takes no optimizer steps and
+preserves model, optimizer, world, manifest, training CSV, and training metadata
+bytes.
+
+Every image/fidelity trajectory starts from the same fresh deterministic world,
+retaining only the checkpoint anatomy, and uses a fixed zero genome. Positive
+fidelities therefore isolate transfer through the trained reference pathway. At
+fidelity `0`, no reference tensors or local reference drive are supplied; all
+targets have the same output at a given age by construction. That row measures
+the organism's reference-free developmental prior, not reconstruction of an
+unseen target it has no information about.
+
+The sweep writes one PNG per target/fidelity/age, a contact sheet,
+`titan_image_probe_report_v9_<tag>.json`, and the same structured report inside
+`titan_image_analysis_v9_<tag>.json`. Raw/coarse/edge/palette reconstruction,
+image/state/memory stability, and reference-drive metrics are recorded for each
+point. Probe ages must be sorted unique values in `1..=4096`; fidelities must be
+unique values in `0..=1`. Defaults are the two lists shown above.
+
 Autonomous mature rollout:
 
 ~~~sh
@@ -342,6 +384,10 @@ does not claim metaphysical strong emergence.
 a real TTY. Compact and rich lines include development steps/second; rich mode
 adds the grounding/emergence/movement/stability tape. Crop windows are marked
 `CROP Nx`, global windows `GLOBAL`.
+
+Temporal image deltas are valid only when consecutive renders use the same
+target, resolution, and observation. Global/crop or crop/crop view changes are
+logged with `image_delta_valid=false` instead of comparing unrelated rasters.
 
 v9 leaves a developmental medical record:
 

@@ -13,6 +13,7 @@ pub mod metrics;
 pub mod objectives;
 pub mod optimizer;
 pub mod persistence;
+pub mod probe;
 pub mod render;
 pub mod state;
 pub mod telemetry;

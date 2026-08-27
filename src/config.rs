@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 pub const SCHEMA_VERSION: u32 = 9;
 pub const MIN_PHYSICAL_CHANNELS: usize = 12;
-const CLI_HELP_V9: &str = r#"TITAN Image 0.9.0 (schema 9) - compact recurrent morphogenic learner
+const CLI_HELP_V9: &str = r#"TITAN Image 0.9.1 (schema 9) - compact recurrent morphogenic learner
 Usage: titan_image --corpus-dir PATH [options]
 
 Lifecycle and presets:
@@ -72,6 +72,10 @@ Experimental conditional rectified flow:
   --flow-sample-steps N         Analysis midpoint ODE steps
 
 Analysis:
+  --probe-dir PATH              Held-out natural images; requires --analysis-only
+  --probe-ages LIST             Comma-separated developmental ages (default 1,8,16,32,64)
+  --probe-reference-fidelities LIST
+                                Comma-separated reference strengths (default 1,0.5,0.25,0.1,0)
   --render-attribution          Frozen-state decomposition and emergence sweep
   --model-stats                 Request checkpoint model statistics
   --autonomous-rollout N        Mature frozen-weight continuation horizon
@@ -429,6 +433,9 @@ pub struct AnalysisConfig {
     pub emergence_gallery: bool,
     pub benchmark: bool,
     pub compare_v8_dir: Option<PathBuf>,
+    pub probe_dir: Option<PathBuf>,
+    pub probe_ages: Vec<usize>,
+    pub probe_reference_fidelities: Vec<f32>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunConfig {
@@ -611,6 +618,9 @@ impl Default for RunConfig {
                 emergence_gallery: true,
                 benchmark: false,
                 compare_v8_dir: None,
+                probe_dir: None,
+                probe_ages: vec![1, 8, 16, 32, 64],
+                probe_reference_fidelities: vec![1.0, 0.5, 0.25, 0.1, 0.0],
             },
             steps: 1600,
             threads,
@@ -687,7 +697,7 @@ impl Default for RunConfig {
             phase_dispersion: 0.035,
             loss_content: 1.0,
             loss_palette: 1.1,
-            loss_structure: 0.9,
+            loss_structure: 0.75,
             loss_seam: 0.08,
             loss_gamut: 0.18,
             mastering_strength: 0.75,
@@ -837,6 +847,11 @@ impl RunConfig {
                 "--render-attribution" => cfg.analysis.render_attribution = true,
                 "--model-stats" => cfg.analysis.model_stats = true,
                 "--benchmark" => cfg.analysis.benchmark = true,
+                "--probe-dir" => cfg.analysis.probe_dir = Some(PathBuf::from(value()?)),
+                "--probe-ages" => cfg.analysis.probe_ages = parse_csv(&value()?, flag)?,
+                "--probe-reference-fidelities" => {
+                    cfg.analysis.probe_reference_fidelities = parse_csv(&value()?, flag)?
+                }
                 "--compare-v8-dir" => cfg.analysis.compare_v8_dir = Some(PathBuf::from(value()?)),
                 "--autonomous-rollout" => cfg.analysis.autonomous_horizon = parse(&value()?, flag)?,
                 "--perturbation-analysis" => {
@@ -1196,6 +1211,7 @@ impl RunConfig {
             || self.analysis.autonomous_horizon > 0
             || self.analysis.perturbation_horizon > 0
             || self.analysis.benchmark
+            || self.analysis.probe_dir.is_some()
             || self.analysis.compare_v8_dir.is_some()
             || self.analysis.dynamics_horizon > 0
     }
@@ -1496,6 +1512,37 @@ impl RunConfig {
         finite_range(self.mastering_strength, 0.0, 2.0, "--mastering-strength")?;
         if self.gallery > 64 || self.gallery_steps > 1024 || self.gallery_stride > 256 {
             bail!("--gallery must be <= 64, --gallery-steps <= 1024, and --gallery-stride <= 256");
+        }
+        if self.analysis.probe_dir.is_some() {
+            if !self.analysis.only {
+                bail!(
+                    "--probe-dir requires --analysis-only so probing cannot take optimizer steps"
+                );
+            }
+            if self.analysis.probe_ages.is_empty()
+                || self.analysis.probe_ages.len() > 64
+                || self
+                    .analysis
+                    .probe_ages
+                    .iter()
+                    .any(|age| *age == 0 || *age > 4096)
+            {
+                bail!("--probe-ages must contain 1..=64 unique ages in 1..=4096");
+            }
+            if self.analysis.probe_reference_fidelities.is_empty()
+                || self.analysis.probe_reference_fidelities.len() > 32
+            {
+                bail!("--probe-reference-fidelities must contain 1..=32 values");
+            }
+            for fidelity in &self.analysis.probe_reference_fidelities {
+                finite_range(*fidelity, 0.0, 1.0, "--probe-reference-fidelities")?;
+            }
+            if !strictly_increasing(&self.analysis.probe_ages) {
+                bail!("--probe-ages must be sorted in strictly increasing order");
+            }
+            if has_duplicate_f32(&self.analysis.probe_reference_fidelities) {
+                bail!("--probe-reference-fidelities must not contain duplicates");
+            }
         }
         if (self.render_only || self.analysis.only) && self.fresh {
             bail!("render-only/analysis-only and --fresh are mutually exclusive");
@@ -1837,6 +1884,30 @@ where
         .map_err(|err| anyhow::anyhow!("invalid value for {flag}: {err}"))
 }
 
+fn parse_csv<T: std::str::FromStr>(value: &str, flag: &str) -> Result<Vec<T>>
+where
+    T::Err: std::fmt::Display,
+{
+    if value.trim().is_empty() {
+        bail!("empty value for {flag}");
+    }
+    value
+        .split(",")
+        .map(|item| parse(item.trim(), flag))
+        .collect()
+}
+
+fn strictly_increasing(values: &[usize]) -> bool {
+    values.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn has_duplicate_f32(values: &[f32]) -> bool {
+    values
+        .iter()
+        .enumerate()
+        .any(|(index, value)| values[..index].iter().any(|prior| prior == value))
+}
+
 fn finite_positive(value: f64, name: &str) -> Result<()> {
     if !value.is_finite() || value <= 0.0 {
         bail!("{name} must be finite and positive");
@@ -2012,6 +2083,30 @@ mod tests {
             ..base.clone()
         };
         assert_ne!(base.checkpoint_signature(), changed.checkpoint_signature());
+    }
+
+    #[test]
+    fn probe_controls_require_frozen_analysis_and_preserve_checkpoint_identity() {
+        let base = RunConfig::default();
+        let mut probe = base.clone();
+        probe.analysis.only = true;
+        probe.analysis.probe_dir = Some(PathBuf::from("held-out-probes"));
+        probe.analysis.probe_ages = vec![1, 8, 16, 64];
+        probe.analysis.probe_reference_fidelities = vec![1.0, 0.25, 0.0];
+        assert!(probe.validate().is_ok());
+        assert_eq!(base.checkpoint_signature(), probe.checkpoint_signature());
+
+        let mut training_probe = probe.clone();
+        training_probe.analysis.only = false;
+        assert!(training_probe.validate().is_err());
+
+        let mut unsorted_ages = probe.clone();
+        unsorted_ages.analysis.probe_ages = vec![1, 16, 8];
+        assert!(unsorted_ages.validate().is_err());
+
+        let mut invalid_fidelity = probe;
+        invalid_fidelity.analysis.probe_reference_fidelities = vec![1.0, -0.1];
+        assert!(invalid_fidelity.validate().is_err());
     }
 
     #[test]

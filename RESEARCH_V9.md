@@ -50,8 +50,9 @@ L_ground = w0 |g-y|_1 + w1 |P_2(g)-P_2(y)|_1
 ~~~
 
 The default weights favor coarse and medium organization. Composite content,
-palette, spatial-gradient structure, gamut, state, and memory terms remain
-visible individually. Natural and crop targets do not receive a periodic seam
+palette, target-aligned spatial-edge structure, gamut, state, and memory terms
+remain visible individually. Gradient-distribution statistics are reserved for
+texture mode, where translation invariance is intentional. Natural and crop targets do not receive a periodic seam
 penalty; periodic texture targets do.
 
 The age schedule uses smoothstep after the configured emergence start:
@@ -166,6 +167,8 @@ The analysis surface separates:
   cross-resolution consistency;
 - separability: fixed-seed/age pairwise output, low-band, edge, micro, macro,
   memory, and residual distances;
+- held-out transfer: fresh-world natural-image trajectories across fixed ages and
+  reference fidelities, including an exact zero-reference baseline;
 - autonomous behavior: frozen mature rollout, recurrence distances, drift,
   fingerprints, and conservative approximate-cycle candidates;
 - perturbation recovery: deterministic micro/macro/memory noise plus localized
@@ -173,6 +176,14 @@ The analysis surface separates:
 - render attribution: one frozen state with renderer paths changed;
 - dynamical necessity: cloned trajectories with interface, scale, NCA, and
   physical mechanisms disabled.
+
+Held-out transfer uses the exact trained checkpoint and its original corpus
+fingerprint, then loads a content-disjoint probe corpus outside persistence. A
+fixed zero genome and the same fresh seed for every target prevent target
+identity from leaking into the zero-reference baseline. Fidelity zero removes
+both interface references and local RGB drives; positive fidelities isolate the
+learned reference pathway. No optimizer window or checkpoint publication is
+reachable from this analysis-only path.
 
 The software reports observations as operational evidence. It does not assert
 strong emergence, homeostasis, strange attractors, or causal macro control

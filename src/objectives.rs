@@ -46,7 +46,10 @@ pub fn visual_loss(
         TrainingMode::Texture => texture_loss(image, &target)?,
     };
     let palette = moment_loss(image, &target)?;
-    let structure = gradient_distribution_loss(image, &target)?;
+    let structure = match config.mode {
+        TrainingMode::Single | TrainingMode::Family => aligned_gradient_loss(image, &target)?,
+        TrainingMode::Texture => gradient_distribution_loss(image, &target)?,
+    };
     let seam = if boundary == BoundaryMode::Periodic {
         seam_energy(image)?
     } else {
@@ -368,6 +371,32 @@ fn gradient_distribution_loss(image: &Tensor, target: &Tensor) -> Result<Tensor>
         .affine(0.5, 0.0)
 }
 
+/// Target-registered edge reconstruction for literal single/family training.
+/// The old log-gradient statistic remains useful for translation-invariant
+/// texture mode, but in reconstruction it could dominate the endpoint while
+/// rewarding shared edge energy instead of target-specific geometry.
+fn aligned_gradient_loss(image: &Tensor, target: &Tensor) -> Result<Tensor> {
+    let (_, _, height, width) = image.dims4()?;
+    let image_dx = image
+        .narrow(3, 1, width - 1)?
+        .sub(&image.narrow(3, 0, width - 1)?)?;
+    let target_dx = target
+        .narrow(3, 1, width - 1)?
+        .sub(&target.narrow(3, 0, width - 1)?)?;
+    let image_dy = image
+        .narrow(2, 1, height - 1)?
+        .sub(&image.narrow(2, 0, height - 1)?)?;
+    let target_dy = target
+        .narrow(2, 1, height - 1)?
+        .sub(&target.narrow(2, 0, height - 1)?)?;
+    image_dx
+        .sub(&target_dx)?
+        .abs()?
+        .mean_all()?
+        .add(&image_dy.sub(&target_dy)?.abs()?.mean_all()?)?
+        .affine(0.5, 0.0)
+}
+
 fn gradient_stat_distance(image: &Tensor, target: &Tensor) -> Result<Tensor> {
     let (_, channels, h, w) = image.dims4()?;
     let statistics = |value: &Tensor| -> Result<(Tensor, Tensor)> {
@@ -433,6 +462,33 @@ mod tests {
         assert!((loss - 0.4).abs() < 1e-6);
         let centered = Tensor::new(&[-0.5f32, 0.0, 0.5], &Device::Cpu)?;
         assert_eq!(stability_barrier(&centered, 1.0)?.to_scalar::<f32>()?, 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn aligned_structure_rejects_shifted_edges_with_matching_statistics() -> Result<()> {
+        let mut target_values = vec![0.0f32; 3 * 16 * 16];
+        let mut shifted_values = vec![0.0f32; 3 * 16 * 16];
+        for channel in 0..3 {
+            for y in 0..16 {
+                for x in 8..16 {
+                    target_values[channel * 256 + y * 16 + x] = 1.0;
+                }
+                for x in 10..16 {
+                    shifted_values[channel * 256 + y * 16 + x] = 1.0;
+                }
+            }
+        }
+        let target = Tensor::from_vec(target_values, (1, 3, 16, 16), &Device::Cpu)?;
+        let shifted = Tensor::from_vec(shifted_values, (1, 3, 16, 16), &Device::Cpu)?;
+        let statistical = gradient_distribution_loss(&shifted, &target)?.to_scalar::<f32>()?;
+        let aligned = aligned_gradient_loss(&shifted, &target)?.to_scalar::<f32>()?;
+        assert!(
+            statistical < 1e-6,
+            "statistical edge loss was {statistical}"
+        );
+        assert!(aligned > 0.05, "aligned edge loss was {aligned}");
+        assert!(aligned < 1.0);
         Ok(())
     }
 }

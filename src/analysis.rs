@@ -9,6 +9,7 @@ use crate::flow::{flow_oklab_to_rgb, RectifiedFlowRenderer};
 use crate::metrics::{image_metrics, state_metrics, tensor_rms};
 use crate::objectives::{cross_resolution_consistency, visual_loss};
 use crate::persistence::{write_json_atomic, ArtifactPaths};
+use crate::probe::{run_natural_image_probes, NaturalImageProbeReport};
 use crate::render::{
     save_contact_sheet_resized, save_png, ImplicitRenderer, RenderPlan, SpatialView,
 };
@@ -58,8 +59,12 @@ pub struct AttractorRecord {
     pub macro_movement: f32,
     pub micro_rms: f32,
     pub macro_rms: f32,
+    pub micro_near_bound_fraction: f32,
+    pub macro_near_bound_fraction: f32,
     pub memory_rms: f32,
+    pub image_delta_valid: bool,
     pub image_delta: f32,
+    pub recurrence_distance_valid: bool,
     pub recurrence_distance: f32,
     pub output_fingerprint: String,
     pub approximate_cycle_candidate: bool,
@@ -151,6 +156,7 @@ pub struct AnalysisSummary {
     pub perturbations: Vec<PerturbationRecord>,
     pub flow_sample: Option<String>,
     pub benchmark: Option<BenchmarkRunReport>,
+    pub natural_image_probe: Option<NaturalImageProbeReport>,
     pub dynamics_ablation: Vec<DynamicsAblationRecord>,
 }
 
@@ -180,6 +186,7 @@ pub fn run_checkpoint_analysis(
         perturbations: Vec::new(),
         flow_sample: None,
         benchmark: None,
+        natural_image_probe: None,
         dynamics_ablation: Vec::new(),
     };
 
@@ -234,6 +241,12 @@ pub fn run_checkpoint_analysis(
     if config.analysis.benchmark {
         summary.benchmark = Some(run_reconstruction_benchmark(
             config, paths, dynamics, renderer, device,
+        )?);
+    }
+    if config.analysis.probe_dir.is_some() {
+        println!("PROBE: frozen held-out natural-image age/fidelity sweep");
+        summary.natural_image_probe = Some(run_natural_image_probes(
+            config, corpus, dynamics, renderer, world, device,
         )?);
     }
     write_json_atomic(&paths.analysis, &summary)?;
@@ -553,6 +566,10 @@ fn autonomous_rollout(
     let mut signatures: Vec<Vec<f32>> = Vec::new();
     let mut records = Vec::new();
     let mut images = Vec::new();
+    let mut movement_samples = 0usize;
+    let mut micro_movement_sum = 0.0f32;
+    let mut macro_movement_sum = 0.0f32;
+    let mut macro_updates = 0usize;
     for offset in 1..=config.analysis.autonomous_horizon {
         let stepped = dynamics.step(
             &probe,
@@ -562,6 +579,12 @@ fn autonomous_rollout(
             config.reference_fidelity_max,
             false,
         )?;
+        movement_samples += 1;
+        micro_movement_sum += stepped.micro_movement;
+        if stepped.macro_updated {
+            macro_updates += 1;
+            macro_movement_sum += stepped.macro_movement;
+        }
         probe = stepped.world;
         if offset % config.analysis.stride != 0 && offset != config.analysis.autonomous_horizon {
             continue;
@@ -574,40 +597,54 @@ fn autonomous_rollout(
             config.reconstruction.emergence_strength,
             false,
         )?;
-        let image_delta = prior_image.as_ref().map_or(0.0, |previous| {
-            mean_abs(
-                &rendered
-                    .image
-                    .sub(previous)
-                    .expect("matching analysis image"),
-            )
-            .unwrap_or(f32::NAN)
-        });
+        let (image_delta_valid, image_delta) = match prior_image.as_ref() {
+            Some(previous) => (true, mean_abs(&rendered.image.sub(previous)?)?),
+            None => (false, 0.0),
+        };
         let signature = state_signature(&probe)?;
-        let recurrence_distance = signatures
-            .iter()
-            .map(|previous| vector_rms_distance(previous, &signature))
-            .fold(f32::INFINITY, f32::min);
+        let recurrence_distance_valid = !signatures.is_empty();
+        let recurrence_distance = if recurrence_distance_valid {
+            signatures
+                .iter()
+                .map(|previous| vector_rms_distance(previous, &signature))
+                .fold(f32::INFINITY, f32::min)
+        } else {
+            0.0
+        };
         signatures.push(signature);
         let micro = state_metrics(&probe.micro, config.state_limit)?;
         let macro_field = state_metrics(&probe.macro_field, config.state_limit)?;
+        let micro_movement = micro_movement_sum / movement_samples.max(1) as f32;
+        let macro_movement = if macro_updates > 0 {
+            macro_movement_sum / macro_updates as f32
+        } else {
+            0.0
+        };
         records.push(AttractorRecord {
             offset,
-            micro_movement: stepped.micro_movement,
-            macro_movement: stepped.macro_movement,
+            micro_movement,
+            macro_movement,
             micro_rms: micro.rms,
             macro_rms: macro_field.rms,
+            micro_near_bound_fraction: micro.clamp_fraction,
+            macro_near_bound_fraction: macro_field.clamp_fraction,
             memory_rms: tensor_rms(&probe.memory)?,
+            image_delta_valid,
             image_delta,
+            recurrence_distance_valid,
             recurrence_distance,
             output_fingerprint: tensor_fingerprint(&rendered.image)?,
             approximate_cycle_candidate: recurrence_distance < 1e-3
-                && stepped.micro_movement + stepped.macro_movement < 1e-3,
+                && micro_movement + macro_movement < 1e-3,
         });
         let path = sibling_png(&paths.attractor_analysis, &format!("{offset:05}"));
         save_png(&rendered.image, &path)?;
         images.push(path);
         prior_image = Some(rendered.image.detach());
+        movement_samples = 0;
+        micro_movement_sum = 0.0;
+        macro_movement_sum = 0.0;
+        macro_updates = 0;
     }
     save_contact_sheet_resized(
         &images,

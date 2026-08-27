@@ -63,6 +63,19 @@ struct DecompositionDiagnostics {
     contribution_rms: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ObservationIdentity {
+    target_index: usize,
+    resolution: usize,
+    detail: bool,
+    fingerprint: u64,
+}
+
+struct CachedObservation {
+    identity: ObservationIdentity,
+    image: Tensor,
+}
+
 #[derive(Serialize)]
 struct BuildProvenance {
     commit: &'static str,
@@ -161,6 +174,11 @@ pub fn run(config: RunConfig) -> Result<()> {
     if config.render_only && !paths.recoverable_checkpoint_complete() {
         bail!(
             "--render-only requires a complete v9 checkpoint for this output directory and run tag"
+        );
+    }
+    if config.analysis.probe_dir.is_some() && !paths.recoverable_checkpoint_complete() {
+        bail!(
+            "--probe-dir requires a complete v9 checkpoint for this output directory and run tag"
         );
     }
 
@@ -497,7 +515,7 @@ pub fn run(config: RunConfig) -> Result<()> {
     let mut interrupted = false;
     let mut stability_stopped = false;
     let mut saturation_windows = 0usize;
-    let mut previous_image: Option<Tensor> = None;
+    let mut previous_observation: Option<CachedObservation> = None;
     let mut morph_loss_history = VecDeque::with_capacity(config.morph_growth.plateau_window);
 
     for local_window in 0..optimizer_windows {
@@ -591,6 +609,14 @@ pub fn run(config: RunConfig) -> Result<()> {
             .as_ref()
             .or(train_plan.as_ref())
             .expect("training render plan");
+        let observation_identity = ObservationIdentity {
+            target_index: sample.index,
+            resolution: active_plan.resolution,
+            detail: detail.is_some(),
+            fingerprint: detail
+                .as_ref()
+                .map_or(sample.fingerprint, |observation| observation.fingerprint),
+        };
         let target = detail
             .as_ref()
             .map_or(&sample.image, |observation| &observation.target);
@@ -721,13 +747,12 @@ pub fn run(config: RunConfig) -> Result<()> {
         let diagnostics = image_metrics(&rendered.image.detach())?;
         let micro_state = state_metrics(&world.micro, config.state_limit)?;
         let macro_state = state_metrics(&world.macro_field, config.state_limit)?;
-        let (image_delta_valid, image_delta_mean, image_delta_rms) =
-            if let Some(previous) = previous_image.as_ref() {
-                let delta = rendered.image.detach().sub(previous)?;
-                (true, mean_abs(&delta)?, tensor_rms(&delta)?)
-            } else {
-                (false, 0.0, 0.0)
-            };
+        let current_image = rendered.image.detach();
+        let (image_delta_valid, image_delta_mean, image_delta_rms) = temporal_image_delta(
+            previous_observation.as_ref(),
+            observation_identity,
+            &current_image,
+        )?;
         let interface_memory_rms = tensor_rms(&world.memory)?;
         let stability_violation = micro_state.clamp_fraction > config.max_saturation_fraction
             || macro_state.clamp_fraction > config.max_saturation_fraction;
@@ -736,7 +761,10 @@ pub fn run(config: RunConfig) -> Result<()> {
         } else {
             0
         };
-        previous_image = Some(rendered.image.detach());
+        previous_observation = Some(CachedObservation {
+            identity: observation_identity,
+            image: current_image,
+        });
         let window_seconds = seconds(window_started.elapsed());
         let development_steps_per_second = config.bptt as f64 / window_seconds.max(1e-9);
         let record = metric_record(
@@ -981,7 +1009,7 @@ pub fn run(config: RunConfig) -> Result<()> {
     }
     if !stability_stopped && (config.analysis_requested() || config.analysis.emergence_gallery) {
         println!("ANALYSIS: decomposition, emergence frontier, and requested frozen-state probes");
-        let _analysis = run_checkpoint_analysis(
+        let analysis = run_checkpoint_analysis(
             &config,
             &paths,
             &mut corpus,
@@ -993,6 +1021,13 @@ pub fn run(config: RunConfig) -> Result<()> {
             &device,
         )?;
         outputs.push(paths.analysis.display().to_string());
+        if let Some(probe) = &analysis.natural_image_probe {
+            outputs.push(probe.report.clone());
+            outputs.push(probe.montage.clone());
+            for target in &probe.targets {
+                outputs.extend(target.points.iter().map(|point| point.output.clone()));
+            }
+        }
         if config.analysis.render_attribution || config.analysis.emergence_gallery {
             outputs.push(paths.decomposition.display().to_string());
             outputs.push(paths.emergence_frontier.display().to_string());
@@ -1243,6 +1278,21 @@ fn select_episode_if_needed(
         world.reseed_for_episode(config, config.seed ^ next.fingerprint, episode, next.index)?;
     *sample = next;
     Ok(())
+}
+
+fn temporal_image_delta(
+    previous: Option<&CachedObservation>,
+    current_identity: ObservationIdentity,
+    current_image: &Tensor,
+) -> Result<(bool, f32, f32)> {
+    let Some(previous) = previous else {
+        return Ok((false, 0.0, 0.0));
+    };
+    if previous.identity != current_identity || previous.image.dims() != current_image.dims() {
+        return Ok((false, 0.0, 0.0));
+    }
+    let delta = current_image.sub(&previous.image)?;
+    Ok((true, mean_abs(&delta)?, tensor_rms(&delta)?))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1800,6 +1850,107 @@ mod tests {
         assert!(paths.render_metadata.exists());
         assert!(paths.previous_checkpoint().checkpoint_complete());
 
+        let probe_dir = root.join("probes");
+        std::fs::create_dir_all(&probe_dir)?;
+        image::RgbImage::from_fn(28, 20, |x, y| {
+            image::Rgb([
+                ((3 * x + 5 * y) % 256) as u8,
+                ((11 * x + y) % 256) as u8,
+                ((x + 13 * y) % 256) as u8,
+            ])
+        })
+        .save(probe_dir.join("unseen-a.png"))?;
+        image::RgbImage::from_fn(22, 30, |x, y| {
+            image::Rgb([
+                ((17 * x + 2 * y) % 256) as u8,
+                ((x + 7 * y) % 256) as u8,
+                ((5 * x + 19 * y) % 256) as u8,
+            ])
+        })
+        .save(probe_dir.join("unseen-b.png"))?;
+        let mut probe = config.clone();
+        probe.fresh = false;
+        probe.analysis.only = true;
+        probe.analysis.render_attribution = false;
+        probe.analysis.probe_dir = Some(probe_dir);
+        probe.analysis.probe_ages = vec![1, 2];
+        probe.analysis.probe_reference_fidelities = vec![1.0, 0.0];
+        run(probe)?;
+        assert_eq!(checkpoint_before[0], std::fs::read(&paths.model)?);
+        assert_eq!(checkpoint_before[1], std::fs::read(&paths.optimizer)?);
+        assert_eq!(checkpoint_before[2], std::fs::read(&paths.world)?);
+        assert_eq!(
+            checkpoint_before[3],
+            std::fs::read(&paths.checkpoint_manifest)?
+        );
+        assert_eq!(metrics_before, std::fs::read(&paths.metrics)?);
+        assert_eq!(metadata_before, std::fs::read(&paths.metadata)?);
+        let probe_summary: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&paths.analysis)?)?;
+        let probe_report = &probe_summary["natural_image_probe"];
+        assert_eq!(probe_report["held_out_by_source_bytes"], true);
+        assert_eq!(probe_report["weights_frozen"], true);
+        assert_eq!(probe_report["optimizer_steps"], 0);
+        assert_eq!(probe_report["target_count"], 2);
+        assert_eq!(probe_report["output_count"], 8);
+        assert!(probe_report["fixed_world_seed"].as_u64().is_some());
+        assert_eq!(probe_report["ages"], serde_json::json!([1, 2]));
+        assert_eq!(
+            probe_report["reference_fidelities"],
+            serde_json::json!([1.0, 0.0])
+        );
+        let targets = probe_report["targets"]
+            .as_array()
+            .expect("probe target array");
+        assert_eq!(targets.len(), 2);
+        let mut reference_free_outputs = Vec::new();
+        for target in targets {
+            let points = target["points"].as_array().expect("probe points array");
+            assert_eq!(points.len(), 4);
+            let mut target_reference_free_outputs = Vec::new();
+            for point in points {
+                let output = point["output"].as_str().expect("probe output path");
+                assert!(std::path::Path::new(output).exists());
+                if point["reference_fidelity"] == 0.0 {
+                    assert_eq!(point["micro_reference_drive_rms"], 0.0);
+                    assert_eq!(point["macro_reference_drive_rms"], 0.0);
+                    target_reference_free_outputs.push(std::fs::read(output)?);
+                }
+            }
+            reference_free_outputs.push(target_reference_free_outputs);
+        }
+        assert_eq!(reference_free_outputs[0], reference_free_outputs[1]);
+        assert!(std::path::Path::new(
+            probe_report["montage"]
+                .as_str()
+                .expect("probe montage path")
+        )
+        .exists());
+        assert!(
+            std::path::Path::new(probe_report["report"].as_str().expect("probe report path"))
+                .exists()
+        );
+
+        let overlap_dir = root.join("overlapping-probes");
+        std::fs::create_dir_all(&overlap_dir)?;
+        std::fs::copy(
+            config.corpus_dir.join("source.png"),
+            overlap_dir.join("copied-source.png"),
+        )?;
+        let mut overlap_probe = config.clone();
+        overlap_probe.fresh = false;
+        overlap_probe.analysis.only = true;
+        overlap_probe.analysis.probe_dir = Some(overlap_dir);
+        overlap_probe.analysis.probe_ages = vec![1];
+        overlap_probe.analysis.probe_reference_fidelities = vec![1.0];
+        let overlap_error = run(overlap_probe)
+            .expect_err("training/probe byte overlap must be rejected")
+            .to_string();
+        assert!(overlap_error.contains("overlap the training corpus by source bytes"));
+        assert_eq!(checkpoint_before[0], std::fs::read(&paths.model)?);
+        assert_eq!(checkpoint_before[1], std::fs::read(&paths.optimizer)?);
+        assert_eq!(checkpoint_before[2], std::fs::read(&paths.world)?);
+
         std::fs::write(&paths.model, b"interrupted checkpoint component")?;
         let mut recovery = config.clone();
         recovery.fresh = false;
@@ -1958,6 +2109,46 @@ mod tests {
         assert!(cadence_due(96, 100, 50));
         assert!(!cadence_due(100, 104, 50));
         assert!(!cadence_due(48, 52, 0));
+    }
+
+    #[test]
+    fn temporal_image_delta_invalidates_global_to_crop_resolution_transition() -> Result<()> {
+        let global_identity = ObservationIdentity {
+            target_index: 7,
+            resolution: 192,
+            detail: false,
+            fingerprint: 0x701,
+        };
+        let previous = CachedObservation {
+            identity: global_identity,
+            image: Tensor::zeros((1, 3, 192, 192), DType::F32, &Device::Cpu)?,
+        };
+        let crop_identity = ObservationIdentity {
+            target_index: 7,
+            resolution: 128,
+            detail: true,
+            fingerprint: 0xc40,
+        };
+        let crop = Tensor::ones((1, 3, 128, 128), DType::F32, &Device::Cpu)?;
+        assert_eq!(
+            temporal_image_delta(Some(&previous), crop_identity, &crop)?,
+            (false, 0.0, 0.0)
+        );
+
+        let changed_global = Tensor::ones((1, 3, 192, 192), DType::F32, &Device::Cpu)?;
+        let (valid, mean, rms) =
+            temporal_image_delta(Some(&previous), global_identity, &changed_global)?;
+        assert!(valid);
+        assert_eq!(mean, 1.0);
+        assert_eq!(rms, 1.0);
+
+        // Shape remains a second safety rail even if a future caller creates a
+        // malformed identity with the wrong resolution.
+        assert_eq!(
+            temporal_image_delta(Some(&previous), global_identity, &crop)?,
+            (false, 0.0, 0.0)
+        );
+        Ok(())
     }
 
     #[test]

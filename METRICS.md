@@ -21,7 +21,9 @@ Grounding:
 - `loss_content`: composite raw endpoint error;
 - `loss_grounding`: weighted grounded-only multiscale objective;
 - `loss_ground_coarse`, `loss_ground_mid`, `loss_ground_fine`;
-- `loss_ssim`, `loss_palette`, `loss_structure`;
+- `loss_ssim`, `loss_palette`, `loss_structure`; structure is target-aligned
+  edge reconstruction in single/family mode and gradient statistics only in
+  translation-invariant texture mode;
 - `cross_resolution_l1`, `cross_resolution_low`,
   `cross_resolution_edge` on scheduled global consistency windows;
 - `loss_endpoint` and `loss_total` remain separate so flow or regularizers
@@ -46,7 +48,8 @@ State and coherence:
 - micro/macro mean and maximum movement;
 - state RMS, mean absolute value, near-bound fraction, and channel RMS range;
 - interface memory RMS;
-- image delta mean/RMS with an explicit validity bit;
+- image delta mean/RMS with an explicit validity bit; target, resolution, or
+  crop-view transitions invalidate the comparison;
 - image variance and edge energy;
 - seam energy and gamut excess;
 - state/memory barrier losses and the stability-watchdog flag;
@@ -123,10 +126,12 @@ target separation, gamut, and stability remain acceptable.
 
 ## Autonomous and perturbation analysis
 
-Autonomous rollout records offset, micro/macro movement and RMS, memory RMS,
-image delta, nearest prior-state signature distance, output fingerprint, and a
+Autonomous rollout records offset, interval-averaged micro/macro movement and
+RMS/near-bound occupancy, memory RMS, image delta, nearest prior-state
+signature distance, output fingerprint, and a
 conservative approximate-cycle flag. Continued wandering alone is not labeled
-a strange attractor.
+a strange attractor. First-sample image/recurrence distances carry explicit
+validity flags rather than using a sentinel value.
 
 Perturbation analysis evolves one untouched mature control beside deterministic
 micro, macro, and memory noise plus localized micro/macro erased patches. It
@@ -155,6 +160,25 @@ It records raw L1, coarse spatial L1, edge L1, development-age convergence, and
 candidate separability. The asymmetry specifically prevents palette/statistics
 matching from masquerading as target-specific reconstruction.
 
+## Held-out natural-image probe
+
+`--probe-dir` adds a checkpoint-only natural-image transfer matrix. Each JSON
+point records target name and source-byte fingerprint, reference fidelity, age,
+emergence schedule, output path, registered raw L1/L2, 8x8 coarse spatial L1,
+edge L1, palette-mean L1, image variance/edge/seam/RGB means, micro/macro state
+RMS and near-bound occupancy, memory RMS, and micro/macro reference-drive RMS.
+The report also records both corpus fingerprints, checkpoint world step, fixed
+world seed, fixed-zero-genome policy, output counts, and explicit frozen-weight/
+zero-optimizer-step flags.
+
+Training and probe manifests are checked for exact source-byte overlap before
+any probe trajectory runs. Every target and fidelity receives the same fresh
+world seed and checkpoint anatomy. Fidelity zero supplies no reference tensors;
+its drive RMS must be exactly zero and same-age outputs must be identical across
+targets. Treat that row as a target-independent prior baseline. Positive
+fidelities measure transfer to held-out inputs. Neither result alone establishes
+broad natural-image generalization beyond the curated probe set.
+
 ## Recommended experiment sequence
 
 1. Run `strict-reconstruct` to establish literal global and target-specific
@@ -163,9 +187,10 @@ matching from masquerading as target-specific reconstruction.
    conditions.
 3. Evaluate the emergence frontier and decomposition montage.
 4. Run target separability and resolution ladder analysis.
-5. Only then test `grounded-emergent`, adaptive depth, perturbation recovery,
+5. Run the held-out natural-image age/fidelity matrix, including fidelity zero.
+6. Only then test `grounded-emergent`, adaptive depth, perturbation recovery,
    and autonomous rollout.
-6. Test `flow-reconstruct` as a separate matched experiment; do not compare a
+7. Test `flow-reconstruct` as a separate matched experiment; do not compare a
    flow sample to the canonical phenotype without labeling it.
 
 Use world-step or wall-clock matched runs and compare peak RSS and measured
