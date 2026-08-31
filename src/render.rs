@@ -4,6 +4,8 @@ use crate::tensor_ops::{
     pixelwise_linear_mode, smooth_limit, PeriodicUpsampler,
 };
 use anyhow::{Context, Result};
+#[cfg(feature = "opencl")]
+use candle_core::{backprop::GradStore, Var};
 use candle_core::{Device, Tensor, D};
 use candle_nn::{Init, Linear, VarBuilder};
 use serde::{Deserialize, Serialize};
@@ -16,6 +18,7 @@ struct OpenClSlot {
     attempted: bool,
     renderer: Option<crate::opencl::OpenClMlp>,
     failure: Option<String>,
+    training_boundary: Option<Var>,
 }
 
 pub struct ImplicitRenderer {
@@ -211,6 +214,7 @@ impl ImplicitRenderer {
                 attempted: false,
                 renderer: None,
                 failure: None,
+                training_boundary: None,
             }),
             default_emergence_strength: config.reconstruction.emergence_strength,
             emergent_limit: config.reconstruction.emergent_limit,
@@ -316,6 +320,122 @@ impl ImplicitRenderer {
             Ok(Some((tensor.narrow(1, 0, 3)?, tensor.narrow(1, 3, 3)?)))
         }
     }
+
+    fn opencl_training_heads(
+        &self,
+        features: &Tensor,
+        resolution: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        #[cfg(not(feature = "opencl"))]
+        {
+            let _ = (features, resolution);
+            anyhow::bail!("OpenCL renderer training requires cargo build --features opencl");
+        }
+        #[cfg(feature = "opencl")]
+        {
+            anyhow::ensure!(
+                self.compute_backend == ComputeBackend::OpenCl,
+                "OpenCL decoder training requires --compute-backend opencl"
+            );
+            let layers = self.opencl_layers()?;
+            let values = features.flatten_all()?.to_vec1::<f32>()?;
+            let mut slot = self.opencl.lock().expect("OpenCL renderer mutex poisoned");
+            self.initialize_opencl(&mut slot)?;
+            let renderer = slot
+                .renderer
+                .as_mut()
+                .context("OpenCL renderer did not initialize")?;
+            let output = renderer.training_forward(&values, resolution * resolution, &layers)?;
+            let boundary =
+                Var::from_vec(output, (1, 6, resolution, resolution), features.device())?;
+            let grounded = boundary.narrow(1, 0, 3)?;
+            let emergent = boundary.narrow(1, 3, 3)?;
+            slot.training_boundary = Some(boundary);
+            Ok((grounded, emergent))
+        }
+    }
+
+    pub fn render_decoder_training(
+        &self,
+        micro: &Tensor,
+        macro_field: &Tensor,
+        genome: &Tensor,
+        plan: &RenderPlan,
+        emergence_strength: f32,
+    ) -> Result<RenderOutput> {
+        self.render_internal(
+            micro,
+            macro_field,
+            genome,
+            plan,
+            emergence_strength,
+            true,
+            false,
+            true,
+        )
+    }
+
+    #[cfg(feature = "opencl")]
+    pub fn populate_opencl_training_gradients(&self, gradients: &mut GradStore) -> Result<bool> {
+        if self.compute_backend != ComputeBackend::OpenCl {
+            return Ok(false);
+        }
+        let mut slot = self.opencl.lock().expect("OpenCL renderer mutex poisoned");
+        let Some(boundary) = slot.training_boundary.take() else {
+            return Ok(false);
+        };
+        let head_gradient = gradients
+            .get(boundary.as_tensor())
+            .context("loss did not produce OpenCL renderer boundary gradients")?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let renderer = slot
+            .renderer
+            .as_mut()
+            .context("OpenCL renderer did not initialize")?;
+        let layer_gradients = renderer.training_backward(&head_gradient)?;
+        anyhow::ensure!(
+            layer_gradients.len() == self.blocks.len() + 3,
+            "OpenCL renderer gradient layer count mismatch"
+        );
+        insert_linear_gradients(gradients, &self.input, &layer_gradients[0])?;
+        for (index, block) in self.blocks.iter().enumerate() {
+            insert_linear_gradients(gradients, block, &layer_gradients[index + 1])?;
+        }
+        insert_linear_gradients(
+            gradients,
+            &self.grounded_head,
+            &layer_gradients[self.blocks.len() + 1],
+        )?;
+        insert_linear_gradients(
+            gradients,
+            &self.emergent_head,
+            &layer_gradients[self.blocks.len() + 2],
+        )?;
+        Ok(true)
+    }
+
+    pub fn refresh_opencl_weights(&self) -> Result<bool> {
+        if self.compute_backend != ComputeBackend::OpenCl {
+            return Ok(false);
+        }
+        #[cfg(not(feature = "opencl"))]
+        {
+            anyhow::bail!("OpenCL renderer requires cargo build --features opencl");
+        }
+        #[cfg(feature = "opencl")]
+        {
+            let layers = self.opencl_layers()?;
+            let mut slot = self.opencl.lock().expect("OpenCL renderer mutex poisoned");
+            self.initialize_opencl(&mut slot)?;
+            let renderer = slot
+                .renderer
+                .as_mut()
+                .context("OpenCL renderer did not initialize")?;
+            renderer.refresh_weights(&layers)?;
+            Ok(true)
+        }
+    }
     pub fn render(
         &self,
         micro: &Tensor,
@@ -351,6 +471,7 @@ impl ImplicitRenderer {
             emergence_strength,
             tracked,
             false,
+            false,
         )
     }
 
@@ -370,6 +491,7 @@ impl ImplicitRenderer {
             emergence_strength,
             false,
             true,
+            false,
         )
     }
 
@@ -383,6 +505,7 @@ impl ImplicitRenderer {
         emergence_strength: f32,
         tracked: bool,
         include_attribution: bool,
+        opencl_training: bool,
     ) -> Result<RenderOutput> {
         let micro_up = plan.micro.apply(micro)?;
         let macro_up = plan.macro_field.apply(macro_field)?;
@@ -397,7 +520,9 @@ impl ImplicitRenderer {
             ],
             1,
         )?;
-        let accelerated = if tracked {
+        let accelerated = if opencl_training {
+            Some(self.opencl_training_heads(&features, plan.resolution)?)
+        } else if tracked {
             None
         } else {
             self.opencl_heads(&features, plan.resolution)?
@@ -604,6 +729,35 @@ fn lab_to_image(
     Ok((image, gamut_excess))
 }
 
+#[cfg(feature = "opencl")]
+fn insert_linear_gradients(
+    gradients: &mut GradStore,
+    linear: &Linear,
+    values: &crate::opencl::LinearGradData,
+) -> Result<()> {
+    let weight = Tensor::from_vec(
+        values.weight.clone(),
+        linear.weight().shape().clone(),
+        linear.weight().device(),
+    )?;
+    let weight = if let Some(existing) = gradients.get(linear.weight()) {
+        existing.add(&weight)?
+    } else {
+        weight
+    };
+    gradients.insert(linear.weight(), weight);
+    let bias = linear
+        .bias()
+        .context("OpenCL renderer requires linear biases")?;
+    let bias_gradient = Tensor::from_vec(values.bias.clone(), bias.shape().clone(), bias.device())?;
+    let bias_gradient = if let Some(existing) = gradients.get(bias) {
+        existing.add(&bias_gradient)?
+    } else {
+        bias_gradient
+    };
+    gradients.insert(bias, bias_gradient);
+    Ok(())
+}
 #[cfg(feature = "opencl")]
 fn linear_data(linear: &Linear) -> Result<crate::opencl::LinearData> {
     let (output, input) = linear.weight().dims2()?;

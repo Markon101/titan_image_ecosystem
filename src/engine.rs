@@ -139,11 +139,11 @@ pub fn run(config: RunConfig) -> Result<()> {
     let training_enabled = !config.render_only && !config.analysis.only;
     if training_enabled {
         match config.compute_backend {
-            ComputeBackend::OpenCl => bail!(
-                "OpenCL Phase 1 supports frozen render-only and analysis-only paths; training remains CPU"
+            ComputeBackend::OpenCl => eprintln!(
+                "OPENCL training: detached decoder windows use GPU NCA/renderer forward and renderer backward; full-core windows remain CPU"
             ),
             ComputeBackend::Auto => {
-                eprintln!("OPENCL auto: training remains on CPU in Phase 1");
+                eprintln!("OPENCL auto: training remains on CPU; select opencl explicitly for hybrid Stage 3");
                 config.compute_backend = ComputeBackend::Cpu;
             }
             ComputeBackend::Cpu => {}
@@ -219,7 +219,10 @@ pub fn run(config: RunConfig) -> Result<()> {
     if let Some(info) = renderer.prepare_inference_backend()? {
         eprintln!("OPENCL device: {info}");
     }
-    if config.analysis_requested() || (config.render_only && config.gallery > 0) {
+    if config.analysis_requested()
+        || (config.render_only && config.gallery > 0)
+        || (training_enabled && config.compute_backend == ComputeBackend::OpenCl)
+    {
         if let Some(info) = dynamics.prepare_inference_backend()? {
             eprintln!("OPENCL dynamics: {info}");
         }
@@ -575,6 +578,7 @@ pub fn run(config: RunConfig) -> Result<()> {
         } else {
             decoder_only_windows += 1;
         }
+        let opencl_decoder_window = !train_core && config.compute_backend == ComputeBackend::OpenCl;
 
         let mut micro_movement_sum = 0.0f32;
         let mut micro_movement_max = 0.0f32;
@@ -649,14 +653,24 @@ pub fn run(config: RunConfig) -> Result<()> {
         };
         let age_phase = (world.age as f32 / config.episode_steps.max(1) as f32).clamp(0.0, 1.0);
         let (grounding_schedule, emergence_schedule) = config.developmental_schedule(age_phase);
-        let rendered = renderer.render_with_emergence(
-            &world.micro,
-            &world.macro_field,
-            &sample.genome_tensor,
-            active_plan,
-            emergence_schedule,
-            true,
-        )?;
+        let rendered = if opencl_decoder_window {
+            renderer.render_decoder_training(
+                &world.micro,
+                &world.macro_field,
+                &sample.genome_tensor,
+                active_plan,
+                emergence_schedule,
+            )?
+        } else {
+            renderer.render_with_emergence(
+                &world.micro,
+                &world.macro_field,
+                &sample.genome_tensor,
+                active_plan,
+                emergence_schedule,
+                true,
+            )?
+        };
         let mut losses = visual_loss(
             &rendered,
             target,
@@ -760,9 +774,36 @@ pub fn run(config: RunConfig) -> Result<()> {
         let loss_values = loss_scalars(&losses)?;
         phase.render_and_loss += seconds(tick.elapsed());
 
-        let optimizer_stats = optimizer.backward_step(&losses.total)?;
+        let optimizer_stats = if opencl_decoder_window {
+            #[cfg(feature = "opencl")]
+            {
+                optimizer.backward_step_with(&losses.total, |gradients| {
+                    anyhow::ensure!(
+                        renderer.populate_opencl_training_gradients(gradients)?,
+                        "OpenCL renderer training boundary was not active"
+                    );
+                    Ok(())
+                })?
+            }
+            #[cfg(not(feature = "opencl"))]
+            {
+                bail!("OpenCL training requires cargo build --features opencl");
+            }
+        } else {
+            optimizer.backward_step(&losses.total)?
+        };
         phase.backward += optimizer_stats.backward_seconds;
         phase.optimizer += optimizer_stats.step_seconds;
+        if config.compute_backend == ComputeBackend::OpenCl {
+            anyhow::ensure!(
+                dynamics.refresh_opencl_weights()?,
+                "OpenCL NCA weights could not be refreshed"
+            );
+            anyhow::ensure!(
+                renderer.refresh_opencl_weights()?,
+                "OpenCL renderer weights could not be refreshed"
+            );
+        }
         world = world.detached();
 
         let tick = Instant::now();
@@ -2217,6 +2258,178 @@ mod tests {
         assert!(micro.clamp_fraction < 1e-4);
         assert!(macro_field.clamp_fraction < 1e-4);
         assert!(world.memory.abs()?.max_all()?.to_scalar::<f32>()? < config.memory_limit);
+        Ok(())
+    }
+
+    #[cfg(feature = "opencl")]
+    #[test]
+    fn opencl_decoder_training_matches_cpu() -> Result<()> {
+        if std::env::var_os("TITAN_OPENCL_TEST").is_none() {
+            return Ok(());
+        }
+        let root = std::env::temp_dir().join(format!(
+            "titan-image-opencl-training-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        let corpus = root.join("corpus");
+        let cpu_output = root.join("cpu");
+        let gpu_output = root.join("gpu");
+        std::fs::create_dir_all(&corpus)?;
+        let source = image::RgbImage::from_fn(24, 24, |x, y| {
+            image::Rgb([
+                ((x * 9 + y * 3) % 256) as u8,
+                ((y * 11 + x * 2) % 256) as u8,
+                ((x * 5 + y * 7) % 256) as u8,
+            ])
+        });
+        source.save(corpus.join("source.png"))?;
+        let mut cpu_config = tiny_config(corpus.clone(), cpu_output);
+        cpu_config.compute_backend = ComputeBackend::Cpu;
+        cpu_config.steps = 2;
+        cpu_config.core_update_every = 2;
+        let mut gpu_config = tiny_config(corpus, gpu_output);
+        gpu_config.compute_backend = ComputeBackend::OpenCl;
+        gpu_config.steps = 2;
+        gpu_config.core_update_every = 2;
+        run(cpu_config.clone())?;
+        run(gpu_config.clone())?;
+        let cpu_paths = ArtifactPaths::new(&cpu_config);
+        let gpu_paths = ArtifactPaths::new(&gpu_config);
+        let cpu_model = candle_core::safetensors::load(&cpu_paths.model, &Device::Cpu)?;
+        let gpu_model = candle_core::safetensors::load(&gpu_paths.model, &Device::Cpu)?;
+        let mut parameter_max = 0.0f32;
+        let mut parameter_mean = 0.0f64;
+        let mut parameter_count = 0usize;
+        for (name, cpu) in &cpu_model {
+            if name.starts_with("checkpoint.") || !cpu.dtype().is_float() {
+                continue;
+            }
+            let gpu = gpu_model
+                .get(name)
+                .with_context(|| format!("GPU model missing {name}"))?;
+            let difference = gpu.sub(cpu)?.abs()?;
+            parameter_max = parameter_max.max(difference.max_all()?.to_scalar::<f32>()?);
+            parameter_mean += difference.sum_all()?.to_scalar::<f32>()? as f64;
+            parameter_count += difference.elem_count();
+        }
+        parameter_mean /= parameter_count as f64;
+        let cpu_world = candle_core::safetensors::load(&cpu_paths.world, &Device::Cpu)?;
+        let gpu_world = candle_core::safetensors::load(&gpu_paths.world, &Device::Cpu)?;
+        let mut state_max = 0.0f32;
+        let mut state_mean = 0.0f64;
+        let mut state_count = 0usize;
+        for name in ["world.micro", "world.macro", "world.memory"] {
+            let difference = gpu_world[name].sub(&cpu_world[name])?.abs()?;
+            state_max = state_max.max(difference.max_all()?.to_scalar::<f32>()?);
+            state_mean += difference.sum_all()?.to_scalar::<f32>()? as f64;
+            state_count += difference.elem_count();
+        }
+        state_mean /= state_count as f64;
+        let cpu_metrics = std::fs::read_to_string(&cpu_paths.metrics)?;
+        let gpu_metrics = std::fs::read_to_string(&gpu_paths.metrics)?;
+        let metric = |csv: &str, name: &str| -> Result<f64> {
+            let mut rows = csv.lines();
+            let header = rows.next().context("metrics header missing")?;
+            let index = header
+                .split(',')
+                .position(|field| field == name)
+                .with_context(|| format!("metrics missing {name}"))?;
+            rows.last()
+                .context("metrics row missing")?
+                .split(',')
+                .nth(index)
+                .context("metrics column missing")?
+                .parse::<f64>()
+                .map_err(Into::into)
+        };
+        let cpu_loss = metric(&cpu_metrics, "loss_total")?;
+        let gpu_loss = metric(&gpu_metrics, "loss_total")?;
+        let loss_abs = (cpu_loss - gpu_loss).abs();
+        let cpu_image = image::open(&cpu_paths.raw)?.to_rgb8();
+        let gpu_image = image::open(&gpu_paths.raw)?.to_rgb8();
+        anyhow::ensure!(cpu_image.dimensions() == gpu_image.dimensions());
+        let mut image_max = 0u8;
+        let mut image_mean = 0.0f64;
+        for (cpu, gpu) in cpu_image.as_raw().iter().zip(gpu_image.as_raw()) {
+            let difference = cpu.abs_diff(*gpu);
+            image_max = image_max.max(difference);
+            image_mean += difference as f64;
+        }
+        image_mean /= cpu_image.as_raw().len() as f64;
+        eprintln!("OPENCL decoder training parity | loss_abs={loss_abs:.8} state_max={state_max:.8} state_mean={state_mean:.8} parameter_max={parameter_max:.8} parameter_mean={parameter_mean:.8} image_max_u8={image_max} image_mean_u8={image_mean:.8}");
+        assert!(loss_abs <= 2e-4, "loss drift {loss_abs}");
+        assert!(state_max <= 5e-4, "state drift {state_max}");
+        assert!(state_mean <= 5e-5, "state mean drift {state_mean}");
+        assert!(parameter_max <= 2e-4, "parameter drift {parameter_max}");
+        assert!(
+            parameter_mean <= 2e-5,
+            "parameter mean drift {parameter_mean}"
+        );
+        assert!(
+            image_max <= 1,
+            "render differs by {image_max} quantization levels"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "opencl")]
+    #[test]
+    fn compare_opencl_training_artifacts() -> Result<()> {
+        let Some(cpu_dir) = std::env::var_os("TITAN_OPENCL_TRAIN_CPU_DIR") else {
+            return Ok(());
+        };
+        let gpu_dir = std::env::var_os("TITAN_OPENCL_TRAIN_GPU_DIR")
+            .context("TITAN_OPENCL_TRAIN_GPU_DIR is required")?;
+        let tag = std::env::var("TITAN_OPENCL_TRAIN_TAG")?;
+        let cpu_config = RunConfig {
+            output_dir: PathBuf::from(cpu_dir),
+            run_tag: Some(tag.clone()),
+            ..RunConfig::default()
+        };
+        let gpu_config = RunConfig {
+            output_dir: PathBuf::from(gpu_dir),
+            run_tag: Some(tag),
+            ..RunConfig::default()
+        };
+        let cpu_paths = ArtifactPaths::new(&cpu_config);
+        let gpu_paths = ArtifactPaths::new(&gpu_config);
+        let compare = |label: &str, cpu_path: &PathBuf, gpu_path: &PathBuf| -> Result<(f32, f64)> {
+            let cpu = candle_core::safetensors::load(cpu_path, &Device::Cpu)?;
+            let gpu = candle_core::safetensors::load(gpu_path, &Device::Cpu)?;
+            let mut maximum = 0.0f32;
+            let mut sum = 0.0f64;
+            let mut count = 0usize;
+            let mut largest = Vec::new();
+            for (name, cpu_tensor) in &cpu {
+                if !cpu_tensor.dtype().is_float() {
+                    continue;
+                }
+                let gpu_tensor = gpu
+                    .get(name)
+                    .with_context(|| format!("{label} missing {name}"))?;
+                let difference = gpu_tensor.sub(cpu_tensor)?.abs()?;
+                let tensor_max = difference.max_all()?.to_scalar::<f32>()?;
+                maximum = maximum.max(tensor_max);
+                sum += difference.sum_all()?.to_scalar::<f32>()? as f64;
+                count += difference.elem_count();
+                largest.push((tensor_max, name.clone()));
+            }
+            largest.sort_by(|a, b| b.0.total_cmp(&a.0));
+            eprintln!(
+                "OPENCL artifact {label} | max={maximum:.8} mean={:.8} largest={:?}",
+                sum / count as f64,
+                &largest[..largest.len().min(5)]
+            );
+            Ok((maximum, sum / count as f64))
+        };
+        let model = compare("model", &cpu_paths.model, &gpu_paths.model)?;
+        let optimizer = compare("optimizer", &cpu_paths.optimizer, &gpu_paths.optimizer)?;
+        let world = compare("world", &cpu_paths.world, &gpu_paths.world)?;
+        assert!(model.0 <= 5e-3, "model drift {}", model.0);
+        assert!(model.1 <= 5e-5, "model mean drift {}", model.1);
+        assert!(optimizer.0 <= 5e-3, "optimizer drift {}", optimizer.0);
+        assert!(world.0 <= 5e-3, "world drift {}", world.0);
         Ok(())
     }
 }

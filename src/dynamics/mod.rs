@@ -118,6 +118,12 @@ impl DynamicsSystem {
         }
     }
 
+    pub fn refresh_opencl_weights(&self) -> Result<bool> {
+        let micro = self.micro_ca.refresh_opencl_weights()?;
+        let macro_field = self.macro_ca.refresh_opencl_weights()?;
+        Ok(micro && macro_field)
+    }
+
     /// Advance one world step. The local NCA handles dense spatial refinement;
     /// a small recurrent token interface performs global read/reason/write.
     #[allow(clippy::too_many_arguments)]

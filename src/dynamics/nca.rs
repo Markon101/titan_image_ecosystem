@@ -104,6 +104,32 @@ impl NeuralCa {
         }
     }
 
+    pub fn refresh_opencl_weights(&self) -> Result<bool> {
+        if self.compute_backend != ComputeBackend::OpenCl {
+            return Ok(false);
+        }
+        #[cfg(not(feature = "opencl"))]
+        {
+            bail!("OpenCL NCA requires cargo build --features opencl");
+        }
+        #[cfg(feature = "opencl")]
+        {
+            let layers = vec![
+                linear_data(&self.input)?,
+                linear_data(&self.hidden)?,
+                linear_data(&self.output)?,
+            ];
+            let mut slot = self.opencl.lock().expect("OpenCL NCA mutex poisoned");
+            self.initialize_opencl(&mut slot)?;
+            let backend = slot
+                .backend
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("OpenCL NCA did not initialize"))?;
+            backend.refresh_weights(&layers)?;
+            Ok(true)
+        }
+    }
+
     pub fn delta(
         &self,
         field: &Tensor,

@@ -110,8 +110,20 @@ impl PersistentAdamW {
     }
 
     pub fn backward_step(&mut self, loss: &Tensor) -> Result<OptimizerStats> {
+        self.backward_step_with(loss, |_| Ok(()))
+    }
+
+    pub fn backward_step_with<F>(
+        &mut self,
+        loss: &Tensor,
+        augment_gradients: F,
+    ) -> Result<OptimizerStats>
+    where
+        F: FnOnce(&mut GradStore) -> Result<()>,
+    {
         let backward_started = Instant::now();
-        let gradients = loss.backward()?;
+        let mut gradients = loss.backward()?;
+        augment_gradients(&mut gradients)?;
         let backward_seconds = backward_started.elapsed().as_secs_f64();
         let step_started = Instant::now();
         let mut stats = self.step(&gradients)?;
