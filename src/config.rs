@@ -14,6 +14,7 @@ Lifecycle and presets:
   --fresh                       Start a new v9 organism
   --render-only                 Load checkpoint and render without training
   --analysis-only               Load checkpoint and run frozen-state analysis
+  --compute-backend NAME        cpu | opencl | auto (default cpu)
   --profile NAME                s25-fast | s25-balanced | s25-quality
   --style NAME                  alien-fluid | fractal-flame | reaction-garden | quasicrystal | pure-nca
   --research-preset NAME        strict-reconstruct | reconstruction-plus | grounded-emergent | free-morph | flow-reconstruct
@@ -339,6 +340,26 @@ impl TerminalMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ComputeBackend {
+    #[default]
+    Cpu,
+    OpenCl,
+    Auto,
+}
+
+impl ComputeBackend {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "cpu" => Ok(Self::Cpu),
+            "opencl" => Ok(Self::OpenCl),
+            "auto" => Ok(Self::Auto),
+            _ => bail!("unknown compute backend {value}; expected cpu, opencl, or auto"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ResearchPreset {
@@ -542,6 +563,8 @@ pub struct RunConfig {
     pub gallery_seed: u64,
     pub fresh: bool,
     pub render_only: bool,
+    #[serde(default)]
+    pub compute_backend: ComputeBackend,
 }
 
 impl Default for RunConfig {
@@ -712,6 +735,7 @@ impl Default for RunConfig {
             gallery_seed: 0x5eed_5eed,
             fresh: false,
             render_only: false,
+            compute_backend: ComputeBackend::Cpu,
         };
         config.apply_profile(PhoneProfile::S25Balanced);
         config.apply_style(StylePreset::AlienFluid);
@@ -843,6 +867,7 @@ impl RunConfig {
                 "--flow-cadence" => cfg.flow.cadence = parse(&value()?, flag)?,
                 "--flow-sample-steps" => cfg.flow.sample_steps = parse(&value()?, flag)?,
                 "--terminal" => cfg.terminal = TerminalMode::parse(&value()?)?,
+                "--compute-backend" => cfg.compute_backend = ComputeBackend::parse(&value()?)?,
                 "--analysis-only" => cfg.analysis.only = true,
                 "--render-attribution" => cfg.analysis.render_attribution = true,
                 "--model-stats" => cfg.analysis.model_stats = true,
@@ -2127,5 +2152,20 @@ mod tests {
             ..RunConfig::default()
         };
         assert!(disabled_watchdog.validate().is_ok());
+    }
+
+    #[test]
+    fn compute_backend_is_execution_only() -> Result<()> {
+        let cpu = RunConfig::default();
+        assert_eq!(cpu.compute_backend, ComputeBackend::Cpu);
+        let mut opencl = cpu.clone();
+        opencl.compute_backend = ComputeBackend::parse("opencl")?;
+        assert_eq!(cpu.checkpoint_signature(), opencl.checkpoint_signature());
+        assert_eq!(
+            cpu.resolved_config_signature(),
+            opencl.resolved_config_signature()
+        );
+        assert!(ComputeBackend::parse("cuda").is_err());
+        Ok(())
     }
 }

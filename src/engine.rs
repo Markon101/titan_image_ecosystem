@@ -1,7 +1,8 @@
 use crate::analysis::run_checkpoint_analysis;
 use crate::comparison::compare_v8_v9;
 use crate::config::{
-    BoundaryMode, ConditioningMode, MorphDepthMode, ObjectiveMode, RunConfig, SCHEMA_VERSION,
+    BoundaryMode, ComputeBackend, ConditioningMode, MorphDepthMode, ObjectiveMode, RunConfig,
+    SCHEMA_VERSION,
 };
 use crate::corpus::{CorpusSourceMetadata, CorpusSummary, ImageCorpus, TargetSample};
 use crate::dynamics::DynamicsSystem;
@@ -133,8 +134,21 @@ struct RunMetadata<'a> {
 }
 
 pub fn run(config: RunConfig) -> Result<()> {
+    let mut config = config;
     config.validate()?;
     let training_enabled = !config.render_only && !config.analysis.only;
+    if training_enabled {
+        match config.compute_backend {
+            ComputeBackend::OpenCl => bail!(
+                "OpenCL Phase 1 supports frozen render-only and analysis-only paths; training remains CPU"
+            ),
+            ComputeBackend::Auto => {
+                eprintln!("OPENCL auto: training remains on CPU in Phase 1");
+                config.compute_backend = ComputeBackend::Cpu;
+            }
+            ComputeBackend::Cpu => {}
+        }
+    }
     install_interrupt_handler()?;
     let available_threads = std::thread::available_parallelism()
         .map(|count| count.get())
@@ -202,6 +216,9 @@ pub fn run(config: RunConfig) -> Result<()> {
     } else {
         (None, false, CheckpointLoadReport::default())
     };
+    if let Some(info) = renderer.prepare_inference_backend()? {
+        eprintln!("OPENCL device: {info}");
+    }
     let loaded_optimizer_tensors =
         checkpoint_load.optimizer_moments_preserved + checkpoint_load.optimizer_moments_new;
     if checkpoint_load.recovered_previous {

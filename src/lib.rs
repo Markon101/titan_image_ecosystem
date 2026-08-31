@@ -11,6 +11,8 @@ pub mod flow;
 pub mod interface;
 pub mod metrics;
 pub mod objectives;
+#[cfg(feature = "opencl")]
+pub mod opencl;
 pub mod optimizer;
 pub mod persistence;
 pub mod probe;
@@ -21,7 +23,8 @@ pub mod tensor_ops;
 pub mod terminal;
 
 pub use config::{
-    BoundaryMode, ConditioningMode, Integrator, MorphDepthMode, ObjectiveMode, OptimizerKind,
-    PhoneProfile, ResearchPreset, RunConfig, StylePreset, TerminalMode, TrainingMode,
+    BoundaryMode, ComputeBackend, ConditioningMode, Integrator, MorphDepthMode, ObjectiveMode,
+    OptimizerKind, PhoneProfile, ResearchPreset, RunConfig, StylePreset, TerminalMode,
+    TrainingMode,
 };
 pub use engine::run;

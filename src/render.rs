@@ -1,4 +1,4 @@
-use crate::config::{RunConfig, StylePreset};
+use crate::config::{ComputeBackend, RunConfig, StylePreset};
 use crate::tensor_ops::{
     broadcast_vector, coordinate_features, coordinate_features_window, periodic_shift,
     pixelwise_linear_mode, smooth_limit, PeriodicUpsampler,
@@ -8,6 +8,15 @@ use candle_core::{Device, Tensor, D};
 use candle_nn::{Init, Linear, VarBuilder};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "opencl")]
+use std::sync::Mutex;
+
+#[cfg(feature = "opencl")]
+struct OpenClSlot {
+    attempted: bool,
+    renderer: Option<crate::opencl::OpenClMlp>,
+    failure: Option<String>,
+}
 
 pub struct ImplicitRenderer {
     input: Linear,
@@ -22,6 +31,9 @@ pub struct ImplicitRenderer {
     chroma: f32,
     gamma: f64,
     style: StylePreset,
+    compute_backend: ComputeBackend,
+    #[cfg(feature = "opencl")]
+    opencl: Mutex<OpenClSlot>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
@@ -193,6 +205,13 @@ impl ImplicitRenderer {
             chroma: config.chroma,
             gamma: config.gamma as f64,
             style: config.style,
+            compute_backend: config.compute_backend,
+            #[cfg(feature = "opencl")]
+            opencl: Mutex::new(OpenClSlot {
+                attempted: false,
+                renderer: None,
+                failure: None,
+            }),
             default_emergence_strength: config.reconstruction.emergence_strength,
             emergent_limit: config.reconstruction.emergent_limit,
             emergence_low_budget: config.reconstruction.emergence_low_budget,
@@ -200,6 +219,103 @@ impl ImplicitRenderer {
         })
     }
 
+    pub fn prepare_inference_backend(&self) -> Result<Option<String>> {
+        if self.compute_backend == ComputeBackend::Cpu {
+            return Ok(None);
+        }
+        #[cfg(not(feature = "opencl"))]
+        {
+            match self.compute_backend {
+                ComputeBackend::OpenCl => {
+                    anyhow::bail!("--compute-backend opencl requires cargo build --features opencl")
+                }
+                ComputeBackend::Auto => {
+                    eprintln!("OPENCL fallback: binary built without opencl feature");
+                    Ok(None)
+                }
+                ComputeBackend::Cpu => Ok(None),
+            }
+        }
+        #[cfg(feature = "opencl")]
+        {
+            let mut slot = self.opencl.lock().expect("OpenCL renderer mutex poisoned");
+            self.initialize_opencl(&mut slot)?;
+            Ok(slot
+                .renderer
+                .as_ref()
+                .map(|renderer| renderer.info.to_string()))
+        }
+    }
+
+    #[cfg(feature = "opencl")]
+    fn initialize_opencl(&self, slot: &mut OpenClSlot) -> Result<()> {
+        if slot.attempted {
+            if self.compute_backend == ComputeBackend::OpenCl {
+                if let Some(message) = &slot.failure {
+                    anyhow::bail!("OpenCL initialization failed: {message}");
+                }
+            }
+            return Ok(());
+        }
+        slot.attempted = true;
+        let result = self
+            .opencl_layers()
+            .and_then(|layers| crate::opencl::OpenClMlp::new(&layers, self.blocks.len()));
+        match result {
+            Ok(renderer) => slot.renderer = Some(renderer),
+            Err(error) if self.compute_backend == ComputeBackend::Auto => {
+                let message = format!("{error:#}");
+                eprintln!("OPENCL fallback: {message}");
+                slot.failure = Some(message);
+            }
+            Err(error) => {
+                slot.failure = Some(format!("{error:#}"));
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "opencl")]
+    fn opencl_layers(&self) -> Result<Vec<crate::opencl::LinearData>> {
+        let mut layers = Vec::with_capacity(self.blocks.len() + 3);
+        layers.push(linear_data(&self.input)?);
+        for block in &self.blocks {
+            layers.push(linear_data(block)?);
+        }
+        layers.push(linear_data(&self.grounded_head)?);
+        layers.push(linear_data(&self.emergent_head)?);
+        Ok(layers)
+    }
+
+    fn opencl_heads(
+        &self,
+        features: &Tensor,
+        resolution: usize,
+    ) -> Result<Option<(Tensor, Tensor)>> {
+        if self.compute_backend == ComputeBackend::Cpu {
+            return Ok(None);
+        }
+        #[cfg(not(feature = "opencl"))]
+        {
+            let _ = (features, resolution);
+            self.prepare_inference_backend()?;
+            Ok(None)
+        }
+        #[cfg(feature = "opencl")]
+        {
+            let mut slot = self.opencl.lock().expect("OpenCL renderer mutex poisoned");
+            self.initialize_opencl(&mut slot)?;
+            let Some(renderer) = slot.renderer.as_ref() else {
+                return Ok(None);
+            };
+            let values = features.flatten_all()?.to_vec1::<f32>()?;
+            let output = renderer.run(&values, resolution * resolution)?;
+            let tensor =
+                Tensor::from_vec(output, (1, 6, resolution, resolution), features.device())?;
+            Ok(Some((tensor.narrow(1, 0, 3)?, tensor.narrow(1, 3, 3)?)))
+        }
+    }
     pub fn render(
         &self,
         micro: &Tensor,
@@ -281,13 +397,25 @@ impl ImplicitRenderer {
             ],
             1,
         )?;
-        let mut hidden = swish(&pixelwise_linear_mode(&features, &self.input, tracked)?)?;
-        for block in &self.blocks {
-            let residual = swish(&pixelwise_linear_mode(&hidden, block, tracked)?)?;
-            hidden = hidden.add(&residual.affine(0.5, 0.0)?)?;
-        }
-        let grounded_learned = pixelwise_linear_mode(&hidden, &self.grounded_head, tracked)?;
-        let emergent_raw = pixelwise_linear_mode(&hidden, &self.emergent_head, tracked)?
+        let accelerated = if tracked {
+            None
+        } else {
+            self.opencl_heads(&features, plan.resolution)?
+        };
+        let (grounded_learned, emergent_logits) = if let Some(heads) = accelerated {
+            heads
+        } else {
+            let mut hidden = swish(&pixelwise_linear_mode(&features, &self.input, tracked)?)?;
+            for block in &self.blocks {
+                let residual = swish(&pixelwise_linear_mode(&hidden, block, tracked)?)?;
+                hidden = hidden.add(&residual.affine(0.5, 0.0)?)?;
+            }
+            (
+                pixelwise_linear_mode(&hidden, &self.grounded_head, tracked)?,
+                pixelwise_linear_mode(&hidden, &self.emergent_head, tracked)?,
+            )
+        };
+        let emergent_raw = emergent_logits
             .tanh()?
             .affine(self.emergent_limit as f64, 0.0)?;
         // A bounded, parameter-free path makes the actual organism observable
@@ -474,6 +602,23 @@ fn lab_to_image(
         .powf(1.0 / gamma)?
         .clamp(0.0f32, 1.0f32)?;
     Ok((image, gamut_excess))
+}
+
+#[cfg(feature = "opencl")]
+fn linear_data(linear: &Linear) -> Result<crate::opencl::LinearData> {
+    let (output, input) = linear.weight().dims2()?;
+    let weight = linear.weight().flatten_all()?.to_vec1::<f32>()?;
+    let bias = linear
+        .bias()
+        .context("OpenCL renderer requires linear biases")?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    Ok(crate::opencl::LinearData {
+        input,
+        output,
+        weight,
+        bias,
+    })
 }
 
 fn zero_linear(input: usize, output: usize, vb: VarBuilder<'_>) -> Result<Linear> {
@@ -841,6 +986,137 @@ mod tests {
         assert_eq!(micro.dims4()?, (1, 12, 32, 32));
         assert_eq!(macro_field.dims4()?, (1, 12, 32, 32));
         assert_eq!(plan.view, view);
+        Ok(())
+    }
+
+    #[cfg(feature = "opencl")]
+    #[test]
+    fn opencl_renderer_matches_cpu() -> Result<()> {
+        if std::env::var_os("TITAN_OPENCL_TEST").is_none() {
+            return Ok(());
+        }
+        let base = RunConfig {
+            micro_size: 24,
+            macro_size: 12,
+            channels: 12,
+            genome_dim: 4,
+            render_hidden: 32,
+            render_blocks: 2,
+            coord_bands: 2,
+            train_resolution: 24,
+            output_resolution: 24,
+            ..RunConfig::default()
+        };
+        let vars = candle_nn::VarMap::new();
+        let cpu = ImplicitRenderer::new(
+            &base,
+            candle_nn::VarBuilder::from_varmap(&vars, DType::F32, &Device::Cpu).pp("renderer"),
+        )?;
+        let mut gpu_config = base.clone();
+        gpu_config.compute_backend = ComputeBackend::OpenCl;
+        let gpu = ImplicitRenderer::new(
+            &gpu_config,
+            candle_nn::VarBuilder::from_varmap(&vars, DType::F32, &Device::Cpu).pp("renderer"),
+        )?;
+        {
+            let data = vars.data().lock().expect("VarMap mutex poisoned");
+            for (name, variable) in data.iter() {
+                let values = (0..variable.elem_count())
+                    .map(|index| ((index as f32 * 0.017 + name.len() as f32).sin()) * 0.04)
+                    .collect::<Vec<_>>();
+                variable.set(&Tensor::from_vec(
+                    values,
+                    variable.shape().clone(),
+                    &Device::Cpu,
+                )?)?;
+            }
+        }
+        let plan = RenderPlan::new(&base, 24, &Device::Cpu)?;
+        let micro_values = (0..12 * 24 * 24)
+            .map(|i| (i as f32 * 0.013).sin() * 0.3)
+            .collect::<Vec<_>>();
+        let macro_values = (0..12 * 12 * 12)
+            .map(|i| (i as f32 * 0.019).cos() * 0.2)
+            .collect::<Vec<_>>();
+        let micro = Tensor::from_vec(micro_values, (1, 12, 24, 24), &Device::Cpu)?;
+        let macro_field = Tensor::from_vec(macro_values, (1, 12, 12, 12), &Device::Cpu)?;
+        let genome = Tensor::new(&[0.1f32, -0.2, 0.3, -0.4], &Device::Cpu)?;
+        let cpu = cpu.render(&micro, &macro_field, &genome, &plan, false)?;
+        let info = gpu
+            .prepare_inference_backend()?
+            .context("OpenCL did not initialize")?;
+        let gpu = gpu.render(&micro, &macro_field, &genome, &plan, false)?;
+        let difference = gpu.image.sub(&cpu.image)?.abs()?;
+        let max_abs = difference.max_all()?.to_scalar::<f32>()?;
+        let mean_abs = difference.mean_all()?.to_scalar::<f32>()?;
+        let rms = difference.sqr()?.mean_all()?.sqrt()?.to_scalar::<f32>()?;
+        eprintln!(
+            "OPENCL parity | {info} | max_abs={max_abs:.8} mean_abs={mean_abs:.8} rms={rms:.8}"
+        );
+        assert!(max_abs <= 2e-4, "OpenCL max abs drift {max_abs}");
+        assert!(mean_abs <= 2e-5, "OpenCL mean abs drift {mean_abs}");
+        Ok(())
+    }
+
+    #[cfg(feature = "opencl")]
+    #[test]
+    fn opencl_checkpoint_renderer_parity_and_benchmark() -> Result<()> {
+        let Some(model_path) = std::env::var_os("TITAN_OPENCL_CHECKPOINT_MODEL") else {
+            return Ok(());
+        };
+        let world_path = std::env::var_os("TITAN_OPENCL_CHECKPOINT_WORLD")
+            .context("TITAN_OPENCL_CHECKPOINT_WORLD is required")?;
+        let base = RunConfig {
+            output_resolution: 384,
+            snapshot_resolution: 384,
+            ..RunConfig::default()
+        };
+        let vars = candle_nn::VarMap::new();
+        let cpu = ImplicitRenderer::new(
+            &base,
+            candle_nn::VarBuilder::from_varmap(&vars, DType::F32, &Device::Cpu).pp("renderer"),
+        )?;
+        let mut gpu_config = base.clone();
+        gpu_config.compute_backend = ComputeBackend::OpenCl;
+        let gpu = ImplicitRenderer::new(
+            &gpu_config,
+            candle_nn::VarBuilder::from_varmap(&vars, DType::F32, &Device::Cpu).pp("renderer"),
+        )?;
+        let saved = candle_core::safetensors::load(model_path, &Device::Cpu)?;
+        {
+            let data = vars.data().lock().expect("VarMap mutex poisoned");
+            for (name, variable) in data.iter() {
+                variable.set(
+                    saved
+                        .get(name)
+                        .with_context(|| format!("checkpoint missing {name}"))?,
+                )?;
+            }
+        }
+        let world = candle_core::safetensors::load(world_path, &Device::Cpu)?;
+        let micro = world.get("world.micro").context("world missing micro")?;
+        let macro_field = world.get("world.macro").context("world missing macro")?;
+        let genome = Tensor::zeros(base.genome_dim, DType::F32, &Device::Cpu)?;
+        let info = gpu
+            .prepare_inference_backend()?
+            .context("OpenCL did not initialize")?;
+        for resolution in [192usize, 384] {
+            let plan = RenderPlan::new(&base, resolution, &Device::Cpu)?;
+            let started = std::time::Instant::now();
+            let cpu_output = cpu.render(micro, macro_field, &genome, &plan, false)?;
+            let cpu_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let started = std::time::Instant::now();
+            let gpu_output = gpu.render(micro, macro_field, &genome, &plan, false)?;
+            let gpu_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let difference = gpu_output.image.sub(&cpu_output.image)?.abs()?;
+            let max_abs = difference.max_all()?.to_scalar::<f32>()?;
+            let mean_abs = difference.mean_all()?.to_scalar::<f32>()?;
+            let rms = difference.sqr()?.mean_all()?.sqrt()?.to_scalar::<f32>()?;
+            eprintln!("OPENCL checkpoint benchmark | {resolution}px | cpu_ms={cpu_ms:.3} gpu_ms={gpu_ms:.3} speedup={:.3}x max_abs={max_abs:.8} mean_abs={mean_abs:.8} rms={rms:.8}", cpu_ms / gpu_ms);
+            assert!(max_abs <= 5e-4, "OpenCL max abs drift {max_abs}");
+            assert!(mean_abs <= 5e-5, "OpenCL mean abs drift {mean_abs}");
+        }
+        eprintln!("OPENCL checkpoint device | {info}");
         Ok(())
     }
 }
