@@ -219,6 +219,11 @@ pub fn run(config: RunConfig) -> Result<()> {
     if let Some(info) = renderer.prepare_inference_backend()? {
         eprintln!("OPENCL device: {info}");
     }
+    if config.analysis_requested() || (config.render_only && config.gallery > 0) {
+        if let Some(info) = dynamics.prepare_inference_backend()? {
+            eprintln!("OPENCL dynamics: {info}");
+        }
+    }
     let loaded_optimizer_tensors =
         checkpoint_load.optimizer_moments_preserved + checkpoint_load.optimizer_moments_new;
     if checkpoint_load.recovered_previous {

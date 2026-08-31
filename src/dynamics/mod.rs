@@ -4,9 +4,7 @@ mod operators;
 use crate::config::{Integrator, RunConfig};
 use crate::interface::{InterfaceOutput, RecurrentInterface};
 use crate::state::WorldState;
-use crate::tensor_ops::{
-    broadcast_vector, mean_abs, pixelwise_linear_mode, smooth_limit, zeros, PeriodicUpsampler,
-};
+use crate::tensor_ops::{mean_abs, pixelwise_linear_mode, smooth_limit, zeros, PeriodicUpsampler};
 use anyhow::{bail, Result};
 use candle_core::{Device, Tensor};
 use candle_nn::{Linear, VarBuilder};
@@ -102,6 +100,22 @@ impl DynamicsSystem {
             config: config.clone(),
             seed: config.seed,
         })
+    }
+
+    pub fn prepare_inference_backend(&self) -> Result<Option<String>> {
+        if self.config.compute_backend == crate::config::ComputeBackend::Cpu {
+            return Ok(None);
+        }
+        let micro = self.micro_ca.prepare_inference_backend()?;
+        let macro_field = self.macro_ca.prepare_inference_backend()?;
+        if micro && macro_field {
+            Ok(Some(format!(
+                "NCA FP32 {}px + {}px",
+                self.config.micro_size, self.config.macro_size
+            )))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Advance one world step. The local NCA handles dense spatial refinement;
@@ -308,13 +322,11 @@ impl DynamicsSystem {
             FieldScale::Micro => (&self.micro_ca, &self.physical.micro_fields),
             FieldScale::Macro => (&self.macro_ca, &self.physical.macro_fields),
         };
-        let (_, _, h, w) = field.dims4()?;
-        let genome_field = broadcast_vector(genome, h, w)?;
         let derivative = match self.config.integrator {
             Integrator::Euler => self.derivative(
                 field,
                 macro_context,
-                &genome_field,
+                genome,
                 interface_bias,
                 step,
                 ca,
@@ -326,7 +338,7 @@ impl DynamicsSystem {
                 let k1 = self.derivative(
                     field,
                     macro_context,
-                    &genome_field,
+                    genome,
                     interface_bias,
                     step,
                     ca,
@@ -338,7 +350,7 @@ impl DynamicsSystem {
                 self.derivative(
                     &midpoint,
                     macro_context,
-                    &genome_field,
+                    genome,
                     interface_bias,
                     step,
                     ca,
@@ -357,7 +369,7 @@ impl DynamicsSystem {
         &self,
         field: &Tensor,
         macro_context: &Tensor,
-        genome_field: &Tensor,
+        genome: &Tensor,
         interface_bias: &Tensor,
         step: u64,
         ca: &NeuralCa,
@@ -369,7 +381,7 @@ impl DynamicsSystem {
         let local = if ablation.disable_nca {
             zeros(channels, height, width, field.device())?
         } else {
-            ca.delta(field, macro_context, genome_field, self.seed, step, tracked)?
+            ca.delta(field, macro_context, genome, self.seed, step, tracked)?
         };
         let mut delta = local.add(interface_bias)?;
         if self.config.state_leak > 0.0 {
@@ -396,6 +408,8 @@ impl DynamicsSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "opencl")]
+    use anyhow::Context;
     use candle_core::DType;
     use candle_nn::{VarBuilder, VarMap};
 
@@ -561,6 +575,325 @@ mod tests {
             first.world.micro.flatten_all()?.to_vec1::<f32>()?,
             second.world.micro.flatten_all()?.to_vec1::<f32>()?
         );
+        Ok(())
+    }
+
+    #[cfg(feature = "opencl")]
+    #[test]
+    fn opencl_pure_nca_rollout_matches_cpu() -> Result<()> {
+        if std::env::var_os("TITAN_OPENCL_TEST").is_none() {
+            return Ok(());
+        }
+        let mut cpu_config = reference_test_config();
+        cpu_config.compute_backend = crate::config::ComputeBackend::Cpu;
+        cpu_config.macro_update_every = 2;
+        cpu_config.episode_steps = 64;
+        let vars = VarMap::new();
+        let cpu = DynamicsSystem::new(
+            &cpu_config,
+            VarBuilder::from_varmap(&vars, DType::F32, &Device::Cpu).pp("dynamics"),
+            &Device::Cpu,
+        )?;
+        let mut gpu_config = cpu_config.clone();
+        gpu_config.compute_backend = crate::config::ComputeBackend::OpenCl;
+        let gpu = DynamicsSystem::new(
+            &gpu_config,
+            VarBuilder::from_varmap(&vars, DType::F32, &Device::Cpu).pp("dynamics"),
+            &Device::Cpu,
+        )?;
+        {
+            let data = vars.data().lock().expect("VarMap mutex poisoned");
+            for (name, variable) in data.iter() {
+                let values = (0..variable.elem_count())
+                    .map(|index| {
+                        let wave = (index as f32 * 0.009 + name.len() as f32).sin();
+                        if name.contains("norm.weight") {
+                            1.0 + wave * 0.01
+                        } else if name.ends_with(".weight") {
+                            wave * 0.025
+                        } else {
+                            wave * 0.005
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                variable.set(&Tensor::from_vec(
+                    values,
+                    variable.shape().clone(),
+                    &Device::Cpu,
+                )?)?;
+            }
+        }
+        let initial = WorldState::fresh(&cpu_config, 0x5151, &Device::Cpu)?;
+        let genome = Tensor::new(&[0.2f32, -0.1, 0.35, -0.25], &Device::Cpu)?;
+        let reference_micro = Tensor::from_vec(
+            (0..3 * 24 * 24)
+                .map(|index| (index as f32 * 0.007).sin() * 0.4)
+                .collect::<Vec<_>>(),
+            (1, 3, 24, 24),
+            &Device::Cpu,
+        )?;
+        let reference_macro = Tensor::from_vec(
+            (0..3 * 12 * 12)
+                .map(|index| (index as f32 * 0.013).cos() * 0.3)
+                .collect::<Vec<_>>(),
+            (1, 3, 12, 12),
+            &Device::Cpu,
+        )?;
+        let mut cpu_world = initial.clone();
+        let mut gpu_world = initial;
+        let cpu_started = std::time::Instant::now();
+        let mut cpu_worlds = Vec::new();
+        for age in 1..=32 {
+            cpu_world = cpu
+                .step(
+                    &cpu_world,
+                    &genome,
+                    Some(&reference_micro),
+                    Some(&reference_macro),
+                    0.65,
+                    false,
+                )?
+                .world;
+            if [1, 8, 32].contains(&age) {
+                cpu_worlds.push(cpu_world.clone());
+            }
+        }
+        let cpu_ms = cpu_started.elapsed().as_secs_f64() * 1000.0;
+        let gpu_started = std::time::Instant::now();
+        let mut comparison_index = 0;
+        for age in 1..=32 {
+            gpu_world = gpu
+                .step(
+                    &gpu_world,
+                    &genome,
+                    Some(&reference_micro),
+                    Some(&reference_macro),
+                    0.65,
+                    false,
+                )?
+                .world;
+            if ![1, 8, 32].contains(&age) {
+                continue;
+            }
+            let cpu_world = &cpu_worlds[comparison_index];
+            comparison_index += 1;
+            let micro = gpu_world.micro.sub(&cpu_world.micro)?.abs()?;
+            let macro_field = gpu_world.macro_field.sub(&cpu_world.macro_field)?.abs()?;
+            let memory = gpu_world.memory.sub(&cpu_world.memory)?.abs()?;
+            let max_abs = micro
+                .max_all()?
+                .to_scalar::<f32>()?
+                .max(macro_field.max_all()?.to_scalar::<f32>()?)
+                .max(memory.max_all()?.to_scalar::<f32>()?);
+            let mean_abs = (micro.mean_all()?.to_scalar::<f32>()?
+                + macro_field.mean_all()?.to_scalar::<f32>()?
+                + memory.mean_all()?.to_scalar::<f32>()?)
+                / 3.0;
+            eprintln!(
+                "OPENCL dynamics parity | age={age} max_abs={max_abs:.8} mean_abs={mean_abs:.8}"
+            );
+            let max_tolerance = if age == 32 { 2e-3 } else { 5e-4 };
+            assert!(max_abs <= max_tolerance, "age {age} drift {max_abs}");
+            assert!(mean_abs <= 2e-4, "age {age} mean drift {mean_abs}");
+        }
+        let gpu_ms = gpu_started.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "OPENCL dynamics benchmark small 32-step | cpu_ms={cpu_ms:.3} gpu_ms={gpu_ms:.3} speedup={:.3}x",
+            cpu_ms / gpu_ms
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "opencl")]
+    #[test]
+    fn opencl_checkpoint_pure_nca_rollout_and_render() -> Result<()> {
+        let Some(metadata_path) = std::env::var_os("TITAN_OPENCL_DYNAMICS_METADATA") else {
+            return Ok(());
+        };
+        let model_path = std::env::var_os("TITAN_OPENCL_DYNAMICS_MODEL")
+            .context("TITAN_OPENCL_DYNAMICS_MODEL is required")?;
+        let world_path = std::env::var_os("TITAN_OPENCL_DYNAMICS_WORLD")
+            .context("TITAN_OPENCL_DYNAMICS_WORLD is required")?;
+        let metadata: serde_json::Value = serde_json::from_slice(&std::fs::read(metadata_path)?)?;
+        let mut cpu_config: RunConfig = serde_json::from_value(metadata["config"].clone())?;
+        cpu_config.compute_backend = crate::config::ComputeBackend::Cpu;
+        cpu_config.analysis.emergence_gallery = false;
+        let vars = VarMap::new();
+        let cpu = DynamicsSystem::new(
+            &cpu_config,
+            VarBuilder::from_varmap(&vars, DType::F32, &Device::Cpu).pp("dynamics"),
+            &Device::Cpu,
+        )?;
+        let cpu_renderer = crate::render::ImplicitRenderer::new(
+            &cpu_config,
+            VarBuilder::from_varmap(&vars, DType::F32, &Device::Cpu).pp("renderer"),
+        )?;
+        let mut gpu_config = cpu_config.clone();
+        gpu_config.compute_backend = crate::config::ComputeBackend::OpenCl;
+        let gpu = DynamicsSystem::new(
+            &gpu_config,
+            VarBuilder::from_varmap(&vars, DType::F32, &Device::Cpu).pp("dynamics"),
+            &Device::Cpu,
+        )?;
+        let gpu_renderer = crate::render::ImplicitRenderer::new(
+            &gpu_config,
+            VarBuilder::from_varmap(&vars, DType::F32, &Device::Cpu).pp("renderer"),
+        )?;
+        let saved = candle_core::safetensors::load(model_path, &Device::Cpu)?;
+        {
+            let data = vars.data().lock().expect("VarMap mutex poisoned");
+            for (name, variable) in data.iter() {
+                variable.set(
+                    saved
+                        .get(name)
+                        .with_context(|| format!("checkpoint missing {name}"))?,
+                )?;
+            }
+        }
+        let saved_world = candle_core::safetensors::load(world_path, &Device::Cpu)?;
+        let scalar = |name: &str| -> Result<u64> {
+            Ok(saved_world
+                .get(name)
+                .with_context(|| format!("world missing {name}"))?
+                .to_scalar::<i64>()? as u64)
+        };
+        let birth_generations = saved_world
+            .get("world.morph_birth_generations")
+            .context("world missing morph birth generations")?
+            .to_vec1::<i64>()?
+            .into_iter()
+            .map(|value| value as u64)
+            .collect();
+        let initial = WorldState {
+            micro: saved_world
+                .get("world.micro")
+                .context("world missing micro")?
+                .clone(),
+            macro_field: saved_world
+                .get("world.macro")
+                .context("world missing macro")?
+                .clone(),
+            memory: saved_world
+                .get("world.memory")
+                .context("world missing memory")?
+                .clone(),
+            step: scalar("world.step")?,
+            age: scalar("world.age")?,
+            episode: scalar("world.episode")?,
+            target_index: scalar("world.target_index")? as usize,
+            morph_active_depth: scalar("world.morph_active_depth")? as usize,
+            morph_generation: scalar("world.morph_generation")?,
+            morph_birth_generations: birth_generations,
+        };
+        let mut corpus = crate::corpus::ImageCorpus::new(&cpu_config, &Device::Cpu)?;
+        let sample = corpus.sample_index(initial.target_index, &Device::Cpu)?;
+        let fidelity = 0.65;
+        let mut warm_world = initial.clone();
+        warm_world.age -= warm_world.age % cpu_config.macro_update_every as u64;
+        let _ = cpu.step(
+            &warm_world,
+            &sample.genome_tensor,
+            Some(&sample.reference_micro),
+            Some(&sample.reference_macro),
+            fidelity,
+            false,
+        )?;
+        let _ = gpu.step(
+            &warm_world,
+            &sample.genome_tensor,
+            Some(&sample.reference_micro),
+            Some(&sample.reference_macro),
+            fidelity,
+            false,
+        )?;
+        gpu_renderer
+            .prepare_inference_backend()?
+            .context("OpenCL renderer did not initialize")?;
+
+        let mut cpu_world = initial.clone();
+        let cpu_started = std::time::Instant::now();
+        let mut cpu_worlds = Vec::new();
+        for relative_age in 1..=32 {
+            cpu_world = cpu
+                .step(
+                    &cpu_world,
+                    &sample.genome_tensor,
+                    Some(&sample.reference_micro),
+                    Some(&sample.reference_macro),
+                    fidelity,
+                    false,
+                )?
+                .world;
+            if [1, 8, 32].contains(&relative_age) {
+                cpu_worlds.push(cpu_world.clone());
+            }
+        }
+        let cpu_ms = cpu_started.elapsed().as_secs_f64() * 1000.0;
+        let mut gpu_world = initial;
+        let gpu_started = std::time::Instant::now();
+        let mut comparison_index = 0;
+        for relative_age in 1..=32 {
+            gpu_world = gpu
+                .step(
+                    &gpu_world,
+                    &sample.genome_tensor,
+                    Some(&sample.reference_micro),
+                    Some(&sample.reference_macro),
+                    fidelity,
+                    false,
+                )?
+                .world;
+            if ![1, 8, 32].contains(&relative_age) {
+                continue;
+            }
+            let cpu_world = &cpu_worlds[comparison_index];
+            comparison_index += 1;
+            let micro = gpu_world.micro.sub(&cpu_world.micro)?.abs()?;
+            let macro_field = gpu_world.macro_field.sub(&cpu_world.macro_field)?.abs()?;
+            let memory = gpu_world.memory.sub(&cpu_world.memory)?.abs()?;
+            let max_abs = micro
+                .max_all()?
+                .to_scalar::<f32>()?
+                .max(macro_field.max_all()?.to_scalar::<f32>()?)
+                .max(memory.max_all()?.to_scalar::<f32>()?);
+            let mean_abs = (micro.mean_all()?.to_scalar::<f32>()?
+                + macro_field.mean_all()?.to_scalar::<f32>()?
+                + memory.mean_all()?.to_scalar::<f32>()?)
+                / 3.0;
+            eprintln!("OPENCL checkpoint dynamics | age=+{relative_age} max_abs={max_abs:.8} mean_abs={mean_abs:.8}");
+            assert!(max_abs <= 5e-3, "age +{relative_age} drift {max_abs}");
+            assert!(
+                mean_abs <= 5e-4,
+                "age +{relative_age} mean drift {mean_abs}"
+            );
+        }
+        let gpu_ms = gpu_started.elapsed().as_secs_f64() * 1000.0;
+        let plan = crate::render::RenderPlan::new(&cpu_config, 192, &Device::Cpu)?;
+        let cpu_render = cpu_renderer.render(
+            &cpu_world.micro,
+            &cpu_world.macro_field,
+            &sample.genome_tensor,
+            &plan,
+            false,
+        )?;
+        let gpu_render = gpu_renderer.render(
+            &gpu_world.micro,
+            &gpu_world.macro_field,
+            &sample.genome_tensor,
+            &plan,
+            false,
+        )?;
+        let render_difference = gpu_render.image.sub(&cpu_render.image)?.abs()?;
+        let render_max = render_difference.max_all()?.to_scalar::<f32>()?;
+        let render_mean = render_difference.mean_all()?.to_scalar::<f32>()?;
+        let render_rms = render_difference
+            .sqr()?
+            .mean_all()?
+            .sqrt()?
+            .to_scalar::<f32>()?;
+        eprintln!("OPENCL checkpoint dynamics benchmark | steps=32 cpu_ms={cpu_ms:.3} gpu_ms={gpu_ms:.3} speedup={:.3}x render_max={render_max:.8} render_mean={render_mean:.8} render_rms={render_rms:.8}", cpu_ms / gpu_ms);
+        assert!(render_max <= 5e-3, "render drift {render_max}");
+        assert!(render_mean <= 5e-4, "render mean drift {render_mean}");
         Ok(())
     }
 }
