@@ -795,10 +795,12 @@ pub fn run(config: RunConfig) -> Result<()> {
         phase.backward += optimizer_stats.backward_seconds;
         phase.optimizer += optimizer_stats.step_seconds;
         if config.compute_backend == ComputeBackend::OpenCl {
-            anyhow::ensure!(
-                dynamics.refresh_opencl_weights()?,
-                "OpenCL NCA weights could not be refreshed"
-            );
+            if train_core {
+                anyhow::ensure!(
+                    dynamics.refresh_opencl_weights()?,
+                    "OpenCL NCA weights could not be refreshed"
+                );
+            }
             anyhow::ensure!(
                 renderer.refresh_opencl_weights()?,
                 "OpenCL renderer weights could not be refreshed"

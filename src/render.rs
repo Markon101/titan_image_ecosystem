@@ -337,7 +337,6 @@ impl ImplicitRenderer {
                 self.compute_backend == ComputeBackend::OpenCl,
                 "OpenCL decoder training requires --compute-backend opencl"
             );
-            let layers = self.opencl_layers()?;
             let values = features.flatten_all()?.to_vec1::<f32>()?;
             let mut slot = self.opencl.lock().expect("OpenCL renderer mutex poisoned");
             self.initialize_opencl(&mut slot)?;
@@ -345,7 +344,7 @@ impl ImplicitRenderer {
                 .renderer
                 .as_mut()
                 .context("OpenCL renderer did not initialize")?;
-            let output = renderer.training_forward(&values, resolution * resolution, &layers)?;
+            let output = renderer.training_forward(&values, resolution * resolution)?;
             let boundary =
                 Var::from_vec(output, (1, 6, resolution, resolution), features.device())?;
             let grounded = boundary.narrow(1, 0, 3)?;

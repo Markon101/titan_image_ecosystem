@@ -1,6 +1,6 @@
 # Titan Image OpenCL notes
 
-Status: Phase 3A hybrid-training MVP. CPU/Candle remains default and numerical oracle. Checkpoint tensor names, schema v9, signatures, schedules, losses, clipping, AdamW state, and serialization remain unchanged.
+Status: Phase 3A hybrid-training optimization. CPU/Candle remains default and numerical oracle. Checkpoint tensor names, schema v9, signatures, schedules, losses, clipping, AdamW state, and serialization remain unchanged.
 
 ## Implemented
 
@@ -9,7 +9,7 @@ Status: Phase 3A hybrid-training MVP. CPU/Candle remains default and numerical o
 - Frozen render-only/analysis/probe renderer MLP on OpenCL FP32. Input features upload once; input layer, all residual blocks, and both output heads remain device-resident; six output channels download once. Weights upload once and remain resident.
 - Frozen FP32 micro and macro NCA forward path on OpenCL: toroidal two-ring perception, input/residual/output pointwise transforms, swish/tanh, deterministic clock mask, and NCA gain. Weights, clock masks, and resolution-sized work buffers remain resident.
 - CPU retains interface attention/GRU/MorphicStack, reference drives, integration/state projection, physical operators, renderer preprocessing/postprocessing, metrics, losses, PNG, scheduling, checkpoints, and full-core autograd windows.
-- Stage 3A explicit `opencl` training: detached decoder windows use OpenCL NCA forward, renderer forward, and manual renderer backward. Tiled FP32 weight-gradient kernels feed the unchanged clipping/AdamW optimizer. Full-core BPTT windows remain CPU/Candle. Cached NCA and renderer weights refresh after every optimizer update.
+- Stage 3A explicit `opencl` training: detached decoder windows use OpenCL NCA forward, renderer forward, and manual renderer backward. Training forward caches swish derivatives, so backward no longer recomputes every dense preactivation. Tiled FP32 gradients are written into packed model-wide buffers and returned with two ordered reads instead of two blocking reads per layer. The unchanged clipping/AdamW optimizer remains the numerical authority. Full-core BPTT windows remain CPU/Candle; NCA weights refresh only after full-core updates, while renderer weights refresh after every optimizer update.
 - `auto` training remains CPU. Missing OpenCL under `auto` falls back to CPU.
 - Device report: name/vendor/version/OpenCL C, compute units, workgroup size, global/max-allocation/local memory, FP16 extension.
 
@@ -19,7 +19,7 @@ CLBlast: no installed `libCLBlast`; available Rust binding is old. Custom Titan-
 
 Termux ICD requires `OCL_ICD_ASSUME_ICD_EXTENSION=1`: Qualcomm driver exposes `clIcdGetPlatformIDsKHR` but not global `clGetPlatformInfo`, so stock `ocl-icd` otherwise skips it.
 
-Detected: `QUALCOMM Adreno(TM) 830`; OpenCL 3.0; Qualcomm build `0800.64.7`; 12 compute units; max workgroup 1024; 5,556 MiB global; 1,024 MiB max allocation; 32 KiB local; native `cl_khr_fp16` (unused; FP32 only).
+Detected: `QUALCOMM Adreno(TM) 830`; OpenCL 3.0; Qualcomm build `0800.64.7`; 12 compute units; max workgroup 1024; 5,556 MiB global; 1,024 MiB max allocation; 32 KiB local; unified host/device memory; fine-grained buffer SVM but no fine-grained system SVM; native `cl_khr_fp16` with preferred/native half vector width 8. Titan remains FP32.
 
 Verified Termux exposure for this phone:
 
@@ -67,6 +67,24 @@ Uncontrolled background conditions: user was using other apps. Directional only;
 | saved c303 detached decoder window, 4 steps | 3438.550 ms | 2178.545 ms | 1.578x |
 
 The Stage 3 decoder-window timing excludes startup and final rendering; its surrounding process timing was invalidated by severe background load. The 768px process includes corpus startup, checkpoint loading, CPU feature/postprocessing, PNG encoding, and OpenCL program compilation. Renderer-only test initializes OpenCL before timing.
+
+Current 2026-09-01 spot checks after the Phase 3A optimization:
+
+| Workload | CPU | OpenCL | speedup | max drift |
+|---|---:|---:|---:|---:|
+| saved c81 renderer 192px | 883.248 ms | 281.411 ms | 3.139x | 8.9e-7 |
+| saved c81 renderer 384px | 2610.169 ms | 1144.664 ms | 2.280x | 9.5e-7 |
+| saved c282 Pure-NCA dynamics, 32 steps | 3824.082 ms | 2806.351 ms | 1.363x | state 8.0e-7; render 1.204e-5 |
+
+These spot checks validate current code and checkpoint parity; they are not an A/B attribution for the backward-only changes. The deterministic tiny decoder test improved from 4.36 to 16.06 displayed decoder steps/s in that run, but the workload is intentionally too small and noisy to treat as a production benchmark.
+
+## Bandwidth and mixed precision
+
+The stated 86 GB/s unified-memory bandwidth is a hardware roofline, not bandwidth currently demonstrated by Titan. OpenCL unified host memory does not make ordinary `cl_mem` buffers or explicit transfers disappear. This device exposes fine-grained *buffer* SVM, but SVM still requires SVM allocation and synchronization; it does not expose fine-grained *system* SVM. See the [OpenCL 3.0 API specification](https://registry.khronos.org/OpenCL/specs/3.0-unified/pdf/OpenCL_API.pdf).
+
+Current renderer and NCA kernels execute scalar per-output dot-product loops, cross the CPU/GPU boundary between major subsystems, and use an in-order queue. Their measured throughput is therefore limited first by arithmetic structure, recomputation, synchronization, and partial residency, not by saturating 86 GB/s. The Phase 3A patch removes redundant backward arithmetic and synchronization before adding precision risk. Queue profiling and an explicit bytes-per-kernel roofline measurement should precede any bandwidth-saturation claim.
+
+The CPU and OpenCL numerical paths remain FP32. The Cargo `+fp16` target feature only enables AArch64 half instructions; it does not convert Candle tensors or OpenCL buffers. A safe future AMP mode should use FP16 weights/activations for selected renderer and NCA transforms with explicit FP32 accumulation, while retaining FP32 recurrent world state, reductions/losses, master weights, optimizer moments, clipping, and serialization. It should include loss scaling and long-horizon drift/boundedness gates, following the FP32-master-weight pattern in [Mixed Precision Training](https://arxiv.org/abs/1710.03740) and the device rules in [`cl_khr_fp16`](https://registry.khronos.org/OpenCL/specs/unified/refpages/man/html/cl_khr_fp16.html). A blanket Candle F16 switch is not accepted because it would change recurrent accumulation semantics before a stable mixed-precision oracle exists.
 
 ## Build/run
 
@@ -138,4 +156,6 @@ Highest-value next tasks:
 
 1. Complete Phase 2 residency: port reference drives, interface attention/GRU/MorphicStack, macro upsampling, integration, and state projection; download only metrics/renders.
 2. Extend Stage 3 through one full-core BPTT window: NCA/interface backward plus state-gradient recurrence, retaining CPU clipping/AdamW oracle parity.
-3. Share one OpenCL context/queue, evaluate CLBlast for full-core GEMMs, then run foreground thermally stabilized 32/64/128-step training benchmarks.
+3. Share one OpenCL context/queue, add event profiling, and tune or replace scalar dense kernels with CLBlast/custom vectorized GEMM before drawing bandwidth conclusions.
+4. Add opt-in mixed precision under the FP32-master/state/optimizer policy above, gated by saved-checkpoint, two-window, 32/64/128-step, and long-horizon boundedness comparisons.
+5. Small follow-up: cache same-resolution inference buffers to remove repeated renderer buffer allocation.

@@ -11,6 +11,11 @@ use std::ptr;
 const SOURCE: &str = r#"
 inline float swish(float x) { return x / (1.0f + exp(-x)); }
 
+inline float swish_derivative(float x) {
+  float sigmoid = 1.0f / (1.0f + exp(-x));
+  return sigmoid + x * sigmoid * (1.0f - sigmoid);
+}
+
 kernel void input_layer(
     global const float *x, global const float *w, global const float *b,
     global float *y, uint pixels, uint inputs, uint outputs,
@@ -40,6 +45,38 @@ kernel void residual_layer(
   y[base + o] = x[base + o] + 0.5f * swish(sum);
 }
 
+kernel void input_layer_training(
+    global const float *x, global const float *w, global const float *b,
+    global float *y, global float *derivative,
+    uint pixels, uint inputs, uint outputs,
+    uint weight_offset, uint bias_offset) {
+  uint gid = get_global_id(0);
+  uint p = gid / outputs;
+  uint o = gid - p * outputs;
+  if (p >= pixels) return;
+  float sum = b[bias_offset + o];
+  uint row = weight_offset + o * inputs;
+  for (uint i = 0; i < inputs; ++i) sum += w[row + i] * x[i * pixels + p];
+  y[p * outputs + o] = swish(sum);
+  derivative[p * outputs + o] = swish_derivative(sum);
+}
+
+kernel void residual_layer_training(
+    global const float *x, global const float *w, global const float *b,
+    global float *y, global float *derivative,
+    uint pixels, uint width, uint weight_offset, uint bias_offset) {
+  uint gid = get_global_id(0);
+  uint p = gid / width;
+  uint o = gid - p * width;
+  if (p >= pixels) return;
+  uint base = p * width;
+  float sum = b[bias_offset + o];
+  uint row = weight_offset + o * width;
+  for (uint i = 0; i < width; ++i) sum += w[row + i] * x[base + i];
+  y[base + o] = x[base + o] + 0.5f * swish(sum);
+  derivative[base + o] = swish_derivative(sum);
+}
+
 kernel void output_heads(
     global const float *x, global const float *w, global const float *b,
     global float *y, uint pixels, uint width,
@@ -59,11 +96,6 @@ kernel void output_heads(
   y[lane * pixels + p] = sum;
 }
 
-inline float swish_derivative(float x) {
-  float sigmoid = 1.0f / (1.0f + exp(-x));
-  return sigmoid + x * sigmoid * (1.0f - sigmoid);
-}
-
 kernel void heads_input_grad(
     global const float *grad_heads, global const float *weights,
     global float *grad_hidden, uint pixels, uint width,
@@ -81,18 +113,14 @@ kernel void heads_input_grad(
 }
 
 kernel void residual_dz(
-    global const float *input, global const float *grad_output,
-    global const float *weights, global const float *biases, global float *dz,
-    uint pixels, uint width, uint weight_offset, uint bias_offset) {
+    global const float *derivative, global const float *grad_output,
+    global float *dz, uint pixels, uint width) {
   uint gid = get_global_id(0);
   uint p = gid / width;
   uint o = gid - p * width;
   if (p >= pixels) return;
   uint base = p * width;
-  uint row = weight_offset + o * width;
-  float z = biases[bias_offset + o];
-  for (uint i = 0; i < width; ++i) z += weights[row + i] * input[base + i];
-  dz[base + o] = grad_output[base + o] * 0.5f * swish_derivative(z);
+  dz[base + o] = grad_output[base + o] * 0.5f * derivative[base + o];
 }
 
 kernel void residual_input_grad(
@@ -111,22 +139,18 @@ kernel void residual_input_grad(
 }
 
 kernel void input_dz(
-    global const float *features, global const float *grad_output,
-    global const float *weights, global const float *biases, global float *dz,
-    uint pixels, uint inputs, uint outputs, uint weight_offset, uint bias_offset) {
+    global const float *derivative, global const float *grad_output,
+    global float *dz, uint pixels, uint outputs) {
   uint gid = get_global_id(0);
   uint p = gid / outputs;
   uint o = gid - p * outputs;
   if (p >= pixels) return;
-  uint row = weight_offset + o * inputs;
-  float z = biases[bias_offset + o];
-  for (uint i = 0; i < inputs; ++i) z += weights[row + i] * features[i * pixels + p];
-  dz[p * outputs + o] = grad_output[p * outputs + o] * swish_derivative(z);
+  dz[p * outputs + o] = grad_output[p * outputs + o] * derivative[p * outputs + o];
 }
 
 kernel void bias_grad_pixel(
     global const float *grad_output, global float *grad_bias,
-    uint pixels, uint outputs) {
+    uint pixels, uint outputs, uint destination_offset) {
   local float partial[64];
   uint o = get_group_id(0);
   uint lane = get_local_id(0);
@@ -139,12 +163,12 @@ kernel void bias_grad_pixel(
     if (lane < stride) partial[lane] += partial[lane + stride];
     barrier(CLK_LOCAL_MEM_FENCE);
   }
-  if (lane == 0 && o < outputs) grad_bias[o] = partial[0];
+  if (lane == 0 && o < outputs) grad_bias[destination_offset + o] = partial[0];
 }
 
 kernel void bias_grad_planar(
     global const float *grad_output, global float *grad_bias,
-    uint pixels, uint outputs, uint output_offset) {
+    uint pixels, uint outputs, uint output_offset, uint destination_offset) {
   local float partial[64];
   uint o = get_group_id(0);
   uint lane = get_local_id(0);
@@ -158,13 +182,14 @@ kernel void bias_grad_planar(
     if (lane < stride) partial[lane] += partial[lane + stride];
     barrier(CLK_LOCAL_MEM_FENCE);
   }
-  if (lane == 0 && o < outputs) grad_bias[o] = partial[0];
+  if (lane == 0 && o < outputs) grad_bias[destination_offset + o] = partial[0];
 }
 
 kernel void param_grad_tiled(
     global const float *input, global const float *grad_output,
     global float *grad_weight, uint pixels, uint inputs, uint outputs,
-    uint input_planar, uint output_planar, uint output_offset) {
+    uint input_planar, uint output_planar, uint output_offset,
+    uint destination_offset) {
   local float left[16][16];
   local float right[16][16];
   uint o = get_global_id(0);
@@ -189,7 +214,7 @@ kernel void param_grad_tiled(
     for (uint k = 0; k < 16; ++k) sum += left[local_o][k] * right[k][local_i];
     barrier(CLK_LOCAL_MEM_FENCE);
   }
-  if (o < outputs && i < inputs) grad_weight[o * inputs + i] = sum;
+  if (o < outputs && i < inputs) grad_weight[destination_offset + o * inputs + i] = sum;
 }
 "#;
 
@@ -244,6 +269,7 @@ struct OpenClTrainingBuffers {
     pixels: usize,
     features: Buffer<cl_float>,
     activations: Vec<Buffer<cl_float>>,
+    derivatives: Vec<Buffer<cl_float>>,
     output: Buffer<cl_float>,
     grad_heads: Buffer<cl_float>,
     grad_a: Buffer<cl_float>,
@@ -259,6 +285,8 @@ pub struct OpenClMlp {
     _program: Program,
     input_kernel: Kernel,
     residual_kernel: Kernel,
+    input_training_kernel: Kernel,
+    residual_training_kernel: Kernel,
     heads_kernel: Kernel,
     heads_input_grad_kernel: Kernel,
     residual_dz_kernel: Kernel,
@@ -273,6 +301,8 @@ pub struct OpenClMlp {
     input_features: usize,
     hidden: usize,
     blocks: usize,
+    weight_count: usize,
+    bias_count: usize,
     training: Option<OpenClTrainingBuffers>,
     pub info: DeviceInfo,
 }
@@ -327,6 +357,8 @@ impl OpenClMlp {
         let input_kernel = Kernel::create(&program, "input_layer")?;
         let residual_kernel = Kernel::create(&program, "residual_layer")?;
         let heads_kernel = Kernel::create(&program, "output_heads")?;
+        let input_training_kernel = Kernel::create(&program, "input_layer_training")?;
+        let residual_training_kernel = Kernel::create(&program, "residual_layer_training")?;
         let heads_input_grad_kernel = Kernel::create(&program, "heads_input_grad")?;
         let residual_dz_kernel = Kernel::create(&program, "residual_dz")?;
         let residual_input_grad_kernel = Kernel::create(&program, "residual_input_grad")?;
@@ -347,6 +379,8 @@ impl OpenClMlp {
             packed_weights.extend_from_slice(&layer.weight);
             packed_biases.extend_from_slice(&layer.bias);
         }
+        let weight_count = packed_weights.len();
+        let bias_count = packed_biases.len();
         let mut weights = unsafe {
             Buffer::<cl_float>::create(
                 &context,
@@ -373,6 +407,8 @@ impl OpenClMlp {
             _program: program,
             input_kernel,
             residual_kernel,
+            input_training_kernel,
+            residual_training_kernel,
             heads_kernel,
             heads_input_grad_kernel,
             residual_dz_kernel,
@@ -387,6 +423,8 @@ impl OpenClMlp {
             input_features,
             hidden,
             blocks,
+            weight_count,
+            bias_count,
             training: None,
             info,
         })
@@ -483,13 +521,7 @@ impl OpenClMlp {
         Ok(result)
     }
 
-    pub fn training_forward(
-        &mut self,
-        features: &[f32],
-        pixels: usize,
-        layers: &[LinearData],
-    ) -> Result<Vec<f32>> {
-        self.refresh_weights(layers)?;
+    pub fn training_forward(&mut self, features: &[f32], pixels: usize) -> Result<Vec<f32>> {
         self.ensure_training_buffers(pixels)?;
         if features.len() != self.input_features * pixels {
             bail!("OpenCL renderer training feature payload mismatch");
@@ -513,11 +545,12 @@ impl OpenClMlp {
             let hidden = self.hidden as cl_uint;
             let (wi, bi) = self.offsets[0];
             unsafe {
-                ExecuteKernel::new(&self.input_kernel)
+                ExecuteKernel::new(&self.input_training_kernel)
                     .set_arg(&training.features)
                     .set_arg(&self.weights)
                     .set_arg(&self.biases)
                     .set_arg(&training.activations[0])
+                    .set_arg(&training.derivatives[0])
                     .set_arg(&p)
                     .set_arg(&inputs)
                     .set_arg(&hidden)
@@ -529,11 +562,12 @@ impl OpenClMlp {
             for index in 0..self.blocks {
                 let (wo, bo) = self.offsets[index + 1];
                 unsafe {
-                    ExecuteKernel::new(&self.residual_kernel)
+                    ExecuteKernel::new(&self.residual_training_kernel)
                         .set_arg(&training.activations[index])
                         .set_arg(&self.weights)
                         .set_arg(&self.biases)
                         .set_arg(&training.activations[index + 1])
+                        .set_arg(&training.derivatives[index + 1])
                         .set_arg(&p)
                         .set_arg(&hidden)
                         .set_arg(&wo)
@@ -594,28 +628,30 @@ impl OpenClMlp {
                     &[],
                 )?;
             }
-            let mut gradients: Vec<Option<LinearGradData>> =
-                (0..self.blocks + 3).map(|_| None).collect();
-            gradients[self.blocks + 1] = Some(self.collect_planar_output_grad(
+            let grounded_index = self.blocks + 1;
+            let emergent_index = self.blocks + 2;
+            self.enqueue_planar_output_grad(
                 &training.activations[self.blocks],
                 &training.grad_heads,
                 &training,
                 self.hidden,
                 3,
                 0,
-            )?);
-            gradients[self.blocks + 2] = Some(self.collect_planar_output_grad(
+                self.offsets[grounded_index],
+            )?;
+            self.enqueue_planar_output_grad(
                 &training.activations[self.blocks],
                 &training.grad_heads,
                 &training,
                 self.hidden,
                 3,
                 3,
-            )?);
+                self.offsets[emergent_index],
+            )?;
             let p = pixels as cl_uint;
             let hidden = self.hidden as cl_uint;
-            let (gw, _) = self.offsets[self.blocks + 1];
-            let (ew, _) = self.offsets[self.blocks + 2];
+            let (gw, _) = self.offsets[grounded_index];
+            let (ew, _) = self.offsets[emergent_index];
             unsafe {
                 ExecuteKernel::new(&self.heads_input_grad_kernel)
                     .set_arg(&training.grad_heads)
@@ -631,6 +667,7 @@ impl OpenClMlp {
             let mut current_is_a = true;
             for index in (0..self.blocks).rev() {
                 let input = &training.activations[index];
+                let derivative = &training.derivatives[index + 1];
                 let grad_output = if current_is_a {
                     &training.grad_a
                 } else {
@@ -641,28 +678,25 @@ impl OpenClMlp {
                 } else {
                     &training.grad_a
                 };
-                let (wo, bo) = self.offsets[index + 1];
+                let (wo, _) = self.offsets[index + 1];
                 unsafe {
                     ExecuteKernel::new(&self.residual_dz_kernel)
-                        .set_arg(input)
+                        .set_arg(derivative)
                         .set_arg(grad_output)
-                        .set_arg(&self.weights)
-                        .set_arg(&self.biases)
                         .set_arg(&training.dz)
                         .set_arg(&p)
                         .set_arg(&hidden)
-                        .set_arg(&wo)
-                        .set_arg(&bo)
                         .set_global_work_size(pixels * self.hidden)
                         .enqueue_nd_range(&self.queue)?;
                 }
-                gradients[index + 1] = Some(self.collect_pixel_grad(
+                self.enqueue_pixel_grad(
                     input,
                     &training.dz,
                     &training,
                     self.hidden,
                     self.hidden,
-                )?);
+                    self.offsets[index + 1],
+                )?;
                 unsafe {
                     ExecuteKernel::new(&self.residual_input_grad_kernel)
                         .set_arg(grad_output)
@@ -682,37 +716,25 @@ impl OpenClMlp {
             } else {
                 &training.grad_b
             };
-            let inputs = self.input_features as cl_uint;
-            let (wi, bi) = self.offsets[0];
             unsafe {
                 ExecuteKernel::new(&self.input_dz_kernel)
-                    .set_arg(&training.features)
+                    .set_arg(&training.derivatives[0])
                     .set_arg(grad_input_hidden)
-                    .set_arg(&self.weights)
-                    .set_arg(&self.biases)
                     .set_arg(&training.dz)
                     .set_arg(&p)
-                    .set_arg(&inputs)
                     .set_arg(&hidden)
-                    .set_arg(&wi)
-                    .set_arg(&bi)
                     .set_global_work_size(pixels * self.hidden)
                     .enqueue_nd_range(&self.queue)?;
             }
-            gradients[0] = Some(self.collect_planar_input_grad(
+            self.enqueue_planar_input_grad(
                 &training.features,
                 &training.dz,
                 &training,
                 self.input_features,
                 self.hidden,
-            )?);
-            gradients
-                .into_iter()
-                .enumerate()
-                .map(|(index, value)| {
-                    value.with_context(|| format!("missing OpenCL gradient for layer {index}"))
-                })
-                .collect()
+                self.offsets[0],
+            )?;
+            self.read_training_gradients(&training)
         })();
         self.training = Some(training);
         result
@@ -734,6 +756,10 @@ impl OpenClMlp {
             packed_weights.extend_from_slice(&layer.weight);
             packed_biases.extend_from_slice(&layer.bias);
         }
+        anyhow::ensure!(
+            packed_weights.len() == self.weight_count && packed_biases.len() == self.bias_count,
+            "OpenCL renderer packed parameter size changed"
+        );
         unsafe {
             self.queue.enqueue_write_buffer(
                 &mut self.weights,
@@ -744,7 +770,7 @@ impl OpenClMlp {
             )?;
             self.queue.enqueue_write_buffer(
                 &mut self.biases,
-                CL_NON_BLOCKING,
+                CL_BLOCKING,
                 0,
                 &packed_biases,
                 &[],
@@ -768,39 +794,44 @@ impl OpenClMlp {
             .checked_mul(self.input_features)
             .context("OpenCL training feature size overflow")?;
         let mut activations = Vec::with_capacity(self.blocks + 1);
+        let mut derivatives = Vec::with_capacity(self.blocks + 1);
         for _ in 0..=self.blocks {
             activations.push(create_buffer(
                 &self._context,
                 CL_MEM_READ_WRITE,
                 hidden_len,
             )?);
+            derivatives.push(create_buffer(
+                &self._context,
+                CL_MEM_READ_WRITE,
+                hidden_len,
+            )?);
         }
-        let max_weight = (self.input_features * self.hidden)
-            .max(self.hidden * self.hidden)
-            .max(3 * self.hidden);
         self.training = Some(OpenClTrainingBuffers {
             pixels,
             features: create_buffer(&self._context, CL_MEM_READ_ONLY, feature_len)?,
             activations,
+            derivatives,
             output: create_buffer(&self._context, CL_MEM_WRITE_ONLY, pixels * 6)?,
             grad_heads: create_buffer(&self._context, CL_MEM_READ_ONLY, pixels * 6)?,
             grad_a: create_buffer(&self._context, CL_MEM_READ_WRITE, hidden_len)?,
             grad_b: create_buffer(&self._context, CL_MEM_READ_WRITE, hidden_len)?,
             dz: create_buffer(&self._context, CL_MEM_READ_WRITE, hidden_len)?,
-            weight_grad: create_buffer(&self._context, CL_MEM_READ_WRITE, max_weight)?,
-            bias_grad: create_buffer(&self._context, CL_MEM_READ_WRITE, self.hidden.max(3))?,
+            weight_grad: create_buffer(&self._context, CL_MEM_READ_WRITE, self.weight_count)?,
+            bias_grad: create_buffer(&self._context, CL_MEM_READ_WRITE, self.bias_count)?,
         });
         Ok(())
     }
 
-    fn collect_pixel_grad(
+    fn enqueue_pixel_grad(
         &self,
         input: &Buffer<cl_float>,
         grad_output: &Buffer<cl_float>,
         training: &OpenClTrainingBuffers,
         inputs: usize,
         outputs: usize,
-    ) -> Result<LinearGradData> {
+        destination: (u32, u32),
+    ) -> Result<()> {
         self.enqueue_parameter_gradients(
             &self.bias_grad_pixel_kernel,
             input,
@@ -811,17 +842,19 @@ impl OpenClMlp {
             None,
             false,
             false,
+            destination,
         )
     }
 
-    fn collect_planar_input_grad(
+    fn enqueue_planar_input_grad(
         &self,
         input: &Buffer<cl_float>,
         grad_output: &Buffer<cl_float>,
         training: &OpenClTrainingBuffers,
         inputs: usize,
         outputs: usize,
-    ) -> Result<LinearGradData> {
+        destination: (u32, u32),
+    ) -> Result<()> {
         self.enqueue_parameter_gradients(
             &self.bias_grad_pixel_kernel,
             input,
@@ -832,10 +865,12 @@ impl OpenClMlp {
             None,
             true,
             false,
+            destination,
         )
     }
 
-    fn collect_planar_output_grad(
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_planar_output_grad(
         &self,
         input: &Buffer<cl_float>,
         grad_output: &Buffer<cl_float>,
@@ -843,7 +878,8 @@ impl OpenClMlp {
         inputs: usize,
         outputs: usize,
         output_offset: usize,
-    ) -> Result<LinearGradData> {
+        destination: (u32, u32),
+    ) -> Result<()> {
         self.enqueue_parameter_gradients(
             &self.bias_grad_planar_kernel,
             input,
@@ -854,6 +890,7 @@ impl OpenClMlp {
             Some(output_offset),
             false,
             true,
+            destination,
         )
     }
 
@@ -869,15 +906,17 @@ impl OpenClMlp {
         output_offset: Option<usize>,
         input_planar: bool,
         output_planar: bool,
-    ) -> Result<LinearGradData> {
+        destination: (u32, u32),
+    ) -> Result<()> {
         const WORKGROUP: usize = 64;
         const TILE: usize = 16;
         let pixels = training.pixels as cl_uint;
         let input_width = inputs as cl_uint;
         let output_width = outputs as cl_uint;
-        let offset = output_offset.unwrap_or(0) as cl_uint;
+        let source_offset = output_offset.unwrap_or(0) as cl_uint;
         let input_layout = cl_uint::from(input_planar);
         let output_layout = cl_uint::from(output_planar);
+        let (weight_offset, bias_offset) = destination;
         unsafe {
             ExecuteKernel::new(&self.param_grad_tiled_kernel)
                 .set_arg(input)
@@ -888,7 +927,8 @@ impl OpenClMlp {
                 .set_arg(&output_width)
                 .set_arg(&input_layout)
                 .set_arg(&output_layout)
-                .set_arg(&offset)
+                .set_arg(&source_offset)
+                .set_arg(&weight_offset)
                 .set_global_work_sizes(&[
                     outputs.div_ceil(TILE) * TILE,
                     inputs.div_ceil(TILE) * TILE,
@@ -901,26 +941,56 @@ impl OpenClMlp {
                 .set_arg(&pixels)
                 .set_arg(&output_width);
             if output_offset.is_some() {
-                bias.set_arg(&offset);
+                bias.set_arg(&source_offset);
             }
-            bias.set_global_work_size(outputs * WORKGROUP)
+            bias.set_arg(&bias_offset)
+                .set_global_work_size(outputs * WORKGROUP)
                 .set_local_work_size(WORKGROUP)
                 .enqueue_nd_range(&self.queue)?;
         }
-        let mut weight = vec![0.0f32; inputs * outputs];
-        let mut bias = vec![0.0f32; outputs];
+        Ok(())
+    }
+
+    fn read_training_gradients(
+        &self,
+        training: &OpenClTrainingBuffers,
+    ) -> Result<Vec<LinearGradData>> {
+        let mut weights = vec![0.0f32; self.weight_count];
+        let mut biases = vec![0.0f32; self.bias_count];
         unsafe {
             self.queue.enqueue_read_buffer(
                 &training.weight_grad,
-                CL_BLOCKING,
+                CL_NON_BLOCKING,
                 0,
-                &mut weight,
+                &mut weights,
                 &[],
             )?;
-            self.queue
-                .enqueue_read_buffer(&training.bias_grad, CL_BLOCKING, 0, &mut bias, &[])?;
+            self.queue.enqueue_read_buffer(
+                &training.bias_grad,
+                CL_BLOCKING,
+                0,
+                &mut biases,
+                &[],
+            )?;
         }
-        Ok(LinearGradData { weight, bias })
+        self.offsets
+            .iter()
+            .enumerate()
+            .map(|(index, &(weight_start, bias_start))| {
+                let weight_end = self
+                    .offsets
+                    .get(index + 1)
+                    .map_or(self.weight_count, |offset| offset.0 as usize);
+                let bias_end = self
+                    .offsets
+                    .get(index + 1)
+                    .map_or(self.bias_count, |offset| offset.1 as usize);
+                Ok(LinearGradData {
+                    weight: weights[weight_start as usize..weight_end].to_vec(),
+                    bias: biases[bias_start as usize..bias_end].to_vec(),
+                })
+            })
+            .collect()
     }
 }
 
@@ -1188,7 +1258,7 @@ impl OpenClNca {
             )?;
             self.queue.enqueue_write_buffer(
                 &mut self.biases,
-                CL_NON_BLOCKING,
+                CL_BLOCKING,
                 0,
                 &packed_biases,
                 &[],
@@ -1381,7 +1451,7 @@ mod tests {
         let cpu_grads = loss.backward()?;
 
         let mut backend = OpenClMlp::new(&layers, blocks)?;
-        let gpu_output = backend.training_forward(&feature_values, pixels, &layers)?;
+        let gpu_output = backend.training_forward(&feature_values, pixels)?;
         let gpu_grads = backend.training_backward(&grad_values)?;
         let cpu_output = cpu_output.flatten_all()?.to_vec1::<f32>()?;
         let output_max = cpu_output
