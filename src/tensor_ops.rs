@@ -23,20 +23,23 @@ pub fn pixelwise_linear(x: &Tensor, linear: &Linear) -> Result<Tensor> {
     pixelwise_linear_mode(x, linear, true)
 }
 
+/// Apply a linear layer to the final dimension, optionally detaching its parameters.
+/// Keeping dense spatial stacks in this layout avoids repeated NCHW transposes.
+pub fn linear_mode(x: &Tensor, linear: &Linear, tracked: bool) -> Result<Tensor> {
+    if tracked {
+        linear.forward(x)
+    } else {
+        Linear::new(linear.weight().detach(), linear.bias().map(Tensor::detach)).forward(x)
+    }
+}
+
 /// Pointwise linear projection with an inference path that detaches weights.
 /// This prevents decoder-only windows from building and immediately discarding
 /// a recurrent-core autograd graph.
 pub fn pixelwise_linear_mode(x: &Tensor, linear: &Linear, tracked: bool) -> Result<Tensor> {
-    let detached;
-    let linear = if tracked {
-        linear
-    } else {
-        detached = Linear::new(linear.weight().detach(), linear.bias().map(Tensor::detach));
-        &detached
-    };
     let (b, c, h, w) = x.dims4()?;
     let flat = x.reshape((b, c, h * w))?.transpose(1, 2)?.contiguous()?;
-    let out = linear.forward(&flat)?;
+    let out = linear_mode(&flat, linear, tracked)?;
     let out_channels = out.dim(2)?;
     out.transpose(1, 2)?
         .contiguous()?

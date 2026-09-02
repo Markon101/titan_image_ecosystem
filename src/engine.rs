@@ -24,6 +24,8 @@ use crate::telemetry::{
 use crate::tensor_ops::{mean_abs, splitmix64, variance};
 use crate::terminal::TerminalReporter;
 use anyhow::{bail, Context, Result};
+#[cfg(feature = "opencl")]
+use candle_core::{backprop::GradStore, Var};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 use rand::{Rng, SeedableRng};
@@ -75,6 +77,86 @@ struct ObservationIdentity {
 struct CachedObservation {
     identity: ObservationIdentity,
     image: Tensor,
+}
+
+#[cfg(feature = "opencl")]
+struct CoreTrainingBoundary {
+    world: WorldState,
+    micro: Var,
+    macro_field: Var,
+    memory: Var,
+}
+
+#[cfg(feature = "opencl")]
+impl CoreTrainingBoundary {
+    fn new(source: &WorldState) -> Result<Self> {
+        let micro = Var::from_tensor(&source.micro.detach())?;
+        let macro_field = Var::from_tensor(&source.macro_field.detach())?;
+        let memory = Var::from_tensor(&source.memory.detach())?;
+        let world = WorldState {
+            micro: micro.as_tensor().clone(),
+            macro_field: macro_field.as_tensor().clone(),
+            memory: memory.as_tensor().clone(),
+            step: source.step,
+            age: source.age,
+            episode: source.episode,
+            morph_active_depth: source.morph_active_depth,
+            morph_generation: source.morph_generation,
+            morph_birth_generations: source.morph_birth_generations.clone(),
+            target_index: source.target_index,
+        };
+        Ok(Self {
+            world,
+            micro,
+            macro_field,
+            memory,
+        })
+    }
+
+    fn backward(
+        &self,
+        source: &WorldState,
+        loss_gradients: &GradStore,
+        renderer_gradients: &GradStore,
+    ) -> Result<GradStore> {
+        let micro =
+            combined_boundary_gradient(self.micro.as_tensor(), loss_gradients, renderer_gradients)?;
+        let macro_field = combined_boundary_gradient(
+            self.macro_field.as_tensor(),
+            loss_gradients,
+            renderer_gradients,
+        )?;
+        let memory = combined_boundary_gradient(
+            self.memory.as_tensor(),
+            loss_gradients,
+            renderer_gradients,
+        )?;
+        let surrogate = source
+            .micro
+            .mul(&micro.detach())?
+            .sum_all()?
+            .add(&source.macro_field.mul(&macro_field.detach())?.sum_all()?)?
+            .add(&source.memory.mul(&memory.detach())?.sum_all()?)?;
+        surrogate.backward().map_err(Into::into)
+    }
+}
+
+#[cfg(feature = "opencl")]
+fn combined_boundary_gradient(
+    boundary: &Tensor,
+    primary: &GradStore,
+    secondary: &GradStore,
+) -> Result<Tensor> {
+    match (primary.get(boundary), secondary.get(boundary)) {
+        (Some(left), Some(right)) => left.add(right).map_err(Into::into),
+        (Some(value), None) | (None, Some(value)) => Ok(value.clone()),
+        (None, None) => Tensor::zeros(
+            boundary.shape().clone(),
+            boundary.dtype(),
+            boundary.device(),
+        )
+        .map_err(Into::into),
+    }
 }
 
 #[derive(Serialize)]
@@ -140,7 +222,7 @@ pub fn run(config: RunConfig) -> Result<()> {
     if training_enabled {
         match config.compute_backend {
             ComputeBackend::OpenCl => eprintln!(
-                "OPENCL training: detached decoder windows use GPU NCA/renderer forward and renderer backward; full-core windows remain CPU"
+                "OPENCL training: all windows use GPU renderer forward/backward; detached windows also use GPU NCA forward, while full-core recurrent BPTT remains CPU"
             ),
             ComputeBackend::Auto => {
                 eprintln!("OPENCL auto: training remains on CPU; select opencl explicitly for hybrid Stage 3");
@@ -579,6 +661,8 @@ pub fn run(config: RunConfig) -> Result<()> {
             decoder_only_windows += 1;
         }
         let opencl_decoder_window = !train_core && config.compute_backend == ComputeBackend::OpenCl;
+        let opencl_core_window = train_core && config.compute_backend == ComputeBackend::OpenCl;
+        let opencl_training_window = opencl_decoder_window || opencl_core_window;
 
         let mut micro_movement_sum = 0.0f32;
         let mut micro_movement_max = 0.0f32;
@@ -624,6 +708,19 @@ pub fn run(config: RunConfig) -> Result<()> {
             world = stepped.world;
         }
 
+        #[cfg(feature = "opencl")]
+        let core_training_boundary = if opencl_core_window {
+            Some(CoreTrainingBoundary::new(&world)?)
+        } else {
+            None
+        };
+        #[cfg(feature = "opencl")]
+        let loss_world = core_training_boundary
+            .as_ref()
+            .map_or(&world, |boundary| &boundary.world);
+        #[cfg(not(feature = "opencl"))]
+        let loss_world = &world;
+
         let tick = Instant::now();
         let detail_plan = detail
             .as_ref()
@@ -653,18 +750,18 @@ pub fn run(config: RunConfig) -> Result<()> {
         };
         let age_phase = (world.age as f32 / config.episode_steps.max(1) as f32).clamp(0.0, 1.0);
         let (grounding_schedule, emergence_schedule) = config.developmental_schedule(age_phase);
-        let rendered = if opencl_decoder_window {
+        let rendered = if opencl_training_window {
             renderer.render_decoder_training(
-                &world.micro,
-                &world.macro_field,
+                &loss_world.micro,
+                &loss_world.macro_field,
                 &sample.genome_tensor,
                 active_plan,
                 emergence_schedule,
             )?
         } else {
             renderer.render_with_emergence(
-                &world.micro,
-                &world.macro_field,
+                &loss_world.micro,
+                &loss_world.macro_field,
                 &sample.genome_tensor,
                 active_plan,
                 emergence_schedule,
@@ -674,9 +771,9 @@ pub fn run(config: RunConfig) -> Result<()> {
         let mut losses = visual_loss(
             &rendered,
             target,
-            &world.micro,
-            &world.macro_field,
-            &world.memory,
+            &loss_world.micro,
+            &loss_world.macro_field,
+            &loss_world.memory,
             &config,
             grounding_schedule,
             emergence_schedule,
@@ -695,8 +792,8 @@ pub fn run(config: RunConfig) -> Result<()> {
                 )?);
             }
             let low = renderer.render_with_emergence(
-                &world.micro,
-                &world.macro_field,
+                &loss_world.micro,
+                &loss_world.macro_field,
                 &sample.genome_tensor,
                 consistency_plan
                     .as_ref()
@@ -741,9 +838,9 @@ pub fn run(config: RunConfig) -> Result<()> {
             )?;
             let flow_loss = flow_renderer.training_loss(
                 &flow_sample,
-                &world.micro,
-                &world.macro_field,
-                &world.memory,
+                &loss_world.micro,
+                &loss_world.macro_field,
+                &loss_world.memory,
                 flow_plan.as_ref().expect("flow plan initialized"),
                 age_phase,
                 reference_fidelity,
@@ -774,14 +871,32 @@ pub fn run(config: RunConfig) -> Result<()> {
         let loss_values = loss_scalars(&losses)?;
         phase.render_and_loss += seconds(tick.elapsed());
 
-        let optimizer_stats = if opencl_decoder_window {
+        let optimizer_stats = if opencl_core_window {
+            #[cfg(feature = "opencl")]
+            {
+                let core_boundary = core_training_boundary
+                    .as_ref()
+                    .context("OpenCL core training boundary missing")?;
+                optimizer.backward_step_with_merged(&losses.total, |gradients| {
+                    let renderer_gradients = renderer
+                        .populate_opencl_training_gradients(gradients, true)?
+                        .context("OpenCL renderer input VJP missing")?;
+                    Ok(Some(core_boundary.backward(
+                        &world,
+                        gradients,
+                        &renderer_gradients,
+                    )?))
+                })?
+            }
+            #[cfg(not(feature = "opencl"))]
+            {
+                bail!("OpenCL training requires cargo build --features opencl");
+            }
+        } else if opencl_decoder_window {
             #[cfg(feature = "opencl")]
             {
                 optimizer.backward_step_with(&losses.total, |gradients| {
-                    anyhow::ensure!(
-                        renderer.populate_opencl_training_gradients(gradients)?,
-                        "OpenCL renderer training boundary was not active"
-                    );
+                    renderer.populate_opencl_training_gradients(gradients, false)?;
                     Ok(())
                 })?
             }

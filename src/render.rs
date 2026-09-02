@@ -1,7 +1,7 @@
 use crate::config::{ComputeBackend, RunConfig, StylePreset};
 use crate::tensor_ops::{
-    broadcast_vector, coordinate_features, coordinate_features_window, periodic_shift,
-    pixelwise_linear_mode, smooth_limit, PeriodicUpsampler,
+    broadcast_vector, coordinate_features, coordinate_features_window, linear_mode, periodic_shift,
+    smooth_limit, PeriodicUpsampler,
 };
 use anyhow::{Context, Result};
 #[cfg(feature = "opencl")]
@@ -14,11 +14,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 #[cfg(feature = "opencl")]
+struct OpenClTrainingBoundary {
+    output: Var,
+    features: Tensor,
+}
+
+#[cfg(feature = "opencl")]
 struct OpenClSlot {
     attempted: bool,
     renderer: Option<crate::opencl::OpenClMlp>,
     failure: Option<String>,
-    training_boundary: Option<Var>,
+    training_boundary: Option<OpenClTrainingBoundary>,
 }
 
 pub struct ImplicitRenderer {
@@ -349,7 +355,10 @@ impl ImplicitRenderer {
                 Var::from_vec(output, (1, 6, resolution, resolution), features.device())?;
             let grounded = boundary.narrow(1, 0, 3)?;
             let emergent = boundary.narrow(1, 3, 3)?;
-            slot.training_boundary = Some(boundary);
+            slot.training_boundary = Some(OpenClTrainingBoundary {
+                output: boundary,
+                features: features.clone(),
+            });
             Ok((grounded, emergent))
         }
     }
@@ -375,16 +384,22 @@ impl ImplicitRenderer {
     }
 
     #[cfg(feature = "opencl")]
-    pub fn populate_opencl_training_gradients(&self, gradients: &mut GradStore) -> Result<bool> {
-        if self.compute_backend != ComputeBackend::OpenCl {
-            return Ok(false);
-        }
+    pub fn populate_opencl_training_gradients(
+        &self,
+        gradients: &mut GradStore,
+        include_input_vjp: bool,
+    ) -> Result<Option<GradStore>> {
+        anyhow::ensure!(
+            self.compute_backend == ComputeBackend::OpenCl,
+            "OpenCL renderer training requires --compute-backend opencl"
+        );
         let mut slot = self.opencl.lock().expect("OpenCL renderer mutex poisoned");
-        let Some(boundary) = slot.training_boundary.take() else {
-            return Ok(false);
-        };
+        let boundary = slot
+            .training_boundary
+            .take()
+            .context("OpenCL renderer training boundary was not active")?;
         let head_gradient = gradients
-            .get(boundary.as_tensor())
+            .get(boundary.output.as_tensor())
             .context("loss did not produce OpenCL renderer boundary gradients")?
             .flatten_all()?
             .to_vec1::<f32>()?;
@@ -392,26 +407,37 @@ impl ImplicitRenderer {
             .renderer
             .as_mut()
             .context("OpenCL renderer did not initialize")?;
-        let layer_gradients = renderer.training_backward(&head_gradient)?;
+        let training_gradients = renderer.training_backward(&head_gradient, include_input_vjp)?;
         anyhow::ensure!(
-            layer_gradients.len() == self.blocks.len() + 3,
+            training_gradients.layers.len() == self.blocks.len() + 3,
             "OpenCL renderer gradient layer count mismatch"
         );
-        insert_linear_gradients(gradients, &self.input, &layer_gradients[0])?;
+        insert_linear_gradients(gradients, &self.input, &training_gradients.layers[0])?;
         for (index, block) in self.blocks.iter().enumerate() {
-            insert_linear_gradients(gradients, block, &layer_gradients[index + 1])?;
+            insert_linear_gradients(gradients, block, &training_gradients.layers[index + 1])?;
         }
         insert_linear_gradients(
             gradients,
             &self.grounded_head,
-            &layer_gradients[self.blocks.len() + 1],
+            &training_gradients.layers[self.blocks.len() + 1],
         )?;
         insert_linear_gradients(
             gradients,
             &self.emergent_head,
-            &layer_gradients[self.blocks.len() + 2],
+            &training_gradients.layers[self.blocks.len() + 2],
         )?;
-        Ok(true)
+        if !include_input_vjp {
+            return Ok(None);
+        }
+        let input_gradient = Tensor::from_vec(
+            training_gradients
+                .input
+                .context("OpenCL renderer input gradient missing")?,
+            boundary.features.shape().clone(),
+            boundary.features.device(),
+        )?;
+        let surrogate = boundary.features.mul(&input_gradient.detach())?.sum_all()?;
+        Ok(Some(surrogate.backward()?))
     }
 
     pub fn refresh_opencl_weights(&self) -> Result<bool> {
@@ -529,14 +555,30 @@ impl ImplicitRenderer {
         let (grounded_learned, emergent_logits) = if let Some(heads) = accelerated {
             heads
         } else {
-            let mut hidden = swish(&pixelwise_linear_mode(&features, &self.input, tracked)?)?;
+            let (batch, channels, height, width) = features.dims4()?;
+            let pixels = height * width;
+            let flat = features
+                .reshape((batch, channels, pixels))?
+                .transpose(1, 2)?
+                .contiguous()?
+                .reshape((batch * pixels, channels))?;
+            let mut hidden = swish(&linear_mode(&flat, &self.input, tracked)?)?;
             for block in &self.blocks {
-                let residual = swish(&pixelwise_linear_mode(&hidden, block, tracked)?)?;
+                let residual = swish(&linear_mode(&hidden, block, tracked)?)?;
                 hidden = hidden.add(&residual.affine(0.5, 0.0)?)?;
             }
+            let planar_head = |head: &Linear| -> candle_core::Result<Tensor> {
+                let output = linear_mode(&hidden, head, tracked)?;
+                let output_channels = output.dim(1)?;
+                output
+                    .reshape((batch, pixels, output_channels))?
+                    .transpose(1, 2)?
+                    .contiguous()?
+                    .reshape((batch, output_channels, height, width))
+            };
             (
-                pixelwise_linear_mode(&hidden, &self.grounded_head, tracked)?,
-                pixelwise_linear_mode(&hidden, &self.emergent_head, tracked)?,
+                planar_head(&self.grounded_head)?,
+                planar_head(&self.emergent_head)?,
             )
         };
         let emergent_raw = emergent_logits

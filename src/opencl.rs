@@ -11,11 +11,6 @@ use std::ptr;
 const SOURCE: &str = r#"
 inline float swish(float x) { return x / (1.0f + exp(-x)); }
 
-inline float swish_derivative(float x) {
-  float sigmoid = 1.0f / (1.0f + exp(-x));
-  return sigmoid + x * sigmoid * (1.0f - sigmoid);
-}
-
 kernel void input_layer(
     global const float *x, global const float *w, global const float *b,
     global float *y, uint pixels, uint inputs, uint outputs,
@@ -57,8 +52,10 @@ kernel void input_layer_training(
   float sum = b[bias_offset + o];
   uint row = weight_offset + o * inputs;
   for (uint i = 0; i < inputs; ++i) sum += w[row + i] * x[i * pixels + p];
-  y[p * outputs + o] = swish(sum);
-  derivative[p * outputs + o] = swish_derivative(sum);
+  float denominator = 1.0f + exp(-sum);
+  float sigmoid = 1.0f / denominator;
+  y[p * outputs + o] = sum / denominator;
+  derivative[p * outputs + o] = sigmoid + sum * sigmoid * (1.0f - sigmoid);
 }
 
 kernel void residual_layer_training(
@@ -73,8 +70,10 @@ kernel void residual_layer_training(
   float sum = b[bias_offset + o];
   uint row = weight_offset + o * width;
   for (uint i = 0; i < width; ++i) sum += w[row + i] * x[base + i];
-  y[base + o] = x[base + o] + 0.5f * swish(sum);
-  derivative[base + o] = swish_derivative(sum);
+  float denominator = 1.0f + exp(-sum);
+  float sigmoid = 1.0f / denominator;
+  y[base + o] = x[base + o] + 0.5f * (sum / denominator);
+  derivative[base + o] = sigmoid + sum * sigmoid * (1.0f - sigmoid);
 }
 
 kernel void output_heads(
@@ -146,6 +145,20 @@ kernel void input_dz(
   uint o = gid - p * outputs;
   if (p >= pixels) return;
   dz[p * outputs + o] = grad_output[p * outputs + o] * derivative[p * outputs + o];
+}
+
+kernel void feature_input_grad(
+    global const float *dz, global const float *weights,
+    global float *grad_features, uint pixels, uint inputs, uint outputs,
+    uint weight_offset) {
+  uint gid = get_global_id(0);
+  uint i = gid / pixels;
+  uint p = gid - i * pixels;
+  if (i >= inputs || p >= pixels) return;
+  float sum = 0.0f;
+  for (uint o = 0; o < outputs; ++o)
+    sum += weights[weight_offset + o * inputs + i] * dz[p * outputs + o];
+  grad_features[i * pixels + p] = sum;
 }
 
 kernel void bias_grad_pixel(
@@ -233,6 +246,12 @@ pub struct LinearGradData {
 }
 
 #[derive(Clone, Debug)]
+pub struct MlpTrainingGradients {
+    pub layers: Vec<LinearGradData>,
+    pub input: Option<Vec<f32>>,
+}
+
+#[derive(Clone, Debug)]
 pub struct DeviceInfo {
     pub name: String,
     pub vendor: String,
@@ -275,6 +294,7 @@ struct OpenClTrainingBuffers {
     grad_a: Buffer<cl_float>,
     grad_b: Buffer<cl_float>,
     dz: Buffer<cl_float>,
+    feature_grad: Buffer<cl_float>,
     weight_grad: Buffer<cl_float>,
     bias_grad: Buffer<cl_float>,
 }
@@ -292,6 +312,7 @@ pub struct OpenClMlp {
     residual_dz_kernel: Kernel,
     residual_input_grad_kernel: Kernel,
     input_dz_kernel: Kernel,
+    feature_input_grad_kernel: Kernel,
     param_grad_tiled_kernel: Kernel,
     bias_grad_pixel_kernel: Kernel,
     bias_grad_planar_kernel: Kernel,
@@ -363,6 +384,7 @@ impl OpenClMlp {
         let residual_dz_kernel = Kernel::create(&program, "residual_dz")?;
         let residual_input_grad_kernel = Kernel::create(&program, "residual_input_grad")?;
         let input_dz_kernel = Kernel::create(&program, "input_dz")?;
+        let feature_input_grad_kernel = Kernel::create(&program, "feature_input_grad")?;
         let param_grad_tiled_kernel = Kernel::create(&program, "param_grad_tiled")?;
         let bias_grad_pixel_kernel = Kernel::create(&program, "bias_grad_pixel")?;
         let bias_grad_planar_kernel = Kernel::create(&program, "bias_grad_planar")?;
@@ -414,6 +436,7 @@ impl OpenClMlp {
             residual_dz_kernel,
             residual_input_grad_kernel,
             input_dz_kernel,
+            feature_input_grad_kernel,
             param_grad_tiled_kernel,
             bias_grad_pixel_kernel,
             bias_grad_planar_kernel,
@@ -609,12 +632,16 @@ impl OpenClMlp {
         result
     }
 
-    pub fn training_backward(&mut self, grad_heads: &[f32]) -> Result<Vec<LinearGradData>> {
+    pub fn training_backward(
+        &mut self,
+        grad_heads: &[f32],
+        include_input_gradient: bool,
+    ) -> Result<MlpTrainingGradients> {
         let mut training = self
             .training
             .take()
             .context("OpenCL training forward is required")?;
-        let result = (|| -> Result<Vec<LinearGradData>> {
+        let result = (|| -> Result<MlpTrainingGradients> {
             let pixels = training.pixels;
             if grad_heads.len() != pixels * 6 {
                 bail!("OpenCL renderer head-gradient payload mismatch");
@@ -734,7 +761,23 @@ impl OpenClMlp {
                 self.hidden,
                 self.offsets[0],
             )?;
-            self.read_training_gradients(&training)
+            if include_input_gradient {
+                let inputs = self.input_features as cl_uint;
+                let (wi, _) = self.offsets[0];
+                unsafe {
+                    ExecuteKernel::new(&self.feature_input_grad_kernel)
+                        .set_arg(&training.dz)
+                        .set_arg(&self.weights)
+                        .set_arg(&training.feature_grad)
+                        .set_arg(&p)
+                        .set_arg(&inputs)
+                        .set_arg(&hidden)
+                        .set_arg(&wi)
+                        .set_global_work_size(pixels * self.input_features)
+                        .enqueue_nd_range(&self.queue)?;
+                }
+            }
+            self.read_training_gradients(&training, include_input_gradient)
         })();
         self.training = Some(training);
         result
@@ -817,6 +860,7 @@ impl OpenClMlp {
             grad_a: create_buffer(&self._context, CL_MEM_READ_WRITE, hidden_len)?,
             grad_b: create_buffer(&self._context, CL_MEM_READ_WRITE, hidden_len)?,
             dz: create_buffer(&self._context, CL_MEM_READ_WRITE, hidden_len)?,
+            feature_grad: create_buffer(&self._context, CL_MEM_WRITE_ONLY, feature_len)?,
             weight_grad: create_buffer(&self._context, CL_MEM_READ_WRITE, self.weight_count)?,
             bias_grad: create_buffer(&self._context, CL_MEM_READ_WRITE, self.bias_count)?,
         });
@@ -954,9 +998,12 @@ impl OpenClMlp {
     fn read_training_gradients(
         &self,
         training: &OpenClTrainingBuffers,
-    ) -> Result<Vec<LinearGradData>> {
+        include_input_gradient: bool,
+    ) -> Result<MlpTrainingGradients> {
         let mut weights = vec![0.0f32; self.weight_count];
         let mut biases = vec![0.0f32; self.bias_count];
+        let mut input =
+            include_input_gradient.then(|| vec![0.0f32; self.input_features * training.pixels]);
         unsafe {
             self.queue.enqueue_read_buffer(
                 &training.weight_grad,
@@ -967,13 +1014,27 @@ impl OpenClMlp {
             )?;
             self.queue.enqueue_read_buffer(
                 &training.bias_grad,
-                CL_BLOCKING,
+                if include_input_gradient {
+                    CL_NON_BLOCKING
+                } else {
+                    CL_BLOCKING
+                },
                 0,
                 &mut biases,
                 &[],
             )?;
+            if let Some(input) = input.as_mut() {
+                self.queue.enqueue_read_buffer(
+                    &training.feature_grad,
+                    CL_BLOCKING,
+                    0,
+                    input,
+                    &[],
+                )?;
+            }
         }
-        self.offsets
+        let layers = self
+            .offsets
             .iter()
             .enumerate()
             .map(|(index, &(weight_start, bias_start))| {
@@ -990,7 +1051,8 @@ impl OpenClMlp {
                     bias: biases[bias_start as usize..bias_end].to_vec(),
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(MlpTrainingGradients { layers, input })
     }
 }
 
@@ -1424,8 +1486,7 @@ mod tests {
         let feature_values = (0..inputs * pixels)
             .map(|i| (i as f32 * 0.043).sin() * 0.3)
             .collect::<Vec<_>>();
-        let features =
-            Tensor::from_vec(feature_values.clone(), (inputs, pixels), &CandleDevice::Cpu)?;
+        let features = Var::from_vec(feature_values.clone(), (inputs, pixels), &CandleDevice::Cpu)?;
         let matrix = features.t()?.contiguous()?;
         let linear = |value: &Tensor, index: usize| -> candle_core::Result<Tensor> {
             value
@@ -1452,7 +1513,7 @@ mod tests {
 
         let mut backend = OpenClMlp::new(&layers, blocks)?;
         let gpu_output = backend.training_forward(&feature_values, pixels)?;
-        let gpu_grads = backend.training_backward(&grad_values)?;
+        let gpu_grads = backend.training_backward(&grad_values, true)?;
         let cpu_output = cpu_output.flatten_all()?.to_vec1::<f32>()?;
         let output_max = cpu_output
             .iter()
@@ -1475,14 +1536,30 @@ mod tests {
                 .to_vec1::<f32>()?;
             for (cpu, gpu) in cpu_weight
                 .iter()
-                .zip(&gpu_grads[index].weight)
-                .chain(cpu_bias.iter().zip(&gpu_grads[index].bias))
+                .zip(&gpu_grads.layers[index].weight)
+                .chain(cpu_bias.iter().zip(&gpu_grads.layers[index].bias))
             {
                 let difference = (cpu - gpu).abs();
                 gradient_max = gradient_max.max(difference);
                 gradient_mean += difference as f64;
                 gradient_count += 1;
             }
+        }
+        let cpu_input = cpu_grads
+            .get(features.as_tensor())
+            .context("missing Candle input gradient")?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        for (cpu, gpu) in cpu_input.iter().zip(
+            gpu_grads
+                .input
+                .as_ref()
+                .context("missing OpenCL input gradient")?,
+        ) {
+            let difference = (cpu - gpu).abs();
+            gradient_max = gradient_max.max(difference);
+            gradient_mean += difference as f64;
+            gradient_count += 1;
         }
         gradient_mean /= gradient_count as f64;
         eprintln!("OPENCL renderer backward parity | output_max={output_max:.8} gradient_max={gradient_max:.8} gradient_mean={gradient_mean:.8}");

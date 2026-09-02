@@ -110,7 +110,7 @@ impl PersistentAdamW {
     }
 
     pub fn backward_step(&mut self, loss: &Tensor) -> Result<OptimizerStats> {
-        self.backward_step_with(loss, |_| Ok(()))
+        self.backward_step_with_merged(loss, |_| Ok(None))
     }
 
     pub fn backward_step_with<F>(
@@ -121,9 +121,35 @@ impl PersistentAdamW {
     where
         F: FnOnce(&mut GradStore) -> Result<()>,
     {
+        self.backward_step_with_merged(loss, |gradients| {
+            augment_gradients(gradients)?;
+            Ok(None)
+        })
+    }
+
+    pub fn backward_step_with_merged<F>(
+        &mut self,
+        loss: &Tensor,
+        augment_gradients: F,
+    ) -> Result<OptimizerStats>
+    where
+        F: FnOnce(&mut GradStore) -> Result<Option<GradStore>>,
+    {
         let backward_started = Instant::now();
         let mut gradients = loss.backward()?;
-        augment_gradients(&mut gradients)?;
+        if let Some(additional) = augment_gradients(&mut gradients)? {
+            for state in &self.variables {
+                let Some(extra) = additional.get(state.variable.as_tensor()) else {
+                    continue;
+                };
+                let merged = if let Some(existing) = gradients.get(state.variable.as_tensor()) {
+                    existing.add(extra)?
+                } else {
+                    extra.clone()
+                };
+                gradients.insert(state.variable.as_tensor(), merged);
+            }
+        }
         let backward_seconds = backward_started.elapsed().as_secs_f64();
         let step_started = Instant::now();
         let mut stats = self.step(&gradients)?;

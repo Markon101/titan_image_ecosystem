@@ -1,6 +1,6 @@
 # Titan Image OpenCL notes
 
-Status: Phase 3A hybrid-training optimization. CPU/Candle remains default and numerical oracle. Checkpoint tensor names, schema v9, signatures, schedules, losses, clipping, AdamW state, and serialization remain unchanged.
+Status: Phase 3B full-core renderer integration. CPU/Candle remains default and numerical oracle. Checkpoint tensor names, schema v9, signatures, schedules, losses, clipping, AdamW state, and serialization remain unchanged.
 
 ## Implemented
 
@@ -9,7 +9,7 @@ Status: Phase 3A hybrid-training optimization. CPU/Candle remains default and nu
 - Frozen render-only/analysis/probe renderer MLP on OpenCL FP32. Input features upload once; input layer, all residual blocks, and both output heads remain device-resident; six output channels download once. Weights upload once and remain resident.
 - Frozen FP32 micro and macro NCA forward path on OpenCL: toroidal two-ring perception, input/residual/output pointwise transforms, swish/tanh, deterministic clock mask, and NCA gain. Weights, clock masks, and resolution-sized work buffers remain resident.
 - CPU retains interface attention/GRU/MorphicStack, reference drives, integration/state projection, physical operators, renderer preprocessing/postprocessing, metrics, losses, PNG, scheduling, checkpoints, and full-core autograd windows.
-- Stage 3A explicit `opencl` training: detached decoder windows use OpenCL NCA forward, renderer forward, and manual renderer backward. Training forward caches swish derivatives, so backward no longer recomputes every dense preactivation. Tiled FP32 gradients are written into packed model-wide buffers and returned with two ordered reads instead of two blocking reads per layer. The unchanged clipping/AdamW optimizer remains the numerical authority. Full-core BPTT windows remain CPU/Candle; NCA weights refresh only after full-core updates, while renderer weights refresh after every optimizer update.
+- Stage 3B explicit `opencl` training: every window uses OpenCL renderer forward/backward. Full-core windows detach the final recurrent state into an explicit loss boundary, return the renderer input VJP from OpenCL, combine it with direct state/memory loss gradients, and seed exactly one CPU/Candle recurrent backward traversal. Decoder-only windows also use OpenCL NCA forward. Training forward caches swish derivatives with one shared exponential, packed gradients use ordered reads, and unchanged clipping/AdamW remains the numerical authority. NCA weights refresh only after full-core updates; renderer weights refresh after every update.
 - `auto` training remains CPU. Missing OpenCL under `auto` falls back to CPU.
 - Device report: name/vendor/version/OpenCL C, compute units, workgroup size, global/max-allocation/local memory, FP16 extension.
 
@@ -52,7 +52,7 @@ Saved `v9-grounded-emergent-c81-01` end-to-end 768px raw PNG: maximum quantized 
 
 Phase 2A synthetic NCA delta: max abs `1e-8`. Synthetic 32-step dynamics: age 1/8/32 max abs `1e-8`/`1e-8`/`6e-8`. Saved `v9-pure-nca-fat-c303-01`, same checkpoint world, target, references, genome, and fidelity: age +1/+8/+32 state max abs `6e-8`/`2.4e-7`/`3.6e-7`; final 192px render max abs `6e-7`, mean abs `3e-8`, RMS `6e-8`.
 
-Stage 3A renderer backward primitive: max gradient drift `1.2e-7`. Deterministic two-window tiny training test (one CPU full-core plus one OpenCL decoder window): loss/state byte-equivalent at float precision, max parameter drift `1e-8`, final PNG byte-identical after cache refresh. Saved c303 two-window continuation: loss equal to seven decimals, model max drift `3e-8`, optimizer max drift `1.0e-7`, world max drift `7.6e-7`; final 192px PNG max difference `1/255`, normalized mean `7.09e-8`.
+Stage 3A renderer backward primitive: max gradient drift `1.2e-7`. Deterministic two-window tiny training test (one OpenCL-rendered full-core window plus one OpenCL decoder window): loss/state byte-equivalent at float precision, max parameter drift `3e-8`, final PNG byte-identical after cache refresh. Saved c303 two-window continuation: loss equal to seven decimals, model max drift `3e-8`, optimizer max drift `1.0e-7`, world max drift `7.6e-7`; final 192px PNG max difference `1/255`, normalized mean `7.09e-8`.
 
 ## Benchmarks
 
@@ -68,7 +68,7 @@ Uncontrolled background conditions: user was using other apps. Directional only;
 
 The Stage 3 decoder-window timing excludes startup and final rendering; its surrounding process timing was invalidated by severe background load. The 768px process includes corpus startup, checkpoint loading, CPU feature/postprocessing, PNG encoding, and OpenCL program compilation. Renderer-only test initializes OpenCL before timing.
 
-Current 2026-09-01 spot checks after the Phase 3A optimization:
+2026-09-01 pre-Phase3B spot-check baseline:
 
 | Workload | CPU | OpenCL | speedup | max drift |
 |---|---:|---:|---:|---:|
@@ -76,7 +76,7 @@ Current 2026-09-01 spot checks after the Phase 3A optimization:
 | saved c81 renderer 384px | 2610.169 ms | 1144.664 ms | 2.280x | 9.5e-7 |
 | saved c282 Pure-NCA dynamics, 32 steps | 3824.082 ms | 2806.351 ms | 1.363x | state 8.0e-7; render 1.204e-5 |
 
-These spot checks validate current code and checkpoint parity; they are not an A/B attribution for the backward-only changes. The deterministic tiny decoder test improved from 4.36 to 16.06 displayed decoder steps/s in that run, but the workload is intentionally too small and noisy to treat as a production benchmark.
+These spot checks are the pre-Phase3B baseline and are not an A/B attribution for the new full-core VJP bridge. A thermally controlled saved-checkpoint core-window benchmark remains required. The deterministic tiny decoder test improved from 4.36 to 16.06 displayed decoder steps/s in that run, but the workload is intentionally too small and noisy to treat as a production benchmark.
 
 ## Bandwidth and mixed precision
 
@@ -89,7 +89,7 @@ The CPU and OpenCL numerical paths remain FP32. The Cargo `+fp16` target feature
 ## Build/run
 
 ```sh
-cargo build --release --locked --features opencl
+cargo build --release --locked --features opencl -j 8
 OCL_ICD_ASSUME_ICD_EXTENSION=1 ./target/release/titan_image \
   --corpus-dir /sdcard/Download/titan_image_sources \
   --output-dir /sdcard/Download/titan_image_v9 \
@@ -150,12 +150,12 @@ OCL_ICD_ASSUME_ICD_EXTENSION=1 TITAN_OPENCL_TEST=1 \
 
 ## Limits / next work
 
-Phase 2 and Phase 3 remain partial. NCA state/context are uploaded and delta downloaded once per active scale because interface attention/GRU/MorphicStack and integration remain CPU. Full-core BPTT/backward remains CPU; only detached decoder windows use manual OpenCL backward. Renderer training activations remain GPU-resident for one window, but renderer features originate on CPU. Runtime errors after successful initialization propagate; only initialization unavailability auto-falls back.
+Phase 2 and Phase 3 remain partial. NCA state/context are uploaded and delta downloaded once per active scale because interface attention/GRU/MorphicStack and integration remain CPU. Full-core recurrent BPTT remains CPU, but its renderer forward/backward and parameter gradients now run on OpenCL through an explicit VJP boundary. Renderer features and returned input gradients still cross host/device memory once per window. Runtime errors after successful initialization propagate; only initialization unavailability auto-falls back.
 
 Highest-value next tasks:
 
 1. Complete Phase 2 residency: port reference drives, interface attention/GRU/MorphicStack, macro upsampling, integration, and state projection; download only metrics/renders.
-2. Extend Stage 3 through one full-core BPTT window: NCA/interface backward plus state-gradient recurrence, retaining CPU clipping/AdamW oracle parity.
+2. Move spatial NCA/integration BPTT and persistent world state onto the shared OpenCL runtime while retaining the CPU token-interface VJP and CPU clipping/AdamW oracle.
 3. Share one OpenCL context/queue, add event profiling, and tune or replace scalar dense kernels with CLBlast/custom vectorized GEMM before drawing bandwidth conclusions.
 4. Add opt-in mixed precision under the FP32-master/state/optimizer policy above, gated by saved-checkpoint, two-window, 32/64/128-step, and long-horizon boundedness comparisons.
 5. Small follow-up: cache same-resolution inference buffers to remove repeated renderer buffer allocation.

@@ -1,7 +1,7 @@
 use crate::config::{ComputeBackend, RunConfig};
 use crate::tensor_ops::{
-    broadcast_vector, deterministic_clock_mask, perceive_multiscale, perception_kernel,
-    pixelwise_linear_mode, splitmix64, PERCEPTION_FEATURES_PER_CHANNEL,
+    broadcast_vector, deterministic_clock_mask, linear_mode, perceive_multiscale,
+    perception_kernel, splitmix64, PERCEPTION_FEATURES_PER_CHANNEL,
 };
 use anyhow::{bail, Result};
 use candle_core::{Device, Tensor};
@@ -150,10 +150,22 @@ impl NeuralCa {
         let genome_field = broadcast_vector(genome, self.size, self.size)?;
         let perceived = perceive_multiscale(field, &self.perception, self.channels)?;
         let features = Tensor::cat(&[&perceived, macro_context, &genome_field], 1)?;
-        let h1 = swish(&pixelwise_linear_mode(&features, &self.input, tracked)?)?;
-        let residual = swish(&pixelwise_linear_mode(&h1, &self.hidden, tracked)?)?;
+        let (batch, feature_count, height, width) = features.dims4()?;
+        let pixels = height * width;
+        let features = features
+            .reshape((batch, feature_count, pixels))?
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((batch * pixels, feature_count))?;
+        let h1 = swish(&linear_mode(&features, &self.input, tracked)?)?;
+        let residual = swish(&linear_mode(&h1, &self.hidden, tracked)?)?;
         let hidden = h1.add(&residual.affine(0.5, 0.0)?)?;
-        let raw = pixelwise_linear_mode(&hidden, &self.output, tracked)?.tanh()?;
+        let raw = linear_mode(&hidden, &self.output, tracked)?
+            .tanh()?
+            .reshape((batch, pixels, self.channels))?
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((batch, self.channels, height, width))?;
         Ok(raw
             .broadcast_mul(&self.clock_masks[clock])?
             .affine(self.gain as f64, 0.0)?)
