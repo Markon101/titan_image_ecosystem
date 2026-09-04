@@ -187,7 +187,8 @@ pub fn run_natural_image_probes(
                 if !config.analysis.probe_ages.contains(&age) {
                     continue;
                 }
-                let age_phase = (age as f32 / config.episode_steps.max(1) as f32).clamp(0.0, 1.0);
+                let age_phase =
+                    (age as f32 / config.developmental_horizon().max(1) as f32).clamp(0.0, 1.0);
                 let (_, emergence_schedule) = config.developmental_schedule(age_phase);
                 let rendered = renderer.render_with_emergence(
                     &world.micro,

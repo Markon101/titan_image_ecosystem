@@ -73,6 +73,39 @@ The developmental schedule is smooth:
 
 The resolved grounding and emergence schedule values are logged every window.
 
+### Variable developmental ages
+
+The legacy default remains one fixed `--episode-steps` horizon and preserves
+existing checkpoint signatures and trajectories. Once an age range is supplied,
+`--episode-steps` no longer controls boundaries or checkpoint identity. New runs
+sample a deterministic, BPTT-aligned horizon for each corpus episode:
+
+```sh
+# Immediate uniform sampling from 32,36,...,96 steps.
+--age-min 32 --age-max 96 --bptt 4
+
+# Expanding curriculum: begin at 32, then grow the eligible upper bound to 96
+# over 20,000 global development steps; continue sampling the full range after.
+--age-min 32 --age-max 96 --age-curriculum-steps 20000 --bptt 4
+```
+
+Both age bounds are required together, must be multiples of `--bptt`, and are
+limited to 4096. Sampling is a pure function of the run seed, episode index, and
+episode start step, so checkpoint resume needs no new world tensor or schema
+change. The developmental conditioning/schedules use `--age-max` as their
+absolute mature-age scale; a shorter episode therefore supervises an earlier
+point on the same developmental clock rather than compressing maturity into
+fewer steps.
+
+Uniform sampling is the recommended first experiment. Growing NCA work uses
+random rollout counts to train persistence across an interval, and TITAN already
+applies a loss at every BPTT window while traversing each sampled episode. The
+expanding curriculum is opt-in for runs that are unstable at long horizons; it
+keeps sampling shorter horizons after longer ones become eligible, avoiding a
+hard phase switch and reducing early-age forgetting. See
+[Growing Neural Cellular Automata](https://distill.pub/2020/growing-ca/) and the
+original [curriculum-learning paper](https://icml.cc/2009/papers/119.pdf).
+
 ## Research presets
 
 Every preset is applied before explicit scalar overrides, regardless of CLI
@@ -427,7 +460,8 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo build --release --locked
 ~~~
 
-The tests cover schema/config semantics, decomposition isolation, native-detail
+The tests cover schema/config semantics, deterministic variable-age scheduling,
+window-shared reference-drive parity, decomposition isolation, native-detail
 coordinates, cross-resolution consistency, 16x16 hierarchical interface,
 long recurrent boundedness, exact flow math, frozen ODE non-mutation,
 append-only model/optimizer migration, transaction integrity, checkpoint

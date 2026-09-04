@@ -79,6 +79,61 @@ struct CachedObservation {
     image: Tensor,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct EpisodeSchedule {
+    episode: u64,
+    start_step: u64,
+    horizon: usize,
+}
+
+impl EpisodeSchedule {
+    fn for_world(config: &RunConfig, world: &WorldState) -> Result<Self> {
+        let mut schedule = Self {
+            episode: 0,
+            start_step: 0,
+            horizon: config.episode_horizon(0, 0),
+        };
+        while schedule.episode < world.episode {
+            schedule.advance(config)?;
+        }
+        let end_step = schedule.end_step()?;
+        anyhow::ensure!(
+            (schedule.start_step..=end_step).contains(&world.step),
+            "checkpoint world step {} is outside episode {} range {}..={}",
+            world.step,
+            world.episode,
+            schedule.start_step,
+            end_step,
+        );
+        if config.episode_reset > 0.0 {
+            anyhow::ensure!(
+                world.age == world.step - schedule.start_step,
+                "checkpoint age {} disagrees with episode {} start step {}",
+                world.age,
+                world.episode,
+                schedule.start_step,
+            );
+        }
+        Ok(schedule)
+    }
+
+    fn end_step(&self) -> Result<u64> {
+        self.start_step
+            .checked_add(self.horizon as u64)
+            .context("episode schedule step overflow")
+    }
+
+    fn advance(&mut self, config: &RunConfig) -> Result<()> {
+        self.start_step = self.end_step()?;
+        self.episode = self
+            .episode
+            .checked_add(1)
+            .context("episode schedule index overflow")?;
+        self.horizon = config.episode_horizon(self.episode, self.start_step);
+        Ok(())
+    }
+}
+
 #[cfg(feature = "opencl")]
 struct CoreTrainingBoundary {
     world: WorldState,
@@ -340,13 +395,15 @@ pub fn run(config: RunConfig) -> Result<()> {
             fresh
         }
     };
+    let mut episode_schedule = EpisodeSchedule::for_world(&config, &world)?;
     let start_world_step = world.step;
     let optimizer_updates_start = optimizer.updates();
     let mut target_telemetry = TargetTelemetry::new(start_world_step);
 
     if checkpoint_load.model.grafted {
         let plan = RenderPlan::new(&config, config.train_resolution, &device)?;
-        let age_phase = (world.age as f32 / config.episode_steps.max(1) as f32).clamp(0.0, 1.0);
+        let age_phase =
+            (world.age as f32 / config.developmental_horizon().max(1) as f32).clamp(0.0, 1.0);
         let (grounding_schedule, emergence_schedule) = config.developmental_schedule(age_phase);
         let mut old_world = world.clone();
         old_world.morph_active_depth = checkpoint_load.model.old_active_depth;
@@ -580,6 +637,23 @@ pub fn run(config: RunConfig) -> Result<()> {
             config.detail.resolution,
         ),
     );
+    if config.variable_age_enabled() {
+        let curriculum = if config.age_curriculum_steps == 0 {
+            "immediate uniform".to_owned()
+        } else {
+            format!("expanding over {} steps", config.age_curriculum_steps)
+        };
+        terminal_reporter.event(
+            "AGES",
+            format!(
+                "{}..={} in BPTT-aligned increments | {} | current episode horizon {}",
+                config.age_min.expect("validated age minimum"),
+                config.age_max.expect("validated age maximum"),
+                curriculum,
+                episode_schedule.horizon,
+            ),
+        );
+    }
     terminal_reporter.event(
         "ANATOMY",
         format!(
@@ -641,6 +715,7 @@ pub fn run(config: RunConfig) -> Result<()> {
             &device,
             &mut world,
             &mut sample,
+            &mut episode_schedule,
             metrics_writer.as_mut(),
         )?;
         let episode_started = world.age == 0;
@@ -648,8 +723,8 @@ pub fn run(config: RunConfig) -> Result<()> {
             terminal_reporter.event(
                 "EPISODE",
                 format!(
-                    "episode {} target {} ({})",
-                    world.episode, sample.index, sample.name
+                    "episode {} target {} ({}) | horizon {}",
+                    world.episode, sample.index, sample.name, episode_schedule.horizon
                 ),
             );
         }
@@ -673,7 +748,7 @@ pub fn run(config: RunConfig) -> Result<()> {
         let mut macro_updates = 0usize;
         let reference_fidelity = reference_fidelity(&config, world.step);
         let age_phase_start =
-            (world.age as f32 / config.episode_steps.max(1) as f32).clamp(0.0, 1.0);
+            (world.age as f32 / config.developmental_horizon().max(1) as f32).clamp(0.0, 1.0);
         let detail = corpus.detail_observation(
             sample.index,
             world.step,
@@ -681,17 +756,28 @@ pub fn run(config: RunConfig) -> Result<()> {
             &config,
             &device,
         )?;
+        let local_reference_micro = detail.as_ref().map_or(&sample.reference_micro, |value| {
+            &value.local_reference_micro
+        });
+        let local_reference_macro = detail.as_ref().map_or(&sample.reference_macro, |value| {
+            &value.local_reference_macro
+        });
+        let prepared_reference = dynamics.prepare_reference_drive(
+            Some(local_reference_micro),
+            Some(local_reference_macro),
+            reference_fidelity,
+            train_core,
+        )?;
         for _ in 0..config.bptt {
             let tick = Instant::now();
-            let stepped = dynamics.step_with_local_reference(
+            let stepped = dynamics.step_with_prepared_reference(
                 &world,
                 &sample.genome_tensor,
                 Some(&sample.reference_micro),
                 Some(&sample.reference_macro),
-                detail.as_ref().map(|value| &value.local_reference_micro),
-                detail.as_ref().map(|value| &value.local_reference_macro),
                 reference_fidelity,
                 train_core,
+                &prepared_reference,
             )?;
             if train_core {
                 phase.tracked_dynamics += seconds(tick.elapsed());
@@ -748,7 +834,8 @@ pub fn run(config: RunConfig) -> Result<()> {
         } else {
             config.detail.boundary
         };
-        let age_phase = (world.age as f32 / config.episode_steps.max(1) as f32).clamp(0.0, 1.0);
+        let age_phase =
+            (world.age as f32 / config.developmental_horizon().max(1) as f32).clamp(0.0, 1.0);
         let (grounding_schedule, emergence_schedule) = config.developmental_schedule(age_phase);
         let rendered = if opencl_training_window {
             renderer.render_decoder_training(
@@ -984,7 +1071,7 @@ pub fn run(config: RunConfig) -> Result<()> {
             macro_reference_drive_sum / config.bptt as f32,
             flow_diagnostics.as_ref(),
         );
-        target_telemetry.observe(&sample.name, config.episode_steps, &record);
+        target_telemetry.observe(&sample.name, config.developmental_horizon(), &record);
         record.write_csv(
             metrics_writer
                 .as_mut()
@@ -1444,19 +1531,26 @@ fn select_episode_if_needed(
     device: &Device,
     world: &mut WorldState,
     sample: &mut TargetSample,
+    schedule: &mut EpisodeSchedule,
     metrics_writer: Option<&mut BufWriter<std::fs::File>>,
 ) -> Result<()> {
-    let episode = world.step / config.episode_steps as u64;
-    if episode == world.episode {
+    if world.step < schedule.end_step()? {
         return Ok(());
     }
     if let Some(writer) = metrics_writer {
         writer.flush()?;
     }
-    let next = corpus.sample(episode, device)?;
-    *world =
-        world.reseed_for_episode(config, config.seed ^ next.fingerprint, episode, next.index)?;
-    *sample = next;
+    while world.step >= schedule.end_step()? {
+        schedule.advance(config)?;
+        let next = corpus.sample(schedule.episode, device)?;
+        *world = world.reseed_for_episode(
+            config,
+            config.seed ^ next.fingerprint,
+            schedule.episode,
+            next.index,
+        )?;
+        *sample = next;
+    }
     Ok(())
 }
 
@@ -2289,6 +2383,36 @@ mod tests {
         assert!(cadence_due(96, 100, 50));
         assert!(!cadence_due(100, 104, 50));
         assert!(!cadence_due(48, 52, 0));
+    }
+
+    #[test]
+    fn variable_episode_schedule_is_resumable_without_new_world_state() -> Result<()> {
+        let config = RunConfig {
+            episode_steps: 12,
+            age_min: Some(8),
+            age_max: Some(16),
+            age_curriculum_steps: 32,
+            bptt: 4,
+            ..RunConfig::default()
+        };
+        config.validate()?;
+        let mut expected = EpisodeSchedule {
+            episode: 0,
+            start_step: 0,
+            horizon: config.episode_horizon(0, 0),
+        };
+        for _ in 0..5 {
+            expected.advance(&config)?;
+        }
+        let mut world = WorldState::fresh(&config, config.seed, &Device::Cpu)?;
+        world.episode = expected.episode;
+        world.step = expected.start_step + 4;
+        world.age = 4;
+        let rebuilt = EpisodeSchedule::for_world(&config, &world)?;
+        assert_eq!(rebuilt.episode, expected.episode);
+        assert_eq!(rebuilt.start_step, expected.start_step);
+        assert_eq!(rebuilt.horizon, expected.horizon);
+        Ok(())
     }
 
     #[test]

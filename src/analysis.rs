@@ -265,7 +265,7 @@ fn run_reconstruction_benchmark(
     let reference = benchmark_reference_report(resolution)?;
     let plan = RenderPlan::new(config, resolution, device)?;
     let fixed_seed = config.seed ^ 0xb3ec_9001;
-    let fixed_age = config.episode_steps.min(32);
+    let fixed_age = config.developmental_horizon().min(32);
     let checkpoints = [1usize, 8, 16, fixed_age];
     let mut results = Vec::new();
     let mut candidates = Vec::new();
@@ -561,7 +561,7 @@ fn autonomous_rollout(
 ) -> Result<Vec<AttractorRecord>> {
     let plan = RenderPlan::new(config, config.snapshot_resolution, device)?;
     let mut probe = world.clone();
-    probe.age = probe.age.max(config.episode_steps as u64);
+    probe.age = probe.age.max(config.developmental_horizon() as u64);
     let mut prior_image: Option<Tensor> = None;
     let mut signatures: Vec<Vec<f32>> = Vec::new();
     let mut records = Vec::new();
@@ -664,7 +664,7 @@ fn perturbation_recovery(
     device: &Device,
 ) -> Result<Vec<PerturbationRecord>> {
     let mut control = world.clone();
-    control.age = control.age.max(config.episode_steps as u64);
+    control.age = control.age.max(config.developmental_horizon() as u64);
     let mut variants = vec![
         (
             "micro_gaussian".to_owned(),
@@ -835,7 +835,7 @@ fn dynamics_ablation(
     let mut outcomes = Vec::new();
     for (name, ablation) in variants {
         let mut state = world.clone();
-        state.age = state.age.max(config.episode_steps as u64);
+        state.age = state.age.max(config.developmental_horizon() as u64);
         for _ in 0..config.analysis.dynamics_horizon {
             state = dynamics
                 .step_ablated(
@@ -888,7 +888,7 @@ fn target_separability(
     device: &Device,
 ) -> Result<SeparabilitySummary> {
     let target_count = corpus.len().min(8);
-    let fixed_age = config.episode_steps.min(32);
+    let fixed_age = config.developmental_horizon().min(32);
     let plan = RenderPlan::new(config, config.train_resolution.min(192), device)?;
     let mut phenotypes = Vec::new();
     let mut montage = Vec::new();

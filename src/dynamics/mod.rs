@@ -35,6 +35,13 @@ pub struct StepOutput {
     pub macro_updated: bool,
 }
 
+pub struct PreparedReferenceDrive {
+    micro: Tensor,
+    macro_field: Tensor,
+    micro_rms: f32,
+    macro_rms: f32,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DynamicsAblation {
     pub disable_interface: bool,
@@ -124,6 +131,37 @@ impl DynamicsSystem {
         Ok(micro && macro_field)
     }
 
+    /// Project the window-constant local references once. Reusing this graph
+    /// across BPTT steps preserves the summed parameter gradient while avoiding
+    /// repeated dense projection, tanh, reduction, and scalar synchronization.
+    pub fn prepare_reference_drive(
+        &self,
+        local_reference_micro: Option<&Tensor>,
+        local_reference_macro: Option<&Tensor>,
+        reference_fidelity: f32,
+        tracked: bool,
+    ) -> Result<PreparedReferenceDrive> {
+        let local_reference_micro = local_reference_micro.unwrap_or(&self.reference_micro_zero);
+        let local_reference_macro = local_reference_macro.unwrap_or(&self.reference_macro_zero);
+        let reference_gain = self.config.reconstruction.local_reference_gain * reference_fidelity;
+        let micro =
+            pixelwise_linear_mode(local_reference_micro, &self.reference_micro_drive, tracked)?
+                .tanh()?
+                .affine(reference_gain as f64, 0.0)?;
+        let macro_field =
+            pixelwise_linear_mode(local_reference_macro, &self.reference_macro_drive, tracked)?
+                .tanh()?
+                .affine(reference_gain as f64, 0.0)?;
+        let micro_rms = micro.sqr()?.mean_all()?.sqrt()?.to_scalar::<f32>()?;
+        let macro_rms = macro_field.sqr()?.mean_all()?.sqrt()?.to_scalar::<f32>()?;
+        Ok(PreparedReferenceDrive {
+            micro,
+            macro_field,
+            micro_rms,
+            macro_rms,
+        })
+    }
+
     /// Advance one world step. The local NCA handles dense spatial refinement;
     /// a small recurrent token interface performs global read/reason/write.
     #[allow(clippy::too_many_arguments)]
@@ -174,6 +212,31 @@ impl DynamicsSystem {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn step_with_prepared_reference(
+        &self,
+        world: &WorldState,
+        genome: &Tensor,
+        reference_micro: Option<&Tensor>,
+        reference_macro: Option<&Tensor>,
+        reference_fidelity: f32,
+        tracked: bool,
+        prepared_reference: &PreparedReferenceDrive,
+    ) -> Result<StepOutput> {
+        self.step_ablated_prepared(
+            world,
+            genome,
+            reference_micro,
+            reference_macro,
+            None,
+            None,
+            reference_fidelity,
+            tracked,
+            Some(prepared_reference),
+            &DynamicsAblation::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn step_ablated(
         &self,
         world: &WorldState,
@@ -186,31 +249,56 @@ impl DynamicsSystem {
         tracked: bool,
         ablation: &DynamicsAblation,
     ) -> Result<StepOutput> {
+        self.step_ablated_prepared(
+            world,
+            genome,
+            reference_micro,
+            reference_macro,
+            local_reference_micro,
+            local_reference_macro,
+            reference_fidelity,
+            tracked,
+            None,
+            ablation,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn step_ablated_prepared(
+        &self,
+        world: &WorldState,
+        genome: &Tensor,
+        reference_micro: Option<&Tensor>,
+        reference_macro: Option<&Tensor>,
+        local_reference_micro: Option<&Tensor>,
+        local_reference_macro: Option<&Tensor>,
+        reference_fidelity: f32,
+        tracked: bool,
+        prepared_reference: Option<&PreparedReferenceDrive>,
+        ablation: &DynamicsAblation,
+    ) -> Result<StepOutput> {
         let reference_micro = reference_micro.unwrap_or(&self.reference_micro_zero);
         let reference_macro = reference_macro.unwrap_or(&self.reference_macro_zero);
-        let local_reference_micro = local_reference_micro.unwrap_or(reference_micro);
-        let local_reference_macro = local_reference_macro.unwrap_or(reference_macro);
-        let reference_gain = self.config.reconstruction.local_reference_gain * reference_fidelity;
-        let micro_reference_drive =
-            pixelwise_linear_mode(local_reference_micro, &self.reference_micro_drive, tracked)?
-                .tanh()?
-                .affine(reference_gain as f64, 0.0)?;
-        let macro_reference_drive =
-            pixelwise_linear_mode(local_reference_macro, &self.reference_macro_drive, tracked)?
-                .tanh()?
-                .affine(reference_gain as f64, 0.0)?;
-        let micro_reference_drive_rms = micro_reference_drive
-            .sqr()?
-            .mean_all()?
-            .sqrt()?
-            .to_scalar::<f32>()?;
-        let macro_reference_drive_rms = macro_reference_drive
-            .sqr()?
-            .mean_all()?
-            .sqrt()?
-            .to_scalar::<f32>()?;
+        let owned_reference;
+        let prepared_reference = if let Some(prepared) = prepared_reference {
+            prepared
+        } else {
+            let local_reference_micro = local_reference_micro.unwrap_or(reference_micro);
+            let local_reference_macro = local_reference_macro.unwrap_or(reference_macro);
+            owned_reference = self.prepare_reference_drive(
+                Some(local_reference_micro),
+                Some(local_reference_macro),
+                reference_fidelity,
+                tracked,
+            )?;
+            &owned_reference
+        };
+        let micro_reference_drive = &prepared_reference.micro;
+        let macro_reference_drive = &prepared_reference.macro_field;
+        let micro_reference_drive_rms = prepared_reference.micro_rms;
+        let macro_reference_drive_rms = prepared_reference.macro_rms;
         let age_phase =
-            (world.age as f32 / self.config.episode_steps.max(1) as f32).clamp(0.0, 1.0);
+            (world.age as f32 / self.config.developmental_horizon().max(1) as f32).clamp(0.0, 1.0);
         let interface = if ablation.disable_interface {
             InterfaceOutput {
                 micro_bias: zeros(
@@ -251,7 +339,7 @@ impl DynamicsSystem {
                 &world.macro_field,
                 &self.macro_zero_context,
                 genome,
-                &interface.macro_bias.add(&macro_reference_drive)?,
+                &interface.macro_bias.add(macro_reference_drive)?,
                 world.step,
                 FieldScale::Macro,
                 tracked,
@@ -268,7 +356,7 @@ impl DynamicsSystem {
                 &world.micro,
                 &macro_context,
                 genome,
-                &interface.micro_bias.add(&micro_reference_drive)?,
+                &interface.micro_bias.add(micro_reference_drive)?,
                 world.step,
                 FieldScale::Micro,
                 tracked,
@@ -502,6 +590,98 @@ mod tests {
             output_resolution: 24,
             ..RunConfig::default()
         }
+    }
+
+    #[test]
+    fn prepared_reference_drive_matches_repeated_bptt_projection() -> Result<()> {
+        let device = Device::Cpu;
+        let config = reference_test_config();
+        let vars = VarMap::new();
+        let system = DynamicsSystem::new(
+            &config,
+            VarBuilder::from_varmap(&vars, DType::F32, &device),
+            &device,
+        )?;
+        let initial = WorldState::fresh(&config, 42, &device)?;
+        let genome = Tensor::new(&[0.0f32, 0.25, -0.5, 1.0], &device)?;
+        let reference_micro =
+            Tensor::ones((1, 3, 24, 24), DType::F32, &device)?.affine(0.3, 0.0)?;
+        let reference_macro =
+            Tensor::ones((1, 3, 12, 12), DType::F32, &device)?.affine(0.2, 0.0)?;
+
+        let mut repeated = initial.clone();
+        for _ in 0..config.bptt {
+            repeated = system
+                .step_with_local_reference(
+                    &repeated,
+                    &genome,
+                    Some(&reference_micro),
+                    Some(&reference_macro),
+                    Some(&reference_micro),
+                    Some(&reference_macro),
+                    0.6,
+                    true,
+                )?
+                .world;
+        }
+        let prepared = system.prepare_reference_drive(
+            Some(&reference_micro),
+            Some(&reference_macro),
+            0.6,
+            true,
+        )?;
+        let mut shared = initial;
+        for _ in 0..config.bptt {
+            shared = system
+                .step_with_prepared_reference(
+                    &shared,
+                    &genome,
+                    Some(&reference_micro),
+                    Some(&reference_macro),
+                    0.6,
+                    true,
+                    &prepared,
+                )?
+                .world;
+        }
+        for difference in [
+            repeated.micro.sub(&shared.micro)?.abs()?,
+            repeated.macro_field.sub(&shared.macro_field)?.abs()?,
+            repeated.memory.sub(&shared.memory)?.abs()?,
+        ] {
+            assert!(difference.max_all()?.to_scalar::<f32>()? <= 1e-7);
+        }
+
+        let repeated_loss = repeated
+            .micro
+            .sum_all()?
+            .add(&repeated.macro_field.sum_all()?)?
+            .add(&repeated.memory.sum_all()?)?;
+        let shared_loss = shared
+            .micro
+            .sum_all()?
+            .add(&shared.macro_field.sum_all()?)?
+            .add(&shared.memory.sum_all()?)?;
+        let repeated_gradients = repeated_loss.backward()?;
+        let shared_gradients = shared_loss.backward()?;
+        for weight in [
+            system.reference_micro_drive.weight(),
+            system.reference_macro_drive.weight(),
+        ] {
+            let repeated_gradient = repeated_gradients
+                .get(weight)
+                .expect("repeated reference gradient");
+            let shared_gradient = shared_gradients
+                .get(weight)
+                .expect("shared reference gradient");
+            let max = repeated_gradient
+                .sub(shared_gradient)?
+                .abs()?
+                .max_all()?
+                .to_scalar::<f32>()?;
+            assert!(max <= 2e-4, "prepared reference gradient drift {max}");
+        }
+        Ok(())
     }
 
     #[test]

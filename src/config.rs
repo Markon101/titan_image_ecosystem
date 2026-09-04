@@ -95,7 +95,10 @@ Training, architecture, and phone controls:
   --train-resolution N          Whole-image supervision edge
   --output-resolution N         Final/gallery edge
   --snapshot-resolution N       Preview/ladder edge
-  --episode-steps N --bptt N --core-update-every N
+  --episode-steps N             Legacy fixed developmental horizon
+  --age-min N --age-max N       Deterministically sample episode horizons in this range
+  --age-curriculum-steps N      Expand sampled upper horizon over N development steps (0: immediate)
+  --bptt N --core-update-every N
   --snapshot-every N --checkpoint-every N --log-every N
   --micro-size N --macro-size N --channels N --genome-dim N
   --interface-grid N            2..16; 8 is balanced reconstruction default
@@ -504,6 +507,16 @@ pub struct RunConfig {
     pub output_resolution: usize,
     pub snapshot_resolution: usize,
     pub episode_steps: usize,
+    /// Optional variable episode-horizon range. `None` for both fields keeps
+    /// the legacy fixed `episode_steps` schedule and its checkpoint signature.
+    #[serde(default)]
+    pub age_min: Option<usize>,
+    #[serde(default)]
+    pub age_max: Option<usize>,
+    /// Development steps over which the upper sampled horizon expands from
+    /// `age_min` to `age_max`. Zero enables the full range immediately.
+    #[serde(default)]
+    pub age_curriculum_steps: usize,
     pub episode_reset: f32,
     pub memory_reset: f32,
     pub bptt: usize,
@@ -676,6 +689,9 @@ impl Default for RunConfig {
             output_resolution: 768,
             snapshot_resolution: 384,
             episode_steps: 64,
+            age_min: None,
+            age_max: None,
+            age_curriculum_steps: 0,
             episode_reset: 0.85,
             bptt: 4,
             memory_reset: 1.0,
@@ -916,6 +932,9 @@ impl RunConfig {
                 "--output-resolution" => cfg.output_resolution = parse(&value()?, flag)?,
                 "--snapshot-resolution" => cfg.snapshot_resolution = parse(&value()?, flag)?,
                 "--episode-steps" => cfg.episode_steps = parse(&value()?, flag)?,
+                "--age-min" => cfg.age_min = Some(parse(&value()?, flag)?),
+                "--age-max" => cfg.age_max = Some(parse(&value()?, flag)?),
+                "--age-curriculum-steps" => cfg.age_curriculum_steps = parse(&value()?, flag)?,
                 "--episode-reset" => cfg.episode_reset = parse(&value()?, flag)?,
                 "--memory-reset" => cfg.memory_reset = parse(&value()?, flag)?,
                 "--bptt" => cfg.bptt = parse(&value()?, flag)?,
@@ -1250,8 +1269,24 @@ impl RunConfig {
         if !self.render_only && !self.analysis.only && !self.steps.is_multiple_of(self.bptt) {
             bail!("--steps must be a multiple of --bptt");
         }
-        if !self.episode_steps.is_multiple_of(self.bptt) {
+        if self.age_min.is_none() && !self.episode_steps.is_multiple_of(self.bptt) {
             bail!("--episode-steps must be a multiple of --bptt");
+        }
+        match (self.age_min, self.age_max) {
+            (None, None) => {
+                if self.age_curriculum_steps > 0 {
+                    bail!("--age-curriculum-steps requires --age-min and --age-max");
+                }
+            }
+            (Some(min), Some(max)) => {
+                if min == 0 || min > max || max > 4096 {
+                    bail!("age horizons must satisfy 1 <= --age-min <= --age-max <= 4096");
+                }
+                if !min.is_multiple_of(self.bptt) || !max.is_multiple_of(self.bptt) {
+                    bail!("--age-min and --age-max must be multiples of --bptt");
+                }
+            }
+            _ => bail!("--age-min and --age-max must be provided together"),
         }
         if !(1..=64).contains(&self.threads) {
             bail!("--threads must be in 1..=64");
@@ -1669,7 +1704,11 @@ impl RunConfig {
             self.chroma.to_bits() as u64,
             self.gamma.to_bits() as u64,
             self.train_resolution as u64,
-            self.episode_steps as u64,
+            if self.variable_age_enabled() {
+                0
+            } else {
+                self.episode_steps as u64
+            },
             self.episode_reset.to_bits() as u64,
             self.bptt as u64,
             self.memory_reset.to_bits() as u64,
@@ -1715,11 +1754,58 @@ impl RunConfig {
             self.max_saturation_fraction.to_bits() as u64,
             self.stability_patience as u64,
         ];
-        values
+        let legacy = values
             .into_iter()
             .fold(0xcbf2_9ce4_8422_2325, |hash, value| {
                 (hash ^ value).wrapping_mul(0x100_0000_01b3)
-            })
+            });
+        let (Some(age_min), Some(age_max)) = (self.age_min, self.age_max) else {
+            return legacy;
+        };
+        [
+            0x6167_655f_7261_6e67,
+            age_min as u64,
+            age_max as u64,
+            self.age_curriculum_steps as u64,
+        ]
+        .into_iter()
+        .fold(legacy, |hash, value| {
+            (hash ^ value).wrapping_mul(0x100_0000_01b3)
+        })
+    }
+
+    /// Largest developmental age represented by this run schedule. Age
+    /// conditioning and mature telemetry stay on one absolute scale even when
+    /// shorter episodes are sampled.
+    pub fn developmental_horizon(&self) -> usize {
+        self.age_max.unwrap_or(self.episode_steps)
+    }
+
+    pub fn variable_age_enabled(&self) -> bool {
+        self.age_min.is_some()
+    }
+
+    /// Deterministic, BPTT-aligned horizon for an episode. Curriculum mode
+    /// expands the eligible upper bound linearly, then continues sampling the
+    /// full range so early-age behavior is not forgotten.
+    pub fn episode_horizon(&self, episode: u64, episode_start_step: u64) -> usize {
+        let (Some(min), Some(max)) = (self.age_min, self.age_max) else {
+            return self.episode_steps;
+        };
+        let upper = if self.age_curriculum_steps == 0 {
+            max
+        } else {
+            let elapsed = episode_start_step.min(self.age_curriculum_steps as u64);
+            let span = max - min;
+            let grown =
+                (span as u128 * elapsed as u128 / self.age_curriculum_steps as u128) as usize;
+            min + grown - grown % self.bptt
+        };
+        let choices = (upper - min) / self.bptt + 1;
+        let key = crate::tensor_ops::splitmix64(
+            self.seed ^ episode.wrapping_mul(0x8f3f_73b5_cf1c_9ade) ^ 0x6167_655f_686f_7269,
+        );
+        min + (key % choices as u64) as usize * self.bptt
     }
 
     pub fn resolved_config_signature(&self) -> u64 {
@@ -2167,5 +2253,76 @@ mod tests {
         );
         assert!(ComputeBackend::parse("cuda").is_err());
         Ok(())
+    }
+
+    #[test]
+    fn variable_age_horizons_are_deterministic_bptt_aligned_and_signed() {
+        let legacy = RunConfig::default();
+        assert_eq!(legacy.episode_horizon(17, 1024), legacy.episode_steps);
+        assert_eq!(legacy.developmental_horizon(), legacy.episode_steps);
+
+        let variable = RunConfig {
+            age_min: Some(32),
+            age_max: Some(96),
+            ..legacy.clone()
+        };
+        variable.validate().unwrap();
+        assert_eq!(variable.developmental_horizon(), 96);
+        assert_ne!(
+            legacy.checkpoint_signature(),
+            variable.checkpoint_signature()
+        );
+        let mut legacy_horizon_changed = variable.clone();
+        legacy_horizon_changed.episode_steps = 63;
+        legacy_horizon_changed.validate().unwrap();
+        assert_eq!(
+            variable.checkpoint_signature(),
+            legacy_horizon_changed.checkpoint_signature()
+        );
+        for episode in 0..128 {
+            let first = variable.episode_horizon(episode, 4096);
+            let second = variable.episode_horizon(episode, 4096);
+            assert_eq!(first, second);
+            assert!((32..=96).contains(&first));
+            assert!(first.is_multiple_of(variable.bptt));
+        }
+    }
+
+    #[test]
+    fn age_curriculum_expands_without_dropping_short_horizons() {
+        let config = RunConfig {
+            age_min: Some(16),
+            age_max: Some(64),
+            age_curriculum_steps: 1024,
+            ..RunConfig::default()
+        };
+        config.validate().unwrap();
+        assert_eq!(config.episode_horizon(0, 0), 16);
+        for episode in 0..64 {
+            let midpoint = config.episode_horizon(episode, 512);
+            assert!((16..=40).contains(&midpoint));
+            let mature = config.episode_horizon(episode, 1024);
+            assert!((16..=64).contains(&mature));
+        }
+    }
+
+    #[test]
+    fn variable_age_controls_require_a_complete_aligned_range() {
+        let missing_max = RunConfig {
+            age_min: Some(32),
+            ..RunConfig::default()
+        };
+        assert!(missing_max.validate().is_err());
+        let unaligned = RunConfig {
+            age_min: Some(30),
+            age_max: Some(64),
+            ..RunConfig::default()
+        };
+        assert!(unaligned.validate().is_err());
+        let orphan_curriculum = RunConfig {
+            age_curriculum_steps: 100,
+            ..RunConfig::default()
+        };
+        assert!(orphan_curriculum.validate().is_err());
     }
 }
