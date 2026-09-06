@@ -126,12 +126,24 @@ target separation, gamut, and stability remain acceptable.
 
 ## Autonomous and perturbation analysis
 
+Analysis version 2 autonomous rollout supplies no reference tensors and uses
+fidelity zero for every step, retaining the saved state/memory and fixed genome.
+Records include the version, fidelity, and micro/macro reference-drive RMS.
+Legacy reports without this version used continued reference guidance.
+
 Autonomous rollout records offset, interval-averaged micro/macro movement and
 RMS/near-bound occupancy, memory RMS, image delta, nearest prior-state
 signature distance, output fingerprint, and a
-conservative approximate-cycle flag. Continued wandering alone is not labeled
+conservative approximate-cycle flag that requires a valid prior signature.
+The signature remains channel spatial means plus memory: it can miss spatial
+rearrangements and is not a full-state recurrence test. Continued wandering alone
+is not labeled
 a strange attractor. First-sample image/recurrence distances carry explicit
 validity flags rather than using a sentinel value.
+
+Perturbation analysis remains reference-guided and records its reference fidelity.
+Legacy `_gaussian` case names are preserved, but `noise_distribution` identifies
+the actual uniform perturbations on `[-0.03, 0.03)` before smooth projection.
 
 Perturbation analysis evolves one untouched mature control beside deterministic
 micro, macro, and memory noise plus localized micro/macro erased patches. It
@@ -178,6 +190,25 @@ its drive RMS must be exactly zero and same-age outputs must be identical across
 targets. Treat that row as a target-independent prior baseline. Positive
 fidelities measure transfer to held-out inputs. Neither result alone establishes
 broad natural-image generalization beyond the curated probe set.
+
+## Analysis provenance and continuation boundaries
+
+The latest analysis summary includes `provenance.completed` for every diagnostic:
+false means not evaluated in this report, not a measured zero. An evaluated
+resolution ladder may have zero comparable scale pairs. A unique evaluation
+ID and `analysis_history_v9_<tag>/` JSON archive preserve complete results across
+subsequent invocations. Provenance includes build and resolved configuration,
+initial state/genome fingerprints, the on-disk checkpoint manifest and file
+identities, and a fingerprinted artifact inventory. File identities use
+FNV-1a 64-bit plus byte length for accidental mismatch detection, not cryptographic
+verification. Archive JSON is retained; image paths may subsequently be overwritten.
+On-disk checkpoint identity and evaluated runtime anatomy are recorded separately
+because append grafts can change runtime capacity before analysis.
+
+Legacy sidecar arrays and the 109-column CSV format are unchanged. A resumed run
+can replay steps beyond its last durable checkpoint: `step` alone is not a unique
+CSV key. Segment at step reversals and retain invocation context before computing
+trends; do not silently average conflicting repeated steps.
 
 ## Recommended experiment sequence
 

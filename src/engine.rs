@@ -2110,7 +2110,81 @@ mod tests {
         analysis.fresh = false;
         analysis.analysis.only = true;
         analysis.analysis.render_attribution = true;
+        analysis.analysis.autonomous_horizon = 4;
+        analysis.analysis.stride = 1;
+        analysis.analysis.perturbation_horizon = 2;
+        run(analysis.clone())?;
+        let first_analysis: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&paths.analysis)?)?;
+        let archive = first_analysis["provenance"]["archive"].as_str().unwrap();
+        let archived_bytes = std::fs::read(archive)?;
+        assert_eq!(archived_bytes, std::fs::read(&paths.analysis)?);
+        assert_eq!(
+            first_analysis["provenance"]["completed"]["autonomous_rollout"],
+            true
+        );
+        assert_eq!(
+            first_analysis["provenance"]["completed"]["benchmark"],
+            false
+        );
+        assert_eq!(
+            first_analysis["provenance"]["completed"]["resolution_consistency"],
+            true
+        );
+        assert_eq!(
+            first_analysis["resolution_consistency"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(first_analysis["provenance"]["artifacts"]
+            .get(paths.resolution_ladder.to_str().unwrap())
+            .is_some());
+        assert_eq!(first_analysis["provenance"]["initial_world"]["step"], 4);
+        assert_eq!(
+            first_analysis["provenance"]["checkpoint_manifest"]["world_step"],
+            4
+        );
+        assert!(
+            !first_analysis["provenance"]["checkpoint_files"]["model"]["fnv1a64"]
+                .as_str()
+                .unwrap()
+                .is_empty()
+        );
+        let first_record = &first_analysis["autonomous_rollout"][0];
+        assert_eq!(first_record["analysis_version"], 2);
+        assert_eq!(first_record["reference_fidelity"], 0.0);
+        assert_eq!(first_record["micro_reference_drive_rms"], 0.0);
+        assert_eq!(first_record["macro_reference_drive_rms"], 0.0);
+        assert_eq!(first_record["approximate_cycle_candidate"], false);
+        assert_eq!(
+            first_analysis["perturbations"][0]["reference_fidelity"],
+            analysis.reference_fidelity_max
+        );
+        assert!(first_analysis["perturbations"][0]["noise_distribution"]
+            .as_str()
+            .unwrap()
+            .starts_with("uniform"));
+        let old_attractor = std::fs::read(&paths.attractor_analysis)?;
+        analysis.analysis.autonomous_horizon = 0;
+        analysis.analysis.perturbation_horizon = 0;
         run(analysis)?;
+        let second_analysis: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&paths.analysis)?)?;
+        assert_ne!(
+            first_analysis["provenance"]["evaluation_id"],
+            second_analysis["provenance"]["evaluation_id"]
+        );
+        assert_eq!(
+            second_analysis["provenance"]["completed"]["autonomous_rollout"],
+            false
+        );
+        assert!(second_analysis["provenance"]["artifacts"]
+            .get(paths.attractor_analysis.to_str().unwrap())
+            .is_none());
+        assert_eq!(old_attractor, std::fs::read(&paths.attractor_analysis)?);
+        assert_eq!(archived_bytes, std::fs::read(archive)?);
         assert_eq!(checkpoint_before[0], std::fs::read(&paths.model)?);
         assert_eq!(checkpoint_before[1], std::fs::read(&paths.optimizer)?);
         assert_eq!(checkpoint_before[2], std::fs::read(&paths.world)?);

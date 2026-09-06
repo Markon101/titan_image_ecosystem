@@ -23,6 +23,9 @@ use rand_chacha::ChaCha8Rng;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
+mod provenance;
+pub use provenance::AnalysisProvenance;
+
 #[derive(Clone, Debug, Serialize)]
 pub struct FrontierPoint {
     pub emergence_strength: f32,
@@ -54,6 +57,10 @@ pub struct ResolutionConsistencyPoint {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct AttractorRecord {
+    pub analysis_version: u32,
+    pub reference_fidelity: f32,
+    pub micro_reference_drive_rms: f32,
+    pub macro_reference_drive_rms: f32,
     pub offset: usize,
     pub micro_movement: f32,
     pub macro_movement: f32,
@@ -73,6 +80,8 @@ pub struct AttractorRecord {
 #[derive(Clone, Debug, Serialize)]
 pub struct PerturbationRecord {
     pub name: String,
+    pub noise_distribution: &'static str,
+    pub reference_fidelity: f32,
     pub initial_state_distance: f32,
     pub final_state_distance: f32,
     pub final_output_l1: f32,
@@ -145,6 +154,7 @@ pub struct BenchmarkRunReport {
 #[derive(Clone, Debug, Serialize)]
 pub struct AnalysisSummary {
     pub schema_version: u32,
+    pub provenance: AnalysisProvenance,
     pub world_step: u64,
     pub interpretation_rule: &'static str,
     pub decomposition_labels: Vec<String>,
@@ -174,6 +184,7 @@ pub fn run_checkpoint_analysis(
 ) -> Result<AnalysisSummary> {
     let mut summary = AnalysisSummary {
         schema_version: crate::config::SCHEMA_VERSION,
+        provenance: AnalysisProvenance::new(config, paths, corpus, world, sample)?,
         world_step: world.step,
         interpretation_rule:
             "Operational diagnostics only; no automatic claim of strong emergence, homeostasis, strange attractors, or dynamical causation.",
@@ -249,6 +260,11 @@ pub fn run_checkpoint_analysis(
             config, corpus, dynamics, renderer, world, device,
         )?);
     }
+    summary.provenance.completed = provenance::completion_status(&summary);
+    summary.provenance.artifacts = provenance::completed_artifacts(paths, &summary)?;
+    let archive = PathBuf::from(&summary.provenance.archive);
+    std::fs::create_dir_all(archive.parent().expect("analysis archive directory"))?;
+    write_json_atomic(&archive, &summary)?;
     write_json_atomic(&paths.analysis, &summary)?;
     Ok(summary)
 }
@@ -571,14 +587,7 @@ fn autonomous_rollout(
     let mut macro_movement_sum = 0.0f32;
     let mut macro_updates = 0usize;
     for offset in 1..=config.analysis.autonomous_horizon {
-        let stepped = dynamics.step(
-            &probe,
-            &sample.genome_tensor,
-            Some(&sample.reference_micro),
-            Some(&sample.reference_macro),
-            config.reference_fidelity_max,
-            false,
-        )?;
+        let stepped = dynamics.step(&probe, &sample.genome_tensor, None, None, 0.0, false)?;
         movement_samples += 1;
         micro_movement_sum += stepped.micro_movement;
         if stepped.macro_updated {
@@ -621,6 +630,10 @@ fn autonomous_rollout(
             0.0
         };
         records.push(AttractorRecord {
+            analysis_version: 2,
+            reference_fidelity: 0.0,
+            micro_reference_drive_rms: stepped.micro_reference_drive_rms,
+            macro_reference_drive_rms: stepped.macro_reference_drive_rms,
             offset,
             micro_movement,
             macro_movement,
@@ -634,7 +647,8 @@ fn autonomous_rollout(
             recurrence_distance_valid,
             recurrence_distance,
             output_fingerprint: tensor_fingerprint(&rendered.image)?,
-            approximate_cycle_candidate: recurrence_distance < 1e-3
+            approximate_cycle_candidate: recurrence_distance_valid
+                && recurrence_distance < 1e-3
                 && micro_movement + macro_movement < 1e-3,
         });
         let path = sibling_png(&paths.attractor_analysis, &format!("{offset:05}"));
@@ -752,6 +766,12 @@ fn perturbation_recovery(
             let final_output_l1 = mean_abs(&image.sub(&control_image)?)?;
             let recovery_ratio = final_state_distance / initial[index].max(1e-8);
             Ok(PerturbationRecord {
+                noise_distribution: if name.ends_with("_gaussian") {
+                    "uniform[-0.03,0.03); legacy case name retained"
+                } else {
+                    "none; deterministic central patch erasure"
+                },
+                reference_fidelity: config.reference_fidelity_max,
                 name,
                 initial_state_distance: initial[index],
                 final_state_distance,
@@ -1151,6 +1171,9 @@ fn sibling_png(base: &Path, label: &str) -> PathBuf {
         .unwrap_or("titan_image_analysis_v9");
     base.with_file_name(format!("{stem}_{label}.png"))
 }
+
+#[cfg(test)]
+mod regression;
 
 #[cfg(test)]
 mod tests {

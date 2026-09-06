@@ -79,7 +79,7 @@ Analysis:
                                 Comma-separated reference strengths (default 1,0.5,0.25,0.1,0)
   --render-attribution          Frozen-state decomposition and emergence sweep
   --model-stats                 Request checkpoint model statistics
-  --autonomous-rollout N        Mature frozen-weight continuation horizon
+  --autonomous-rollout N        Mature frozen-weight reference-free continuation
   --perturbation-analysis N     Deterministic damage/recovery horizon
   --dynamics-ablation N         Causal cloned-trajectory horizon
   --analysis-stride N           Heavy-analysis sampling stride

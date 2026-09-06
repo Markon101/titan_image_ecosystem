@@ -377,6 +377,13 @@ image/state/memory stability, and reference-drive metrics are recorded for each
 point. Probe ages must be sorted unique values in `1..=4096`; fidelities must be
 unique values in `0..=1`. Defaults are the two lists shown above.
 
+Autonomous mature rollout removes both reference tensors and sets reference
+fidelity to zero at every continuation step. It retains the saved organism,
+its memory, and its fixed genome; this tests reference withdrawal from a
+developed state, not the fresh zero-reference prior. Analysis version 2 records
+zero reference-drive RMS explicitly. Older rollout reports used ongoing reference
+guidance and must not be compared as the same experiment.
+
 Autonomous mature rollout:
 
 ~~~sh
@@ -387,6 +394,21 @@ Autonomous mature rollout:
   --autonomous-rollout 512 --analysis-stride 32 \
   --run-tag reconstruction-plus-v9-01
 ~~~
+
+Perturbation recovery and causal dynamics ablations remain reference-guided;
+recovery records explicitly include the configured fidelity. Legacy case names
+ending in `_gaussian` are retained for readers, with an added field identifying
+the actual deterministic uniform noise distribution.
+
+Completed analysis summaries now include additive provenance: analysis version,
+evaluation ID, build/configuration, initial state fingerprints, on-disk checkpoint
+identities, diagnostic completion flags, and fingerprints of generated artifacts.
+Each complete JSON summary is also retained in `analysis_history_v9_<tag>/`.
+Existing latest-summary and sidecar filenames remain available. Sidecars absent
+from the completion/artifact inventory belong to another evaluation or were not
+requested. Image paths remain mutable; verify the recorded fingerprint before
+using an image with an archived report. This adds no checkpoint/schema migration
+and does not alter training trajectories or the CSV format.
 
 Perturbation recovery and causal dynamics ablations:
 
