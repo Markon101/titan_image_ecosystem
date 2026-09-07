@@ -1,4 +1,4 @@
-use crate::analysis::run_checkpoint_analysis;
+use crate::analysis::{run_checkpoint_analysis, EvaluationArtifacts};
 use crate::comparison::compare_v8_v9;
 use crate::config::{
     BoundaryMode, ComputeBackend, ConditioningMode, MorphDepthMode, ObjectiveMode, RunConfig,
@@ -1197,7 +1197,14 @@ pub fn run(config: RunConfig) -> Result<()> {
         &world.morph_birth_generations,
         config.objective.uses_flow(),
     )?;
-    write_json_atomic(&paths.model_stats, &final_model_stats)?;
+    let mut evaluation = if config.analysis.only {
+        Some(EvaluationArtifacts::new(&config, world.step)?)
+    } else {
+        None
+    };
+    write_evaluation_output(&mut evaluation, &paths.model_stats, |path| {
+        write_json_atomic(path, &final_model_stats)
+    })?;
     if training_enabled {
         write_json_atomic(
             &target_statistics_path,
@@ -1250,14 +1257,21 @@ pub fn run(config: RunConfig) -> Result<()> {
     } else {
         paths.emergent.clone()
     };
-    save_png(&final_render.image, &final_raw_path)?;
-    save_mastered_png(
-        &final_render.image,
-        &final_mastered_path,
-        config.mastering_strength,
-    )?;
-    save_png(&final_render.grounded_image, &final_grounded_path)?;
-    save_png(&final_render.emergent_visual, &final_emergent_path)?;
+    let final_raw_path = write_evaluation_output(&mut evaluation, &final_raw_path, |path| {
+        save_png(&final_render.image, path)
+    })?;
+    let final_mastered_path =
+        write_evaluation_output(&mut evaluation, &final_mastered_path, |path| {
+            save_mastered_png(&final_render.image, path, config.mastering_strength)
+        })?;
+    let final_grounded_path =
+        write_evaluation_output(&mut evaluation, &final_grounded_path, |path| {
+            save_png(&final_render.grounded_image, path)
+        })?;
+    let final_emergent_path =
+        write_evaluation_output(&mut evaluation, &final_emergent_path, |path| {
+            save_png(&final_render.emergent_visual, path)
+        })?;
     let mut outputs = vec![
         final_raw_path.display().to_string(),
         final_mastered_path.display().to_string(),
@@ -1269,16 +1283,26 @@ pub fn run(config: RunConfig) -> Result<()> {
     }
     if config.save_state_atlas {
         println!("Writing micro/macro state atlases...");
-        save_state_atlas(&world.micro, &paths.micro_state)?;
-        save_state_atlas(&world.macro_field, &paths.macro_state)?;
-        outputs.push(paths.micro_state.display().to_string());
-        outputs.push(paths.macro_state.display().to_string());
+        let micro = write_evaluation_output(&mut evaluation, &paths.micro_state, |path| {
+            save_state_atlas(&world.micro, path)
+        })?;
+        let macro_field = write_evaluation_output(&mut evaluation, &paths.macro_state, |path| {
+            save_state_atlas(&world.macro_field, path)
+        })?;
+        outputs.push(micro.display().to_string());
+        outputs.push(macro_field.display().to_string());
     }
+    let mut analysis_summary = None;
     if !stability_stopped && (config.analysis_requested() || config.analysis.emergence_gallery) {
         println!("ANALYSIS: decomposition, emergence frontier, and requested frozen-state probes");
+        if evaluation.is_none() {
+            evaluation = Some(EvaluationArtifacts::new(&config, world.step)?);
+        }
+        let artifacts = evaluation.as_mut().expect("evaluation initialized");
         let analysis = run_checkpoint_analysis(
             &config,
             &paths,
+            artifacts,
             &mut corpus,
             &dynamics,
             &renderer,
@@ -1287,18 +1311,11 @@ pub fn run(config: RunConfig) -> Result<()> {
             &sample,
             &device,
         )?;
-        outputs.push(paths.analysis.display().to_string());
-        if let Some(probe) = &analysis.natural_image_probe {
-            outputs.push(probe.report.clone());
-            outputs.push(probe.montage.clone());
-            for target in &probe.targets {
-                outputs.extend(target.points.iter().map(|point| point.output.clone()));
-            }
-        }
-        if config.analysis.render_attribution || config.analysis.emergence_gallery {
-            outputs.push(paths.decomposition.display().to_string());
-            outputs.push(paths.emergence_frontier.display().to_string());
-        }
+        outputs.push(artifacts.archive().display().to_string());
+        outputs.extend(artifacts.emitted_paths().cloned());
+        outputs.sort();
+        outputs.dedup();
+        analysis_summary = Some(analysis);
     }
     interrupted |= stop_requested();
     let (gallery_outputs, gallery_interrupted) = if stability_stopped || config.analysis.only {
@@ -1404,9 +1421,17 @@ pub fn run(config: RunConfig) -> Result<()> {
     } else {
         &paths.metadata
     };
+    if config.analysis.only {
+        write_evaluation_output(&mut evaluation, metadata_path, |path| {
+            write_json_atomic(path, &metadata)
+        })?;
+    }
     write_json_atomic(metadata_path, &metadata)?;
     if let Some(v8_dir) = config.analysis.compare_v8_dir.as_deref() {
-        let comparison = compare_v8_v9(v8_dir, &paths)?;
+        let comparison = compare_v8_v9(v8_dir, &paths, analysis_summary.as_ref())?;
+        write_evaluation_output(&mut evaluation, &paths.comparison, |path| {
+            write_json_atomic(path, &comparison)
+        })?;
         println!(
             "V8/V9 COMPARISON: v8 content {:?} -> v9 content {:?}, speed {:?} -> {:?}",
             comparison.v8.reconstruction_content,
@@ -1414,6 +1439,10 @@ pub fn run(config: RunConfig) -> Result<()> {
             comparison.v8.development_steps_per_second,
             comparison.v9.development_steps_per_second,
         );
+    }
+    if let (Some(artifacts), Some(summary)) = (evaluation, analysis_summary) {
+        let summary = artifacts.publish(summary, &paths.analysis)?;
+        println!("ANALYSIS ARCHIVE: {}", summary.provenance.archive);
     }
     println!(
         "{} at world step {} in {:.2}s ({:.2} development step/s). Raw: {}  Mastered: {}",
@@ -1432,6 +1461,19 @@ pub fn run(config: RunConfig) -> Result<()> {
         println!("Gallery: {}", paths.gallery.display());
     }
     Ok(())
+}
+
+fn write_evaluation_output(
+    evaluation: &mut Option<EvaluationArtifacts>,
+    canonical: &std::path::Path,
+    generate: impl FnOnce(&std::path::Path) -> Result<()>,
+) -> Result<PathBuf> {
+    if let Some(artifacts) = evaluation {
+        artifacts.write(canonical, generate)
+    } else {
+        generate(canonical)?;
+        Ok(canonical.to_path_buf())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2138,8 +2180,14 @@ mod tests {
                 .len(),
             0
         );
+        let archived_path = |canonical: &std::path::Path| {
+            std::path::Path::new(archive)
+                .parent()
+                .unwrap()
+                .join(canonical.file_name().unwrap())
+        };
         assert!(first_analysis["provenance"]["artifacts"]
-            .get(paths.resolution_ladder.to_str().unwrap())
+            .get(archived_path(&paths.resolution_ladder).to_str().unwrap())
             .is_some());
         assert_eq!(first_analysis["provenance"]["initial_world"]["step"], 4);
         assert_eq!(
@@ -2166,7 +2214,7 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("uniform"));
-        let old_attractor = std::fs::read(&paths.attractor_analysis)?;
+        let old_attractor = std::fs::read(archived_path(&paths.attractor_analysis))?;
         analysis.analysis.autonomous_horizon = 0;
         analysis.analysis.perturbation_horizon = 0;
         run(analysis)?;
@@ -2183,7 +2231,10 @@ mod tests {
         assert!(second_analysis["provenance"]["artifacts"]
             .get(paths.attractor_analysis.to_str().unwrap())
             .is_none());
-        assert_eq!(old_attractor, std::fs::read(&paths.attractor_analysis)?);
+        assert_eq!(
+            old_attractor,
+            std::fs::read(archived_path(&paths.attractor_analysis))?
+        );
         assert_eq!(archived_bytes, std::fs::read(archive)?);
         assert_eq!(checkpoint_before[0], std::fs::read(&paths.model)?);
         assert_eq!(checkpoint_before[1], std::fs::read(&paths.optimizer)?);

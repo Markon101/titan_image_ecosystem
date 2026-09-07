@@ -1,3 +1,4 @@
+use crate::analysis::EvaluationArtifacts;
 use crate::benchmark::{
     reconstruction_reference_metrics, target_reference_metrics, TargetReferenceMetrics,
 };
@@ -5,8 +6,7 @@ use crate::config::{RunConfig, TrainingMode, SCHEMA_VERSION};
 use crate::corpus::ImageCorpus;
 use crate::dynamics::DynamicsSystem;
 use crate::metrics::{image_metrics, state_metrics, tensor_rms};
-use crate::persistence::write_json_atomic;
-use crate::render::{save_contact_sheet_resized, save_png, ImplicitRenderer, RenderPlan};
+use crate::render::{ImplicitRenderer, RenderPlan};
 use crate::state::WorldState;
 use crate::tensor_ops::splitmix64;
 use anyhow::{bail, Result};
@@ -81,6 +81,7 @@ pub struct NaturalImageProbeReport {
 
 pub fn run_natural_image_probes(
     config: &RunConfig,
+    artifacts: &mut EvaluationArtifacts,
     training_corpus: &ImageCorpus,
     dynamics: &DynamicsSystem,
     renderer: &ImplicitRenderer,
@@ -200,11 +201,12 @@ pub fn run_natural_image_probes(
                 )?;
                 let fidelity_code = (reference_fidelity * 1000.0).round() as u16;
                 let output_path = config.output_dir.join(format!(
-                    "titan_image_probe_v9{}_{index:03}_{:016x}_f{fidelity_code:04}_a{age:04}.png",
+                    "titan_image_probe_v9{}_{index:03}_{:016x}_f{fidelity_code:04}_b{:08x}_a{age:04}.png",
                     config.suffix(),
                     sample.fingerprint,
+                    reference_fidelity.to_bits(),
                 ));
-                save_png(&rendered.image, &output_path)?;
+                let output_path = artifacts.png(&rendered.image, &output_path)?;
                 let reconstruction =
                     reconstruction_reference_metrics(&rendered.image, &sample.image)?;
                 let image = image_metrics(&rendered.image)?;
@@ -252,11 +254,12 @@ pub fn run_natural_image_probes(
         "titan_image_probe_montage_v9{}.png",
         config.suffix()
     ));
-    save_contact_sheet_resized(&output_paths, &montage_path, 192)?;
+    let montage_path = artifacts.montage(&output_paths, &montage_path, 192)?;
     let report_path = config.output_dir.join(format!(
         "titan_image_probe_report_v9{}.json",
         config.suffix()
     ));
+    let report_path = artifacts.output_path(&report_path);
     let report = NaturalImageProbeReport {
         schema_version: SCHEMA_VERSION,
         checkpoint_world_step: checkpoint_world.step,
@@ -280,6 +283,6 @@ pub fn run_natural_image_probes(
         interpretation_rule: "Held-out reconstruction diagnostics measure transfer behavior; they do not by themselves establish generalization beyond this probe set.",
         targets,
     };
-    write_json_atomic(&report_path, &report)?;
+    artifacts.json(&report_path, &report)?;
     Ok(report)
 }

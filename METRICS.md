@@ -201,7 +201,12 @@ subsequent invocations. Provenance includes build and resolved configuration,
 initial state/genome fingerprints, the on-disk checkpoint manifest and file
 identities, and a fingerprinted artifact inventory. File identities use
 FNV-1a 64-bit plus byte length for accidental mismatch detection, not cryptographic
-verification. Archive JSON is retained; image paths may subsequently be overwritten.
+verification. Provenance version 3 stores images and reports in the same unique
+`step_<world-step>_<evaluation-id>/` directory as `evaluation.json`. The writer
+registers only freshly emitted bytes, checks them before publication, and never
+reopens a previous evaluation for output. Root-level latest JSON files point to
+these retained artifacts. Version 2 archives referenced mutable canonical paths;
+their fingerprints and completion flags alone do not establish fresh ownership.
 On-disk checkpoint identity and evaluated runtime anatomy are recorded separately
 because append grafts can change runtime capacity before analysis.
 

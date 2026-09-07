@@ -8,11 +8,9 @@ use crate::dynamics::{DynamicsAblation, DynamicsSystem};
 use crate::flow::{flow_oklab_to_rgb, RectifiedFlowRenderer};
 use crate::metrics::{image_metrics, state_metrics, tensor_rms};
 use crate::objectives::{cross_resolution_consistency, visual_loss};
-use crate::persistence::{write_json_atomic, ArtifactPaths};
+use crate::persistence::ArtifactPaths;
 use crate::probe::{run_natural_image_probes, NaturalImageProbeReport};
-use crate::render::{
-    save_contact_sheet_resized, save_png, ImplicitRenderer, RenderPlan, SpatialView,
-};
+use crate::render::{ImplicitRenderer, RenderPlan, SpatialView};
 use crate::state::WorldState;
 use crate::telemetry::tensor_fingerprint;
 use crate::tensor_ops::{mean_abs, smooth_limit, splitmix64};
@@ -23,7 +21,9 @@ use rand_chacha::ChaCha8Rng;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
+mod artifacts;
 mod provenance;
+pub use artifacts::EvaluationArtifacts;
 pub use provenance::AnalysisProvenance;
 
 #[derive(Clone, Debug, Serialize)]
@@ -174,6 +174,7 @@ pub struct AnalysisSummary {
 pub fn run_checkpoint_analysis(
     config: &RunConfig,
     paths: &ArtifactPaths,
+    artifacts: &mut EvaluationArtifacts,
     corpus: &mut ImageCorpus,
     dynamics: &DynamicsSystem,
     renderer: &ImplicitRenderer,
@@ -184,7 +185,7 @@ pub fn run_checkpoint_analysis(
 ) -> Result<AnalysisSummary> {
     let mut summary = AnalysisSummary {
         schema_version: crate::config::SCHEMA_VERSION,
-        provenance: AnalysisProvenance::new(config, paths, corpus, world, sample)?,
+        provenance: AnalysisProvenance::new(config, paths, corpus, world, sample, artifacts)?,
         world_step: world.step,
         interpretation_rule:
             "Operational diagnostics only; no automatic claim of strong emergence, homeostasis, strange attractors, or dynamical causation.",
@@ -202,8 +203,9 @@ pub fn run_checkpoint_analysis(
     };
 
     if config.analysis.render_attribution || config.analysis.emergence_gallery {
-        let (labels, montage, frontier) =
-            render_decomposition_frontier(config, paths, renderer, world, sample, device)?;
+        let (labels, montage, frontier) = render_decomposition_frontier(
+            config, paths, artifacts, renderer, world, sample, device,
+        )?;
         summary.decomposition_labels = labels;
         summary.decomposition_montage = Some(montage.display().to_string());
         summary.frontier = frontier;
@@ -211,21 +213,22 @@ pub fn run_checkpoint_analysis(
 
     if config.analysis.only {
         summary.resolution_consistency =
-            resolution_ladder(config, paths, renderer, world, sample, device)?;
+            resolution_ladder(config, paths, artifacts, renderer, world, sample, device)?;
         if config.mode == TrainingMode::Family {
             summary.target_separability = Some(target_separability(
-                config, paths, corpus, dynamics, renderer, device,
+                config, paths, artifacts, corpus, dynamics, renderer, device,
             )?);
         }
     }
     if config.analysis.autonomous_horizon > 0 {
-        summary.autonomous_rollout =
-            autonomous_rollout(config, paths, dynamics, renderer, world, sample, device)?;
+        summary.autonomous_rollout = autonomous_rollout(
+            config, paths, artifacts, dynamics, renderer, world, sample, device,
+        )?;
     }
     if config.analysis.perturbation_horizon > 0 {
         summary.perturbations =
             perturbation_recovery(config, dynamics, renderer, world, sample, device)?;
-        write_json_atomic(&paths.perturbation_analysis, &summary.perturbations)?;
+        artifacts.json(&paths.perturbation_analysis, &summary.perturbations)?;
     }
     if config.analysis.dynamics_horizon > 0 {
         summary.dynamics_ablation =
@@ -245,33 +248,29 @@ pub fn run_checkpoint_analysis(
             config.reconstruction.emergence_strength,
         )?;
         let image = flow_oklab_to_rgb(&flow_output.state)?;
-        save_png(&image, &paths.flow_sample)?;
-        write_json_atomic(&paths.flow_trajectory, &flow_output.trajectory)?;
-        summary.flow_sample = Some(paths.flow_sample.display().to_string());
+        let flow_path = artifacts.png(&image, &paths.flow_sample)?;
+        artifacts.json(&paths.flow_trajectory, &flow_output.trajectory)?;
+        summary.flow_sample = Some(flow_path.display().to_string());
     }
     if config.analysis.benchmark {
         summary.benchmark = Some(run_reconstruction_benchmark(
-            config, paths, dynamics, renderer, device,
+            config, paths, artifacts, dynamics, renderer, device,
         )?);
     }
     if config.analysis.probe_dir.is_some() {
         println!("PROBE: frozen held-out natural-image age/fidelity sweep");
         summary.natural_image_probe = Some(run_natural_image_probes(
-            config, corpus, dynamics, renderer, world, device,
+            config, artifacts, corpus, dynamics, renderer, world, device,
         )?);
     }
     summary.provenance.completed = provenance::completion_status(&summary);
-    summary.provenance.artifacts = provenance::completed_artifacts(paths, &summary)?;
-    let archive = PathBuf::from(&summary.provenance.archive);
-    std::fs::create_dir_all(archive.parent().expect("analysis archive directory"))?;
-    write_json_atomic(&archive, &summary)?;
-    write_json_atomic(&paths.analysis, &summary)?;
     Ok(summary)
 }
 
 fn run_reconstruction_benchmark(
     config: &RunConfig,
     paths: &ArtifactPaths,
+    artifacts: &mut EvaluationArtifacts,
     dynamics: &DynamicsSystem,
     renderer: &ImplicitRenderer,
     device: &Device,
@@ -350,12 +349,13 @@ fn run_reconstruction_benchmark(
         candidate_separability: pairwise_separability(&candidates)?,
         results,
     };
-    write_json_atomic(&paths.benchmark, &report)?;
+    artifacts.json(&paths.benchmark, &report)?;
     Ok(report)
 }
 fn render_decomposition_frontier(
     config: &RunConfig,
     paths: &ArtifactPaths,
+    artifacts: &mut EvaluationArtifacts,
     renderer: &ImplicitRenderer,
     world: &WorldState,
     sample: &TargetSample,
@@ -413,7 +413,7 @@ fn render_decomposition_frontier(
     let mut images = Vec::new();
     for (label, image) in entries {
         let path = sibling_png(&paths.decomposition, label);
-        save_png(image, &path)?;
+        let path = artifacts.png(image, &path)?;
         labels.push(format!("{label}:{}", path.display()));
         images.push(path);
     }
@@ -462,18 +462,19 @@ fn render_decomposition_frontier(
             &paths.decomposition,
             &format!("emergence_{index:02}_{normalized:.2}"),
         );
-        save_png(&rendered.image, &path)?;
+        let path = artifacts.png(&rendered.image, &path)?;
         labels.push(format!("emergence_{normalized:.2}:{}", path.display()));
         images.push(path);
     }
-    save_contact_sheet_resized(&images, &paths.decomposition, 256)?;
-    write_json_atomic(&paths.emergence_frontier, &frontier)?;
-    Ok((labels, paths.decomposition.clone(), frontier))
+    let montage = artifacts.montage(&images, &paths.decomposition, 256)?;
+    artifacts.json(&paths.emergence_frontier, &frontier)?;
+    Ok((labels, montage, frontier))
 }
 
 fn resolution_ladder(
     config: &RunConfig,
     paths: &ArtifactPaths,
+    artifacts: &mut EvaluationArtifacts,
     renderer: &ImplicitRenderer,
     world: &WorldState,
     sample: &TargetSample,
@@ -506,7 +507,7 @@ fn resolution_ladder(
             false,
         )?;
         let path = sibling_png(&paths.resolution_ladder, &format!("{resolution:04}"));
-        save_png(&rendered.image, &path)?;
+        let path = artifacts.png(&rendered.image, &path)?;
         images.push(path);
         renders.push((resolution, rendered.image));
     }
@@ -559,16 +560,18 @@ fn resolution_ladder(
             edge_l1,
         });
         let path = sibling_png(&paths.resolution_ladder, "crop_overlap");
-        save_png(&crop.image, &path)?;
+        let path = artifacts.png(&crop.image, &path)?;
         images.push(path);
     }
-    save_contact_sheet_resized(&images, &paths.resolution_ladder, 256)?;
+    artifacts.montage(&images, &paths.resolution_ladder, 256)?;
     Ok(consistency)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn autonomous_rollout(
     config: &RunConfig,
     paths: &ArtifactPaths,
+    artifacts: &mut EvaluationArtifacts,
     dynamics: &DynamicsSystem,
     renderer: &ImplicitRenderer,
     world: &WorldState,
@@ -652,7 +655,7 @@ fn autonomous_rollout(
                 && micro_movement + macro_movement < 1e-3,
         });
         let path = sibling_png(&paths.attractor_analysis, &format!("{offset:05}"));
-        save_png(&rendered.image, &path)?;
+        let path = artifacts.png(&rendered.image, &path)?;
         images.push(path);
         prior_image = Some(rendered.image.detach());
         movement_samples = 0;
@@ -660,12 +663,12 @@ fn autonomous_rollout(
         macro_movement_sum = 0.0;
         macro_updates = 0;
     }
-    save_contact_sheet_resized(
+    artifacts.montage(
         &images,
         &paths.attractor_analysis.with_extension("png"),
         256,
     )?;
-    write_json_atomic(&paths.attractor_analysis, &records)?;
+    artifacts.json(&paths.attractor_analysis, &records)?;
     Ok(records)
 }
 
@@ -902,6 +905,7 @@ fn dynamics_ablation(
 fn target_separability(
     config: &RunConfig,
     paths: &ArtifactPaths,
+    artifacts: &mut EvaluationArtifacts,
     corpus: &mut ImageCorpus,
     dynamics: &DynamicsSystem,
     renderer: &ImplicitRenderer,
@@ -937,7 +941,7 @@ fn target_separability(
             false,
         )?;
         let path = sibling_png(&paths.target_comparison, &format!("target_{index:03}"));
-        save_png(&rendered.image, &path)?;
+        let path = artifacts.png(&rendered.image, &path)?;
         montage.push(path);
         phenotypes.push((index, world, rendered.image, rendered.emergent_lab));
     }
@@ -989,7 +993,7 @@ fn target_separability(
         nearest_pair: nearest.map(|pair| (pair.first_target, pair.second_target)),
         pairs,
     };
-    save_contact_sheet_resized(&montage, &paths.target_comparison, 192)?;
+    artifacts.montage(&montage, &paths.target_comparison, 192)?;
     Ok(summary)
 }
 

@@ -1,4 +1,5 @@
-use crate::persistence::{write_json_atomic, ArtifactPaths};
+use crate::analysis::AnalysisSummary;
+use crate::persistence::ArtifactPaths;
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use serde_json::Value;
@@ -34,12 +35,17 @@ pub struct V8V9Comparison {
     pub v8_metadata: String,
     pub v9_metrics: String,
     pub v9_metadata: String,
+    pub v9_analysis_archive: Option<String>,
     pub v8: RunComparisonSnapshot,
     pub v9: RunComparisonSnapshot,
     pub interpretation: &'static str,
 }
 
-pub fn compare_v8_v9(v8_dir: &Path, v9_paths: &ArtifactPaths) -> Result<V8V9Comparison> {
+pub fn compare_v8_v9(
+    v8_dir: &Path,
+    v9_paths: &ArtifactPaths,
+    analysis: Option<&AnalysisSummary>,
+) -> Result<V8V9Comparison> {
     let v8_metrics = newest_with_prefix(v8_dir, "titan_image_metrics_v8", "csv")?;
     let v8_metadata = newest_with_prefix(v8_dir, "titan_image_run_metadata_v8", "json")?;
     if !v9_paths.metrics.exists() || !v9_paths.metadata.exists() {
@@ -50,39 +56,31 @@ pub fn compare_v8_v9(v8_dir: &Path, v9_paths: &ArtifactPaths) -> Result<V8V9Comp
         "v9",
         &v9_paths.metrics,
         &v9_paths.metadata,
-        Some(&v9_paths.analysis),
+        analysis
+            .and_then(|summary| summary.target_separability.as_ref())
+            .map(|report| f64::from(report.mean_output_l1)),
     )?;
-    let report = V8V9Comparison {
+    Ok(V8V9Comparison {
         v8_metrics: v8_metrics.display().to_string(),
         v8_metadata: v8_metadata.display().to_string(),
         v9_metrics: v9_paths.metrics.display().to_string(),
         v9_metadata: v9_paths.metadata.display().to_string(),
+        v9_analysis_archive: analysis.map(|summary| summary.provenance.archive.clone()),
         v8,
         v9,
         interpretation:
             "Developmental comparison only. Different schemas/checkpoints are not weight-compatible and metric improvements do not alone prove emergence or causality.",
-    };
-    write_json_atomic(&v9_paths.comparison, &report)?;
-    Ok(report)
+    })
 }
 
 fn snapshot(
     label: &str,
     metrics_path: &Path,
     metadata_path: &Path,
-    analysis_path: Option<&Path>,
+    target_separability: Option<f64>,
 ) -> Result<RunComparisonSnapshot> {
     let row = last_csv_row(metrics_path)?;
     let metadata: Value = serde_json::from_slice(&std::fs::read(metadata_path)?)?;
-    let target_separability = analysis_path
-        .filter(|path| path.exists())
-        .and_then(|path| std::fs::read(path).ok())
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|value| {
-            value
-                .pointer("/target_separability/mean_output_l1")
-                .and_then(Value::as_f64)
-        });
     Ok(RunComparisonSnapshot {
         label: label.to_owned(),
         world_step: field(&row, "step"),
@@ -168,6 +166,45 @@ fn newest_with_prefix(directory: &Path, prefix: &str, extension: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn comparison_does_not_load_a_stale_canonical_analysis() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "titan-compare-provenance-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root)?;
+        let config = crate::config::RunConfig {
+            output_dir: root.clone(),
+            ..Default::default()
+        };
+        let paths = ArtifactPaths::new(&config);
+        for path in [&paths.metrics, &root.join("titan_image_metrics_v8.csv")] {
+            std::fs::write(path, "step,loss_content\n12,0.25\n")?;
+        }
+        for path in [
+            &paths.metadata,
+            &root.join("titan_image_run_metadata_v8.json"),
+        ] {
+            std::fs::write(path, b"{}")?;
+        }
+        let stale = br#"{"target_separability":{"mean_output_l1":999.0}}"#;
+        std::fs::write(&paths.analysis, stale)?;
+        let comparison = compare_v8_v9(&root, &paths, None)?;
+        assert_eq!(comparison.v9.target_separability, None);
+        assert_eq!(comparison.v9_analysis_archive, None);
+        assert_eq!(comparison.v9.reconstruction_content, Some(0.25));
+        assert_eq!(std::fs::read(&paths.analysis)?, stale);
+        assert!(
+            !paths.comparison.exists(),
+            "only the evaluation writer publishes outputs"
+        );
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
 
     #[test]
     fn parses_flat_metrics_without_external_csv_dependency() -> Result<()> {

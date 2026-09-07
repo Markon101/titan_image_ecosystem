@@ -9,13 +9,9 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
 
-static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ArtifactIdentity {
     pub path: String,
     pub bytes: u64,
@@ -46,18 +42,10 @@ impl AnalysisProvenance {
         corpus: &ImageCorpus,
         world: &WorldState,
         sample: &TargetSample,
+        artifacts: &super::EvaluationArtifacts,
     ) -> Result<Self> {
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let evaluation_id = format!(
-            "{}-{}-{}",
-            nanos,
-            std::process::id(),
-            SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        );
-        let archive = config
-            .output_dir
-            .join(format!("analysis_history_v9{}", config.suffix()))
-            .join(format!("step_{}_{}.json", world.step, evaluation_id));
+        let evaluation_id = artifacts.evaluation_id.clone();
+        let archive = artifacts.archive();
         let mut checkpoint_files = BTreeMap::new();
         for (name, path) in [
             ("model", &paths.model),
@@ -77,7 +65,7 @@ impl AnalysisProvenance {
             None
         };
         Ok(Self {
-            analysis_version: 2,
+            analysis_version: 3,
             evaluation_id,
             archive: archive.display().to_string(),
             build: serde_json::json!({
@@ -111,7 +99,8 @@ impl AnalysisProvenance {
                 "recurrence_signature": "legacy channel spatial means plus memory; heuristic, not full-state recurrence",
                 "checkpoint_identity": "on-disk checkpoint bytes; runtime anatomy and state recorded separately",
                 "artifact_identity": "FNV-1a 64-bit plus byte length; non-cryptographic",
-                "archive": "complete JSON results retained; image paths remain mutable, verify fingerprints",
+                "archive": "write-once evaluation directory; evaluation.json published after successful registered writes",
+                "artifact_ownership": "all artifacts freshly emitted by this evaluation; no cached output adoption; canonical names are templates only",
             }),
             artifacts: BTreeMap::new(),
         })
@@ -139,63 +128,7 @@ pub(super) fn completion_status(summary: &AnalysisSummary) -> BTreeMap<String, b
     .collect()
 }
 
-pub(super) fn completed_artifacts(
-    paths: &ArtifactPaths,
-    summary: &AnalysisSummary,
-) -> Result<BTreeMap<String, ArtifactIdentity>> {
-    let mut files: Vec<PathBuf> = Vec::new();
-    if let Some(path) = &summary.decomposition_montage {
-        files.push(PathBuf::from(path));
-        files.push(paths.emergence_frontier.clone());
-        for label in &summary.decomposition_labels {
-            if let Some((_, path)) = label.split_once(':') {
-                files.push(PathBuf::from(path));
-            }
-        }
-    }
-    if summary.provenance.config.analysis.only {
-        files.push(paths.resolution_ladder.clone());
-    }
-    if summary.target_separability.is_some() {
-        files.push(paths.target_comparison.clone());
-    }
-    if !summary.autonomous_rollout.is_empty() {
-        files.push(paths.attractor_analysis.clone());
-        files.push(paths.attractor_analysis.with_extension("png"));
-        for record in &summary.autonomous_rollout {
-            files.push(super::sibling_png(
-                &paths.attractor_analysis,
-                &format!("{:05}", record.offset),
-            ));
-        }
-    }
-    if !summary.perturbations.is_empty() {
-        files.push(paths.perturbation_analysis.clone());
-    }
-    if summary.benchmark.is_some() {
-        files.push(paths.benchmark.clone());
-    }
-    if let Some(probe) = &summary.natural_image_probe {
-        files.push(PathBuf::from(&probe.report));
-        files.push(PathBuf::from(&probe.montage));
-        for target in &probe.targets {
-            files.extend(target.points.iter().map(|p| PathBuf::from(&p.output)));
-        }
-    }
-    if let Some(path) = &summary.flow_sample {
-        files.push(PathBuf::from(path));
-        files.push(paths.flow_trajectory.clone());
-    }
-    files
-        .into_iter()
-        .map(|path| {
-            let identity = file_identity(&path)?;
-            Ok((path.display().to_string(), identity))
-        })
-        .collect()
-}
-
-fn file_identity(path: &Path) -> Result<ArtifactIdentity> {
+pub(super) fn file_identity(path: &Path) -> Result<ArtifactIdentity> {
     let mut file = std::fs::File::open(path)
         .with_context(|| format!("cannot fingerprint {}", path.display()))?;
     let mut buffer = [0u8; 65536];

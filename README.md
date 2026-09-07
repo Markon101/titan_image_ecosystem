@@ -403,12 +403,25 @@ the actual deterministic uniform noise distribution.
 Completed analysis summaries now include additive provenance: analysis version,
 evaluation ID, build/configuration, initial state fingerprints, on-disk checkpoint
 identities, diagnostic completion flags, and fingerprints of generated artifacts.
-Each complete JSON summary is also retained in `analysis_history_v9_<tag>/`.
-Existing latest-summary and sidecar filenames remain available. Sidecars absent
-from the completion/artifact inventory belong to another evaluation or were not
-requested. Image paths remain mutable; verify the recorded fingerprint before
-using an image with an archived report. This adds no checkpoint/schema migration
-and does not alter training trajectories or the CSV format.
+Provenance version 3 gives every evaluation a newly created directory:
+`analysis_history_v9_<tag>/step_<world-step>_<evaluation-id>/evaluation.json`.
+Its PNGs and sidecar reports live alongside that JSON, retaining descriptive
+filenames. All entries in `provenance.artifacts` are fresh outputs registered by
+the successful write path; existing canonical files are never adopted. Montages
+accept only this evaluation's registered images. Duplicate destinations, failed
+or empty writes, unowned report references, and changed registered bytes prevent
+publication. Incomplete directories without `evaluation.json` are not evaluations.
+
+The root-level analysis JSON and render metadata remain convenience latest
+outputs. Analysis PNGs/reports, model statistics, state atlases, and optional
+v8/v9 comparison reports now live in the evaluation directory; consumers must
+follow the archive's paths instead of constructing root-level filenames. Probe
+filenames include exact fidelity bits as well as the rounded `f0500` display code,
+so distinct fidelities cannot collide. Historical v1/v2 archives and canonical
+files are left intact and do not gain v3 ownership guarantees retroactively.
+Source-image pyramid caches remain input caches, never evaluation outputs.
+There is no checkpoint/schema migration, training-trajectory change, or CSV change.
+See [the provenance audit](ANALYSIS_PROVENANCE.md) for the invariant and tests.
 
 Perturbation recovery and causal dynamics ablations:
 
