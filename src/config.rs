@@ -7,6 +7,13 @@ pub const MIN_PHYSICAL_CHANNELS: usize = 12;
 const CLI_HELP_V9: &str = r#"TITAN Image 0.9.1 (schema 9) - compact recurrent morphogenic learner
 Usage: titan_image --corpus-dir PATH [options]
 
+Experimental configuration:
+  --config-json PATH           Complete saved RunConfig JSON; scalar flags override
+  --training-rmsnorm MODE       legacy | differentiable (tracked training only)
+  --optimizer-diagnostics       Per-group gradient/update JSONL
+  Training withdrawal phases are configured in experiment.withdrawal in JSON.
+  Fork/import: titan_image fork --help
+
 Lifecycle and presets:
   --corpus-dir PATH             PNG/JPEG/WebP corpus (required)
   --output-dir PATH             v9 artifact directory
@@ -35,7 +42,7 @@ Reconstruction++:
   --loss-ground-coarse X        Coarse grounded reconstruction weight
   --loss-ground-mid X           Medium grounded reconstruction weight
   --loss-ground-fine X          Fine grounded reconstruction weight
-  --loss-emergent-fit X         Compatible residual-fit weight
+  --loss-emergent-fit X         Reconstruction-completion residual fit (not novelty/motion)
   --loss-emergent-low X         Low-band residual regularizer
   --loss-emergent-tv X          Residual total-variation regularizer
   --loss-head-redundancy X      Ground/emergent correlation penalty
@@ -463,6 +470,8 @@ pub struct AnalysisConfig {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunConfig {
+    #[serde(default)]
+    pub experiment: crate::experiment::TrainingExperiment,
     pub corpus_dir: PathBuf,
     pub output_dir: PathBuf,
     pub run_tag: Option<String>,
@@ -586,6 +595,7 @@ impl Default for RunConfig {
             .map(|n| n.get().min(8))
             .unwrap_or(4);
         let mut config = Self {
+            experiment: Default::default(),
             corpus_dir: PathBuf::from("/sdcard/Download/titan_image_sources"),
             output_dir: PathBuf::from("/sdcard/Download/titan_image_v9"),
             run_tag: None,
@@ -779,9 +789,14 @@ impl RunConfig {
             return Ok(None);
         }
 
-        let mut cfg = Self::default();
+        let mut cfg = if let Some(index) = args.iter().position(|a| a == "--config-json") {
+            let path = args.get(index + 1).context("--config-json needs a path")?;
+            serde_json::from_slice(&std::fs::read(path)?)?
+        } else {
+            Self::default()
+        };
         preapply_presets(&args, &mut cfg)?;
-        let mut corpus_was_explicit = false;
+        let mut corpus_was_explicit = args.iter().any(|a| a == "--config-json");
         let mut i = 0;
         while i < args.len() {
             let flag = &args[i];
@@ -792,6 +807,17 @@ impl RunConfig {
                     .with_context(|| format!("missing value for {flag}"))
             };
             match flag.as_str() {
+                "--config-json" => {
+                    let _ = value()?;
+                }
+                "--training-rmsnorm" => {
+                    cfg.experiment.norm = match value()?.as_str() {
+                        "legacy" => crate::experiment::NormTraining::Legacy,
+                        "differentiable" => crate::experiment::NormTraining::Differentiable,
+                        _ => bail!("expected legacy or differentiable RMSNorm"),
+                    }
+                }
+                "--optimizer-diagnostics" => cfg.experiment.optimizer_diagnostics = true,
                 "--corpus-dir" => {
                     cfg.corpus_dir = PathBuf::from(value()?);
                     corpus_was_explicit = true;
@@ -1249,7 +1275,8 @@ impl RunConfig {
     }
 
     pub fn analysis_requested(&self) -> bool {
-        self.analysis.only
+        self.experiment.panel.is_some()
+            || self.analysis.only
             || self.analysis.render_attribution
             || self.analysis.model_stats
             || self.analysis.autonomous_horizon > 0
@@ -1260,6 +1287,7 @@ impl RunConfig {
             || self.analysis.dynamics_horizon > 0
     }
     pub fn validate(&self) -> Result<()> {
+        self.experiment.validate(self)?;
         if !self.render_only && !self.analysis.only && self.steps == 0 {
             bail!("--steps must be positive unless render-only or analysis-only is selected");
         }
@@ -1760,9 +1788,9 @@ impl RunConfig {
                 (hash ^ value).wrapping_mul(0x100_0000_01b3)
             });
         let (Some(age_min), Some(age_max)) = (self.age_min, self.age_max) else {
-            return legacy;
+            return self.experiment.signature(legacy);
         };
-        [
+        let aged = [
             0x6167_655f_7261_6e67,
             age_min as u64,
             age_max as u64,
@@ -1771,7 +1799,8 @@ impl RunConfig {
         .into_iter()
         .fold(legacy, |hash, value| {
             (hash ^ value).wrapping_mul(0x100_0000_01b3)
-        })
+        });
+        self.experiment.signature(aged)
     }
 
     /// Largest developmental age represented by this run schedule. Age

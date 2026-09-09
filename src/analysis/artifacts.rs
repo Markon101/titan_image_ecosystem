@@ -168,6 +168,23 @@ impl EvaluationArtifacts {
                 owned(&point.output)?;
             }
         }
+        if let Some(panel) = &summary.experimental_panel {
+            for point in panel["points"]
+                .as_array()
+                .context("invalid experimental panel")?
+            {
+                for frame in point["autonomous"]
+                    .as_array()
+                    .context("invalid autonomous panel")?
+                {
+                    owned(
+                        frame["raw_frame"]
+                            .as_str()
+                            .context("missing panel raw frame")?,
+                    )?;
+                }
+            }
+        }
         summary.provenance.artifacts = self.records;
         // Publish only a complete JSON; readers ignore partial evaluation folders.
         let archive = Path::new(&summary.provenance.archive);

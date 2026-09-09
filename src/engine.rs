@@ -273,6 +273,10 @@ struct RunMetadata<'a> {
 pub fn run(config: RunConfig) -> Result<()> {
     let mut config = config;
     config.validate()?;
+    anyhow::ensure!(
+        !config.output_dir.join(".fork-incomplete").try_exists()?,
+        "incomplete training fork; restore/recreate the fork before resuming"
+    );
     let training_enabled = !config.render_only && !config.analysis.only;
     if training_enabled {
         match config.compute_backend {
@@ -746,7 +750,8 @@ pub fn run(config: RunConfig) -> Result<()> {
         let mut micro_reference_drive_sum = 0.0f32;
         let mut macro_reference_drive_sum = 0.0f32;
         let mut macro_updates = 0usize;
-        let reference_fidelity = reference_fidelity(&config, world.step);
+        let mut saturation_penalty_sum: Option<Tensor> = None;
+        let mut reference_fidelity = reference_fidelity(&config, world.step);
         let age_phase_start =
             (world.age as f32 / config.developmental_horizon().max(1) as f32).clamp(0.0, 1.0);
         let detail = corpus.detail_observation(
@@ -763,21 +768,69 @@ pub fn run(config: RunConfig) -> Result<()> {
             &value.local_reference_macro
         });
         let prepared_reference = dynamics.prepare_reference_drive(
-            Some(local_reference_micro),
-            Some(local_reference_macro),
-            reference_fidelity,
+            if config.experiment.withdrawal.is_some() {
+                None
+            } else {
+                Some(local_reference_micro)
+            },
+            if config.experiment.withdrawal.is_some() {
+                None
+            } else {
+                Some(local_reference_macro)
+            },
+            if config.experiment.withdrawal.is_some() {
+                0.0
+            } else {
+                reference_fidelity
+            },
             train_core,
         )?;
         for _ in 0..config.bptt {
+            let scheduled = config
+                .experiment
+                .withdrawal
+                .as_ref()
+                .map(|w| w.fidelity(world.age, world.episode, config.seed));
+            if let Some(fidelity) = scheduled {
+                reference_fidelity = fidelity;
+            }
+            let runtime_micro = if scheduled == Some(0.0) {
+                None
+            } else {
+                Some(&sample.reference_micro)
+            };
+            let runtime_macro = if scheduled == Some(0.0) {
+                None
+            } else {
+                Some(&sample.reference_macro)
+            };
+            let scheduled_reference = if scheduled.is_some() {
+                Some(dynamics.prepare_reference_drive(
+                    if reference_fidelity == 0.0 {
+                        None
+                    } else {
+                        Some(local_reference_micro)
+                    },
+                    if reference_fidelity == 0.0 {
+                        None
+                    } else {
+                        Some(local_reference_macro)
+                    },
+                    reference_fidelity,
+                    train_core,
+                )?)
+            } else {
+                None
+            };
             let tick = Instant::now();
             let stepped = dynamics.step_with_prepared_reference(
                 &world,
                 &sample.genome_tensor,
-                Some(&sample.reference_micro),
-                Some(&sample.reference_macro),
+                runtime_micro,
+                runtime_macro,
                 reference_fidelity,
                 train_core,
-                &prepared_reference,
+                scheduled_reference.as_ref().unwrap_or(&prepared_reference),
             )?;
             if train_core {
                 phase.tracked_dynamics += seconds(tick.elapsed());
@@ -791,6 +844,12 @@ pub fn run(config: RunConfig) -> Result<()> {
             macro_updates += usize::from(stepped.macro_updated);
             micro_reference_drive_sum += stepped.micro_reference_drive_rms;
             macro_reference_drive_sum += stepped.macro_reference_drive_rms;
+            if let Some(penalty) = stepped.saturation_penalty {
+                saturation_penalty_sum = Some(match saturation_penalty_sum {
+                    Some(sum) => sum.add(&penalty)?,
+                    None => penalty,
+                });
+            }
             world = stepped.world;
         }
 
@@ -941,6 +1000,17 @@ pub fn run(config: RunConfig) -> Result<()> {
         } else {
             None
         };
+        // Added after visual/flow weighting, once per full-core BPTT window.
+        // OpenCL merges these direct CPU gradients with its renderer input VJP.
+        let saturation_penalty_loss = if let Some(sum) = saturation_penalty_sum {
+            let penalty = sum.affine(1.0 / config.bptt as f64, 0.0)?;
+            let value = penalty.to_scalar::<f32>()?;
+            anyhow::ensure!(value.is_finite(), "non-finite saturation penalty");
+            losses.total = losses.total.add(&penalty)?;
+            value
+        } else {
+            0.0
+        };
         let decomposition = DecompositionDiagnostics {
             grounded: image_metrics(&rendered.grounded_image.detach())?,
             grounded_rms: tensor_rms(&rendered.grounded_image.detach())?,
@@ -994,6 +1064,23 @@ pub fn run(config: RunConfig) -> Result<()> {
         } else {
             optimizer.backward_step(&losses.total)?
         };
+        if config.experiment.optimizer_diagnostics {
+            append_jsonl(
+                &config
+                    .output_dir
+                    .join(format!("training_diagnostics{}.jsonl", config.suffix())),
+                &serde_json::json!({"version":1,"start_world_step":start_world_step,
+                    "world_step":world.step,"optimizer_update":optimizer.updates(),
+                    "full_core":train_core,"full_core_updates":full_core_windows,
+                    "decoder_only_updates":decoder_only_windows,"effective_bptt":config.bptt,"peak_rss_kib":peak_rss_kib(),
+                    "macro_updates_in_window":macro_updates,"elapsed_seconds":started.elapsed().as_secs_f64(),
+                    "reference_fidelity_endpoint":reference_fidelity,
+                    "reference_policy":config.experiment.withdrawal,
+                    "saturation_penalty_loss":saturation_penalty_loss,
+                    "saturation_penalty_applied":train_core && config.experiment.active_saturation_penalty().is_some(),
+                    "optimizer":optimizer_stats}),
+            )?;
+        }
         phase.backward += optimizer_stats.backward_seconds;
         phase.optimizer += optimizer_stats.step_seconds;
         if config.compute_backend == ComputeBackend::OpenCl {
@@ -2095,6 +2182,88 @@ mod tests {
     }
 
     #[test]
+    fn bptt_eight_withdrawal_keeps_target_supervision_and_zero_tail_drive() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "titan-withdrawal-test-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        let corpus = root.join("corpus");
+        std::fs::create_dir_all(&corpus)?;
+        image::RgbImage::from_fn(24, 24, |x, y| {
+            image::Rgb([(x * 10) as u8, (y * 10) as u8, 100])
+        })
+        .save(corpus.join("source.png"))?;
+        let mut config = tiny_config(corpus, root.join("output"));
+        config.bptt = 8;
+        config.episode_steps = 16;
+        config.steps = 16;
+        config.experiment.norm = crate::experiment::NormTraining::Differentiable;
+        config.experiment.optimizer_diagnostics = true;
+        config.experiment.saturation_penalty = Some(crate::experiment::SaturationPenalty {
+            weight: 0.01,
+            threshold: 2.,
+        });
+        config.experiment.withdrawal = Some(crate::experiment::Withdrawal {
+            observe: 4,
+            taper: 4,
+            autonomous_tail: 8,
+            min_fidelity: 0.2,
+            max_fidelity: 1.,
+            guided_anchor_probability: 0.,
+        });
+        let signature = config.checkpoint_signature();
+        let mut changed = config.clone();
+        changed.bptt = 4;
+        assert_ne!(signature, changed.checkpoint_signature());
+        changed = config.clone();
+        changed.core_update_every = 1;
+        assert_ne!(signature, changed.checkpoint_signature());
+        changed = config.clone();
+        changed.experiment.withdrawal = None;
+        assert_ne!(signature, changed.checkpoint_signature());
+        run(config.clone())?;
+        let paths = ArtifactPaths::new(&config);
+        let metadata: serde_json::Value = serde_json::from_slice(&std::fs::read(&paths.metadata)?)?;
+        assert_eq!(metadata["full_core_windows"], 1);
+        assert_eq!(metadata["decoder_only_windows"], 1);
+        let diagnostics = std::fs::read_to_string(
+            config
+                .output_dir
+                .join(format!("training_diagnostics{}.jsonl", config.suffix())),
+        )?;
+        let rows: Vec<serde_json::Value> = diagnostics
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<std::result::Result<_, _>>()?;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["saturation_penalty_applied"], true);
+        assert!(rows[0]["saturation_penalty_loss"]
+            .as_f64()
+            .unwrap()
+            .is_finite());
+        assert_eq!(rows[1]["saturation_penalty_applied"], false);
+        assert_eq!(rows[1]["saturation_penalty_loss"], 0.0);
+        let csv = std::fs::read_to_string(&paths.metrics)?;
+        let mut lines = csv.lines();
+        let header: Vec<_> = lines.next().unwrap().split(',').collect();
+        let rows: Vec<Vec<_>> = lines.map(|l| l.split(',').collect()).collect();
+        assert_eq!(rows.len(), 2);
+        let value = |row: usize, name: &str| {
+            rows[row][header.iter().position(|c| *c == name).unwrap()]
+                .parse::<f32>()
+                .unwrap()
+        };
+        assert_eq!(value(1, "reference_fidelity"), 0.);
+        assert_eq!(value(1, "micro_reference_drive_rms"), 0.);
+        assert_eq!(value(1, "macro_reference_drive_rms"), 0.);
+        assert!(value(1, "loss_content") > 0.);
+        assert_eq!(value(0, "macro_updates"), 2.);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
     fn fresh_and_resumed_training_write_complete_artifacts() -> Result<()> {
         let root = std::env::temp_dir().join(format!(
             "titan-image-v9-test-{}-{}",
@@ -2796,6 +2965,154 @@ mod tests {
         assert!(model.1 <= 5e-5, "model mean drift {}", model.1);
         assert!(optimizer.0 <= 5e-3, "optimizer drift {}", optimizer.0);
         assert!(world.0 <= 5e-3, "world drift {}", world.0);
+        Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "opencl"))]
+mod experimental_opencl_tests {
+    use super::*;
+    #[test]
+    fn differentiable_norm_full_core_opencl_vjp_matches_cpu() -> Result<()> {
+        check_parity(0.0)?;
+        check_parity(0.01)
+    }
+
+    fn check_parity(penalty_weight: f32) -> Result<()> {
+        if std::env::var_os("TITAN_OPENCL_TEST").is_none() {
+            return Ok(());
+        }
+        let device = Device::Cpu;
+        let mut config = RunConfig {
+            micro_size: 16,
+            macro_size: 8,
+            channels: 12,
+            genome_dim: 4,
+            interface_grid: 2,
+            interface_width: 16,
+            interface_loops: 2,
+            morph_layers: 2,
+            morph_depth: 2,
+            ca_hidden: 16,
+            render_hidden: 16,
+            render_blocks: 1,
+            train_resolution: 16,
+            reaction_gain: 0.,
+            phase_gain: 0.,
+            fractal_gain: 0.,
+            quasiperiodic_gain: 0.,
+            cyclic_gain: 0.,
+            ..Default::default()
+        };
+        config.experiment.norm = crate::experiment::NormTraining::Differentiable;
+        config.experiment.saturation_penalty = Some(crate::experiment::SaturationPenalty {
+            weight: penalty_weight,
+            threshold: 0.01,
+        });
+        let vars = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vars, DType::F32, &device);
+        let dynamics = DynamicsSystem::new(&config, vb.pp("dynamics"), &device)?;
+        let cpu = ImplicitRenderer::new(&config, vb.pp("renderer"))?;
+        config.compute_backend = ComputeBackend::OpenCl;
+        let gpu = ImplicitRenderer::new(&config, vb.pp("renderer"))?;
+        deterministic_initialize(&vars, 42)?;
+        for (name, var) in vars.data().lock().unwrap().iter() {
+            if name.contains("contract.weight") || name.contains("write.weight") {
+                var.set(&Tensor::from_vec(
+                    (0..var.elem_count())
+                        .map(|i| ((i as f32 + 1.) * 0.37).sin() * 0.02)
+                        .collect::<Vec<_>>(),
+                    var.shape().clone(),
+                    &device,
+                )?)?;
+            }
+        }
+        let mut world = WorldState::fresh(&config, 42, &device)?;
+        let genome = Tensor::ones(4, DType::F32, &device)?;
+        let mut penalty_sum: Option<Tensor> = None;
+        for _ in 0..4 {
+            let stepped = dynamics.step(&world, &genome, None, None, 0., true)?;
+            if let Some(p) = stepped.saturation_penalty {
+                penalty_sum = Some(match penalty_sum {
+                    Some(sum) => sum.add(&p)?,
+                    None => p,
+                });
+            }
+            world = stepped.world;
+        }
+        let penalty = penalty_sum.map(|p| p.affine(0.25, 0.)).transpose()?;
+        assert_eq!(penalty.is_some(), penalty_weight > 0.);
+        if let Some(p) = &penalty {
+            assert!(p.to_scalar::<f32>()? > 0.);
+        }
+        let plan = RenderPlan::new(&config, 16, &device)?;
+        let rendered =
+            cpu.render_with_emergence(&world.micro, &world.macro_field, &genome, &plan, 0.7, true)?;
+        let mut cpu_loss = rendered
+            .image
+            .sqr()?
+            .mean_all()?
+            .add(&world.memory.sqr()?.mean_all()?.affine(0.01, 0.)?)?;
+        if let Some(p) = &penalty {
+            cpu_loss = cpu_loss.add(p)?;
+        }
+        let cpu_grad = cpu_loss.backward()?;
+        let boundary = CoreTrainingBoundary::new(&world)?;
+        let gpu_render = gpu.render_decoder_training(
+            &boundary.world.micro,
+            &boundary.world.macro_field,
+            &genome,
+            &plan,
+            0.7,
+        )?;
+        let mut loss = gpu_render
+            .image
+            .sqr()?
+            .mean_all()?
+            .add(&boundary.world.memory.sqr()?.mean_all()?.affine(0.01, 0.)?)?;
+        if let Some(p) = &penalty {
+            loss = loss.add(p)?;
+        }
+        let mut loss_grad = loss.backward()?;
+        let renderer_grad = gpu
+            .populate_opencl_training_gradients(&mut loss_grad, true)?
+            .context("missing input VJP")?;
+        let core_grad = boundary.backward(&world, &loss_grad, &renderer_grad)?;
+        let mut max = 0f32;
+        let mut norms = 0;
+        for (name, var) in vars.data().lock().unwrap().iter() {
+            if !name.starts_with("dynamics.") {
+                continue;
+            }
+            let merged = match (
+                loss_grad.get(var.as_tensor()),
+                core_grad.get(var.as_tensor()),
+            ) {
+                (Some(a), Some(b)) => Some(a.add(b)?),
+                (Some(a), None) | (None, Some(a)) => Some(a.clone()),
+                (None, None) => None,
+            };
+            match (cpu_grad.get(var.as_tensor()), merged.as_ref()) {
+                (Some(a), Some(b)) => {
+                    let error = a.sub(b)?.abs()?.max_all()?.to_scalar::<f32>()?;
+                    let magnitude = a.abs()?.max_all()?.to_scalar::<f32>()?;
+                    assert!(
+                        error < 2e-5 + 2e-3 * magnitude,
+                        "{name}: {error} magnitude {magnitude}"
+                    );
+                    max = max.max(error);
+                    if name.contains("norm.weight") {
+                        norms += 1;
+                    }
+                }
+                (None, None) => {}
+                _ => panic!("reachability mismatch {name}"),
+            }
+        }
+        assert_eq!(norms, 4);
+        eprintln!(
+            "RMSNorm diff full-core CPU/OpenCL VJP max_abs={max:.9}, reachable_norms={norms}"
+        );
         Ok(())
     }
 }

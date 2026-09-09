@@ -245,14 +245,14 @@ pub fn load_checkpoint(
     config: &RunConfig,
     corpus_fingerprint: u64,
 ) -> Result<(WorldState, CheckpointLoadReport)> {
-    match load_checkpoint_inner(paths, varmap, optimizer, device, config, corpus_fingerprint) {
+    match load_checkpoint_read_only(paths, varmap, optimizer, device, config, corpus_fingerprint) {
         Ok(result) => Ok(result),
         Err(primary_error) => {
             let previous = paths.previous_checkpoint();
             if !previous.checkpoint_complete() {
                 return Err(primary_error);
             }
-            match load_checkpoint_inner(
+            match load_checkpoint_read_only(
                 &previous,
                 varmap,
                 optimizer,
@@ -273,7 +273,7 @@ pub fn load_checkpoint(
     }
 }
 
-fn load_checkpoint_inner(
+pub(crate) fn load_checkpoint_read_only(
     paths: &ArtifactPaths,
     varmap: &mut VarMap,
     optimizer: &mut PersistentAdamW,

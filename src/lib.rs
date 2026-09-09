@@ -7,7 +7,9 @@ pub mod config;
 pub mod corpus;
 pub mod dynamics;
 pub mod engine;
+pub mod experiment;
 pub mod flow;
+pub mod gradient_diagnostics;
 pub mod interface;
 pub mod metrics;
 pub mod objectives;
@@ -17,10 +19,12 @@ pub mod optimizer;
 pub mod persistence;
 pub mod probe;
 pub mod render;
+pub mod replay;
 pub mod state;
 pub mod telemetry;
 pub mod tensor_ops;
 pub mod terminal;
+pub mod training_fork;
 
 pub use config::{
     BoundaryMode, ComputeBackend, ConditioningMode, Integrator, MorphDepthMode, ObjectiveMode,

@@ -31,10 +31,12 @@ pub struct PersistentAdamW {
     optimizer_kind: OptimizerKind,
     muon_momentum: f64,
     muon_ns_steps: usize,
+    diagnostics: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct OptimizerStats {
+    pub groups: std::collections::BTreeMap<String, crate::gradient_diagnostics::GroupStats>,
     pub gradient_norm: f32,
     pub gradient_rms: f32,
     pub clip_scale: f32,
@@ -106,6 +108,7 @@ impl PersistentAdamW {
             optimizer_kind: config.optimizer,
             muon_momentum: config.muon_momentum,
             muon_ns_steps: config.muon_ns_steps,
+            diagnostics: config.experiment.optimizer_diagnostics,
         })
     }
 
@@ -167,6 +170,19 @@ impl PersistentAdamW {
     }
 
     fn step(&mut self, gradients: &GradStore) -> Result<OptimizerStats> {
+        let mut groups =
+            std::collections::BTreeMap::<String, crate::gradient_diagnostics::GroupStats>::new();
+        if self.diagnostics {
+            for state in &self.variables {
+                groups
+                    .entry(crate::gradient_diagnostics::group(&state.name).to_owned())
+                    .or_default()
+                    .observe(
+                        state.variable.as_tensor(),
+                        gradients.get(state.variable.as_tensor()),
+                    )?;
+            }
+        }
         let mut squared_norm = 0.0f64;
         let mut updated_variables = 0usize;
         let mut core_squared_norm = 0.0f64;
@@ -302,10 +318,22 @@ impl PersistentAdamW {
                     .sum_all()?
                     .to_scalar::<f32>()? as f64;
             }
+            if self.diagnostics {
+                groups
+                    .get_mut(crate::gradient_diagnostics::group(&state.name))
+                    .unwrap()
+                    .update_energy += crate::gradient_diagnostics::energy(
+                    &next_value.sub(state.variable.as_tensor())?,
+                )?;
+            }
             state.variable.set(&next_value)?;
+        }
+        for group in groups.values_mut() {
+            group.finish(squared_norm);
         }
         self.updates = next_update;
         Ok(OptimizerStats {
+            groups,
             gradient_norm: gradient_norm as f32,
             gradient_rms: (gradient_norm / (updated_parameters as f64).sqrt()) as f32,
             core_gradient_rms: if core_updated_parameters > 0 {

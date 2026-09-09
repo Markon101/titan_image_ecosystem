@@ -17,11 +17,13 @@ pub struct ArtifactIdentity {
     pub bytes: u64,
     /// Identity/error-detection only, not a cryptographic integrity guarantee.
     pub fnv1a64: String,
+    pub sha256: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct AnalysisProvenance {
     pub analysis_version: u32,
+    pub training_fork: Option<serde_json::Value>,
     pub evaluation_id: String,
     pub archive: String,
     pub build: serde_json::Value,
@@ -65,7 +67,14 @@ impl AnalysisProvenance {
             None
         };
         Ok(Self {
-            analysis_version: 3,
+            analysis_version: 4,
+            training_fork: if config.output_dir.join("fork.json").try_exists()? {
+                Some(serde_json::from_slice(&std::fs::read(
+                    config.output_dir.join("fork.json"),
+                )?)?)
+            } else {
+                None
+            },
             evaluation_id,
             archive: archive.display().to_string(),
             build: serde_json::json!({
@@ -98,7 +107,7 @@ impl AnalysisProvenance {
                 "perturbation_reference": "guided; configured maximum fidelity",
                 "recurrence_signature": "legacy channel spatial means plus memory; heuristic, not full-state recurrence",
                 "checkpoint_identity": "on-disk checkpoint bytes; runtime anatomy and state recorded separately",
-                "artifact_identity": "FNV-1a 64-bit plus byte length; non-cryptographic",
+                "artifact_identity": "SHA-256 plus legacy FNV-1a and byte length",
                 "archive": "write-once evaluation directory; evaluation.json published after successful registered writes",
                 "artifact_ownership": "all artifacts freshly emitted by this evaluation; no cached output adoption; canonical names are templates only",
             }),
@@ -109,6 +118,7 @@ impl AnalysisProvenance {
 
 pub(super) fn completion_status(summary: &AnalysisSummary) -> BTreeMap<String, bool> {
     [
+        ("experimental_panel", summary.experimental_panel.is_some()),
         ("decomposition", summary.decomposition_montage.is_some()),
         ("frontier", !summary.frontier.is_empty()),
         (
@@ -148,5 +158,6 @@ pub(super) fn file_identity(path: &Path) -> Result<ArtifactIdentity> {
         path: path.display().to_string(),
         bytes,
         fnv1a64: format!("{hash:016x}"),
+        sha256: crate::training_fork::sha256(path)?,
     })
 }

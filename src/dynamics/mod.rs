@@ -27,6 +27,7 @@ pub struct DynamicsSystem {
 }
 
 pub struct StepOutput {
+    pub saturation_penalty: Option<Tensor>,
     pub world: WorldState,
     pub micro_movement: f32,
     pub macro_movement: f32,
@@ -44,6 +45,8 @@ pub struct PreparedReferenceDrive {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DynamicsAblation {
+    /// Analysis-only clock selection perturbation; physical time/cadence stay fixed.
+    pub clock_seed_xor: u64,
     pub disable_interface: bool,
     pub freeze_micro: bool,
     pub freeze_macro: bool,
@@ -107,6 +110,78 @@ impl DynamicsSystem {
             config: config.clone(),
             seed: config.seed,
         })
+    }
+
+    pub fn inspect_interface(
+        &self,
+        world: &WorldState,
+        genome: &Tensor,
+        reference_micro: &Tensor,
+        reference_macro: &Tensor,
+        fidelity: f32,
+    ) -> Result<serde_json::Value> {
+        let phase = (world.age as f32 / self.config.developmental_horizon() as f32).min(1.0);
+        let inspect = |micro: &Tensor,
+                       macro_field: &Tensor,
+                       rm: &Tensor,
+                       ra: &Tensor,
+                       mem: &Tensor,
+                       gen: &Tensor| {
+            self.interface.inspect(
+                micro,
+                macro_field,
+                rm,
+                ra,
+                gen,
+                mem,
+                fidelity,
+                phase,
+                world.morph_active_depth,
+            )
+        };
+        let (base, trace) = inspect(
+            &world.micro,
+            &world.macro_field,
+            reference_micro,
+            reference_macro,
+            &world.memory,
+            genome,
+        )?;
+        let mut sensitivity = serde_json::Map::new();
+        for name in ["state", "reference", "memory", "genome"] {
+            let shift = |t: &Tensor, active: bool| {
+                if active {
+                    t.affine(1.0, 0.05)
+                } else {
+                    Ok(t.clone())
+                }
+            };
+            let (changed, _) = inspect(
+                &shift(&world.micro, name == "state")?,
+                &shift(&world.macro_field, name == "state")?,
+                &shift(reference_micro, name == "reference")?,
+                &shift(reference_macro, name == "reference")?,
+                &shift(&world.memory, name == "memory")?,
+                &shift(genome, name == "genome")?,
+            )?;
+            let measure = |a: &Tensor, b: &Tensor| -> Result<serde_json::Value> {
+                let delta = a.sub(b)?;
+                Ok(
+                    serde_json::json!({"rms":crate::metrics::tensor_rms(&delta)?,
+                    "max_abs":delta.abs()?.max_all()?.to_scalar::<f32>()?}),
+                )
+            };
+            sensitivity.insert(
+                name.to_owned(),
+                serde_json::json!({
+                "micro":measure(&base.micro_bias, &changed.micro_bias)?,
+                "macro":measure(&base.macro_bias, &changed.macro_bias)?}),
+            );
+        }
+        Ok(
+            serde_json::json!({"fidelity":fidelity,"age":world.age,"trace":trace,
+            "sensitivity":{"perturbation":"uniform +0.05 in one input category; local directional probe, not a Jacobian norm", "values":sensitivity}}),
+        )
     }
 
     pub fn prepare_inference_backend(&self) -> Result<Option<String>> {
@@ -301,6 +376,7 @@ impl DynamicsSystem {
             (world.age as f32 / self.config.developmental_horizon().max(1) as f32).clamp(0.0, 1.0);
         let interface = if ablation.disable_interface {
             InterfaceOutput {
+                saturation_penalty: None,
                 micro_bias: zeros(
                     self.config.channels,
                     self.config.micro_size,
@@ -380,6 +456,7 @@ impl DynamicsSystem {
             }
         }
         Ok(StepOutput {
+            saturation_penalty: interface.saturation_penalty,
             world: WorldState {
                 micro: next_micro,
                 macro_field: next_macro,
@@ -475,7 +552,14 @@ impl DynamicsSystem {
         let local = if ablation.disable_nca {
             zeros(channels, height, width, field.device())?
         } else {
-            ca.delta(field, macro_context, genome, self.seed, step, tracked)?
+            ca.delta(
+                field,
+                macro_context,
+                genome,
+                self.seed ^ ablation.clock_seed_xor,
+                step,
+                tracked,
+            )?
         };
         let mut delta = local.add(interface_bias)?;
         if self.config.state_leak > 0.0 {

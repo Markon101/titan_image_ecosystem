@@ -117,7 +117,7 @@ pub struct MetricRecord {
     pub flow_condition_rms: f32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct ImageDiagnostics {
     pub variance: f32,
     pub seam: f32,
@@ -127,7 +127,7 @@ pub struct ImageDiagnostics {
     pub correlations: [f32; 3],
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct StateDiagnostics {
     pub rms: f32,
     pub mean_abs: f32,

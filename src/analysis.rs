@@ -22,6 +22,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 
 mod artifacts;
+mod experimental;
 mod provenance;
 pub use artifacts::EvaluationArtifacts;
 pub use provenance::AnalysisProvenance;
@@ -153,6 +154,7 @@ pub struct BenchmarkRunReport {
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct AnalysisSummary {
+    pub experimental_panel: Option<serde_json::Value>,
     pub schema_version: u32,
     pub provenance: AnalysisProvenance,
     pub world_step: u64,
@@ -184,6 +186,7 @@ pub fn run_checkpoint_analysis(
     device: &Device,
 ) -> Result<AnalysisSummary> {
     let mut summary = AnalysisSummary {
+        experimental_panel: None,
         schema_version: crate::config::SCHEMA_VERSION,
         provenance: AnalysisProvenance::new(config, paths, corpus, world, sample, artifacts)?,
         world_step: world.step,
@@ -261,6 +264,11 @@ pub fn run_checkpoint_analysis(
         println!("PROBE: frozen held-out natural-image age/fidelity sweep");
         summary.natural_image_probe = Some(run_natural_image_probes(
             config, artifacts, corpus, dynamics, renderer, world, device,
+        )?);
+    }
+    if let Some(panel) = &config.experiment.panel {
+        summary.experimental_panel = Some(experimental::run(
+            config, panel, artifacts, corpus, dynamics, renderer, world, device,
         )?);
     }
     summary.provenance.completed = provenance::completion_status(&summary);

@@ -216,6 +216,18 @@ fn fresh_evaluations_never_adopt_canonical_or_prior_outputs() -> Result<()> {
     config.mode = crate::config::TrainingMode::Family;
     config.output_resolution = 32;
     config.analysis.only = true;
+    config.experiment.panel = Some(crate::experiment::PanelConfig {
+        targets: vec![0],
+        seeds: vec![42],
+        burn_in: 4,
+        diagnostic_ages: vec![0, 4],
+        horizons: vec![2, 4],
+        stride: 1,
+        recovery_horizon: 2,
+        recovery_cases: crate::experiment::default_recovery_cases(),
+        history_capacity: 3,
+        clock_robustness: true,
+    });
     config.analysis.render_attribution = true;
     config.analysis.perturbation_horizon = 2;
     config.analysis.dynamics_horizon = 1;
@@ -257,7 +269,14 @@ fn fresh_evaluations_never_adopt_canonical_or_prior_outputs() -> Result<()> {
     }
     let mut evaluations = Vec::new();
     let mut saved_bytes = Vec::new();
-    for _ in 0..2 {
+    let mut default_recovery: Option<Vec<serde_json::Value>> = None;
+    for iteration in 0..2 {
+        if iteration == 1 {
+            config.experiment.panel.as_mut().unwrap().recovery_cases = vec![
+                crate::experiment::RecoveryCase::MacroNoise,
+                crate::experiment::RecoveryCase::MacroPatch,
+            ];
+        }
         let mut artifacts = EvaluationArtifacts::new(&config, world.step)?;
         let summary = run_checkpoint_analysis(
             &config,
@@ -272,8 +291,35 @@ fn fresh_evaluations_never_adopt_canonical_or_prior_outputs() -> Result<()> {
             &device,
         )?;
         let summary = artifacts.publish(summary, &paths.analysis)?;
+        let panel = summary.experimental_panel.as_ref().unwrap();
+        assert_eq!(panel["points"][0]["autonomous"][0]["age"], 5);
+        assert_eq!(
+            panel["points"][0]["autonomous"][0]["reference_fidelity"],
+            0.0
+        );
+        let recovery = panel["points"][0]["recovery"].as_array().unwrap();
+        assert_eq!(recovery.len(), if iteration == 0 { 14 } else { 6 });
+        let expected_macro_updates = (4..6u64)
+            .filter(|a| a.is_multiple_of(config.macro_update_every as u64))
+            .count();
+        for row in recovery {
+            assert_eq!(row["development_steps"], 2);
+            assert_eq!(row["macro_updates"], expected_macro_updates);
+            if let Some(defaults) = &default_recovery {
+                assert!(["macro_noise", "macro_patch", "clock_sequence_only"]
+                    .contains(&row["case"].as_str().unwrap()));
+                let original = defaults
+                    .iter()
+                    .find(|x| x["case"] == row["case"] && x["mode"] == row["mode"])
+                    .unwrap();
+                assert_eq!(row, original, "selection changed the paired trajectory");
+            }
+        }
+        if iteration == 0 {
+            default_recovery = Some(recovery.clone());
+        }
         let archive = Path::new(&summary.provenance.archive);
-        assert_eq!(summary.provenance.analysis_version, 3);
+        assert_eq!(summary.provenance.analysis_version, 4);
         assert_eq!(std::fs::read(archive)?, std::fs::read(&paths.analysis)?);
         let root = archive.parent().unwrap();
         for (path, identity) in &summary.provenance.artifacts {
@@ -283,6 +329,10 @@ fn fresh_evaluations_never_adopt_canonical_or_prior_outputs() -> Result<()> {
             assert_ne!(bytes, stale);
             assert_eq!(identity.bytes, bytes.len() as u64);
             assert_eq!(identity.fnv1a64, fnv(&bytes));
+            assert_eq!(
+                identity.sha256,
+                crate::training_fork::sha256(Path::new(path))?
+            );
             if path.ends_with(".png") {
                 image::open(path)?;
             }
@@ -393,4 +443,58 @@ fn fnv(bytes: &[u8]) -> String {
             ^ u64::from(*byte))
         .wrapping_mul(0x100000001b3))
     )
+}
+
+#[test]
+fn actual_burn_in_withdraws_both_references_and_same_clock_control_is_exact() -> Result<()> {
+    let (config, _vars, dynamics, renderer, mut world, mut sample) = fixture()?;
+    for _ in 0..4 {
+        world = experimental::advance(&dynamics, &world, &sample, 1.0, 0)?.world;
+    }
+    assert_eq!(world.age, 4);
+    assert_eq!(world.step, 4);
+    let control = experimental::advance(&dynamics, &world, &sample, 0.0, 0)?;
+    sample.reference_micro = sample.reference_micro.affine(10., 99.)?;
+    sample.reference_macro = sample.reference_macro.affine(10., 99.)?;
+    let repeat = experimental::advance(&dynamics, &world, &sample, 0.0, 0)?;
+    assert_eq!(control.micro_reference_drive_rms, 0.0);
+    assert_eq!(control.macro_reference_drive_rms, 0.0);
+    assert_eq!(
+        tensor_fingerprint(&control.world.micro)?,
+        tensor_fingerprint(&repeat.world.micro)?
+    );
+    assert_eq!(
+        tensor_fingerprint(&control.world.macro_field)?,
+        tensor_fingerprint(&repeat.world.macro_field)?
+    );
+    let plan = RenderPlan::new(&config, 16, &Device::Cpu)?;
+    let render = renderer.render_with_emergence(
+        &control.world.micro,
+        &control.world.macro_field,
+        &sample.genome_tensor,
+        &plan,
+        0.7,
+        false,
+    )?;
+    let loss = |target: &Tensor| -> Result<f32> {
+        Ok(visual_loss(
+            &render,
+            target,
+            &control.world.micro,
+            &control.world.macro_field,
+            &control.world.memory,
+            &config,
+            1.,
+            0.7,
+            config.detail.boundary,
+        )?
+        .total
+        .to_scalar::<f32>()?)
+    };
+    assert!(
+        (loss(&sample.image)? - loss(&sample.image.affine(0., 0.2)?)?).abs() > 1e-4,
+        "supervision must remain sensitive to target after dynamics reference withdrawal"
+    );
+    std::fs::remove_dir_all(config.output_dir)?;
+    Ok(())
 }
