@@ -85,7 +85,7 @@ for arm,v in m.items():
 lines+=['','Both arms start from identical model, world and optimizer tensor values, excluding only fork-specific identity scalars. Both enable differentiable RMSNorm and retain the optimizer and warmup position. Only the penalty differs (zero versus weight 0.0001, threshold 2.5). Each trains 256 development steps / 32 full-core updates. This is a one-target, one-seed pilot, not a causal explanation of the longer fork.','',
 '## Validation and limitations','',
 'All frozen checkpoint copies, original protected files and probe sources retained their hashes. All archived artifact hashes were checked. Autonomous samples record zero reference drive and absent runtime references. '
-'The binary SHA-256 matches the earlier CPU/OpenCL-validated build and its 37-file source snapshot; no Rust numerical code changed in this task. '
+'The binary SHA-256 matches the earlier CPU/OpenCL-validated build and its 32-file Rust source snapshot; no Rust numerical code changed in this task. '
 'The inherited backend mismatch was detected in an initial attempt, which was stopped and excluded before rerunning both arms on OpenCL. '
 'The training log contains 289 non-increasing step transitions; only its latest contiguous 309-window invocation was used for mechanical checks. '
 'Image inspection failed with the Termux filesystem sandbox error, so no visual-quality claim is made. HTML verification is structural only when Chromium is unavailable.','',

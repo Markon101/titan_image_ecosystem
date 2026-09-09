@@ -55,8 +55,21 @@ def main():
         return dict(id=f'block-{key}', type='chart', chartId=key, layout='full')
 
     def table(key, title, rows, columns):
-        datasets[key] = rows
-        tables.append(dict(id=key, title=title, dataset=key, sourceId='measurements',
+        collection, predicate = {
+            'familiar': ('familiar', "json_extract(value, '$.phase') = 'guided'"),
+            'saturation': ('interface', "json_extract(value, '$.age') = 64 AND json_extract(value, '$.fidelity') = 1"),
+            'recovery-endpoints': ('recovery', '1 = 1'),
+        }[key]
+        assert all(field.isidentifier() for field in columns)
+        projection = ', '.join(f"json_extract(value, '$.{field}') AS [{field}]" for field in columns)
+        query = f"SELECT {projection} FROM json_each(readfile('{sql_path}'), '$.{collection}') WHERE {predicate}"
+        reviewed = [dict(row) for row in db.execute(query)]
+        assert reviewed == rows, 'Table query differs from reviewed source rows'
+        datasets[key] = reviewed
+        table_source = dict(source, query=dict(engine='SQLite JSON1 with readfile supplied by Python', language='sql',
+            sql=query, description='Query executed against the verified frozen comparison JSON; readfile reads the named local evidence file.',
+            tables_used=[str(args.summary)]))
+        tables.append(dict(id=key, title=title, dataset=key, source=table_source,
             defaultSort=dict(field=columns[0], direction='asc'),
             columns=[dict(field=k, label=k.replace('_',' ').title(),
                           type='number' if isinstance(rows[0].get(k), (int,float)) else 'text') for k in columns]))

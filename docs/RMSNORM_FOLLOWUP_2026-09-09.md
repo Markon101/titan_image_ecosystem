@@ -2,7 +2,7 @@
 
 ## Technical summary
 
-Completed frozen parent/fork comparisons and a separate 32-full-core-update saturation/control pilot. The longer fork combines additional training, differentiable RMSNorm and a write-logit penalty; its before/after differences cannot isolate any one cause. The short pilot tests the penalty at a matched budget. No broad training extension was launched. Use the per-case results below to decide the next bounded experiment.
+Do not extend the current penalty-enabled fork yet. Guided reconstruction improved on all six held-out probes and all four familiar target/seed pairs, but macro recovery regressed: all 16 parent recovery cases stayed below half their initial distance in the final sampled interval, versus 0/16 for the latest fork. In the matched 32-full-core-update pilot, the penalty reduced write saturation but increased guided error by 59.68% and worsened recovery in every tested condition. The training-extension gate failed. No broad continuation was launched.
 
 ## Scope and definitions
 
@@ -28,7 +28,7 @@ Age-64 guided error improved on all six probes. The age-8 zero-reference mean wo
 | 41 | 42 | 0.130216 | 0.104439 |
 | 41 | 137 | 0.130328 | 0.104414 |
 
-These familiar targets check retention on a small panel; they do not estimate whole-corpus performance.
+Guided error improved in all four familiar target/seed pairs. After 512 reference-free steps, mean target L1 also decreased: 0.239736 to 0.225255 for target 0 and 0.377822 to 0.348753 for target 41. These are reconstruction measurements on a small panel, not evidence of whole-corpus performance or damage recovery.
 
 ## Write saturation and gradients
 
@@ -54,7 +54,7 @@ The CPU gradient probes reached 0/10 normalization tensors in the parent and 10/
 | fork | autonomous | macro_noise | 0.698091 | 0.934200 | 0/4 |
 | fork | autonomous | macro_patch | 0.720803 | 0.651471 | 0/4 |
 
-Each 512-step recovery contains 128 macro updates. Ratios below one indicate contraction relative to the initial damage; threshold crossings alone do not establish sustained recovery or homeostasis. Exact per-pair endpoints and trajectories are retained in the evidence.
+The longer horizon changes the earlier diagnosis: the saturated parent recovers slowly, whereas the latest fork retains much more damage. Guided macro-noise distance grows to a median 2.676 times its initial value in the latest fork. Each 512-step recovery contains 128 macro updates. Ratios below one indicate contraction relative to the initial damage; threshold crossings alone do not establish sustained recovery or homeostasis. Exact per-pair endpoints and trajectories are retained in the evidence.
 
 ## Matched saturation intervention
 
@@ -63,18 +63,20 @@ Each 512-step recovery contains 128 macro updates. Ratios below one indicate con
 | control | 0.056313 | 1.000000 | 1.000000 | 4/4 |
 | penalty | 0.089920 | 0.593750 | 0.526855 | 0/4 |
 
-Both arms start from identical model, world and optimizer tensor values, excluding only fork-specific identity scalars. Both enable differentiable RMSNorm and retain the optimizer and warmup position. Only the penalty differs (zero versus weight 0.0001, threshold 2.5). Each trains 256 development steps / 32 full-core updates. This is a one-target, one-seed pilot, not a causal explanation of the longer fork.
+Both arms start from identical model, world and optimizer tensor values, excluding only fork-specific identity scalars. Both enable differentiable RMSNorm and retain the optimizer and warmup position. Only the penalty differs (zero versus weight 0.0001, threshold 2.5). Each trains 256 development steps / 32 full-core updates. The penalty arm has 59.68% higher guided L1 than the control. Its guided macro-noise and macro-patch distances finish at 9.313 and 3.167 times their initial values, versus 0.203 and 0.158 for control. Its autonomous ratios are 0.678 and 0.802, versus 0.203 and 0.153. This is a one-target, one-seed pilot, not a causal explanation of the longer fork.
 
 ## Validation and limitations
 
-All frozen checkpoint copies, original protected files and probe sources retained their hashes. All archived artifact hashes were checked. Autonomous samples record zero reference drive and absent runtime references. The binary SHA-256 matches the earlier CPU/OpenCL-validated build and its 37-file source snapshot; no Rust numerical code changed in this task. The inherited backend mismatch was detected in an initial attempt, which was stopped and excluded before rerunning both arms on OpenCL. The training log contains 289 non-increasing step transitions; only its latest contiguous 309-window invocation was used for mechanical checks. Image inspection failed with the Termux filesystem sandbox error, so no visual-quality claim is made. HTML verification is structural only when Chromium is unavailable.
+All frozen checkpoint copies, original protected files and probe sources retained their hashes. All archived artifact hashes were checked. Autonomous samples record zero reference drive and absent runtime references. The binary SHA-256 matches the earlier CPU/OpenCL-validated build and its 32-file Rust source snapshot; no Rust numerical code changed in this task. The inherited backend mismatch was detected in an initial attempt, which was stopped and excluded before rerunning both arms on OpenCL. The training log contains 289 non-increasing step transitions; only its latest contiguous 309-window invocation was used for mechanical checks. Image inspection failed with the Termux filesystem sandbox error, so no visual-quality claim is made. The HTML report passed payload and structural validation. No compatible Chromium was installed, so interactive rendering, source dialogs and viewport layout were not browser-tested.
 
 ## Decision and further questions
 
-Do not launch an unrestricted continuation based on guided reconstruction alone. The next step must address the weakest measured condition in the tables: retention if familiar errors regress, write responsiveness if saturation remains high, or autonomous macro recovery if damage does not contract. A favorable one-seed penalty result warrants replication across the two-target/two-seed panel before another long block. Keep RMSNorm, penalty, withdrawal, BPTT and replay changes isolated in explicit forks; this study does not establish cycles or homeostasis.
+The current penalty setting (weight 0.0001, threshold 2.5) fails the measured extension gate. Preserve the latest fork as evidence, but do not add a long training block or disable the penalty in place. Retain strict fork signatures and the original checkpoint.
+
+The next controlled experiment should use the RMSNorm-only control checkpoint as its starting point and test a weaker penalty in a separate matched fork. Keep the budget short and require retained guided reconstruction plus improved or preserved macro recovery before extending. A weaker weight is a hypothesis, not an approved remedy. No such extra experiment was run here.
+
+Lower saturation alone is not a success criterion: this intervention made writes more responsive while trajectories became less robust. Conversely, the parent’s strong distance contraction may reflect insensitive saturated dynamics; it does not by itself prove useful learned repair. Separate perturbation robustness, target retention and responsiveness when choosing the next objective. Withdrawal, BPTT and replay changes should remain separate experiments. Neither result establishes a cycle or homeostasis.
 
 ## Reproduction
 
 Run `scripts/frozen_fork_followup.py --help` and `scripts/matched_saturation_pilot.py --help` for the single-use runners. Each analysis root retains the exact plan, configurations, command receipts, hashes and immutable evaluation archives. Run `python scripts/summarize_frozen_fork.py analysis/rmsnorm_followup_2026-09-09_matched` to reverify the frozen evidence. [Full compact evidence](evidence/rmsnorm_followup_2026-09-09.json) contains every reported comparison and archive identity.
-
-HTML packaging failed; the validated Markdown write-up and JSON evidence remain available. See report-delivery.json.
