@@ -1,5 +1,6 @@
 //! Independent, frozen developmental analysis. No training or checkpoint writes.
 mod metrics;
+mod operators;
 mod spectral;
 use anyhow::{bail, ensure, Context, Result};
 use candle_core::{DType, Device, Tensor};
@@ -46,6 +47,7 @@ struct Options {
     response_bands: Vec<Band>,
     fixed_rms: f64,
     fixed_window: usize,
+    operators: Option<PathBuf>,
 }
 const HELP: &str = "titan_develop --config CONFIG_OR_METADATA.json --output NEW_DIRECTORY [options]
 Frozen CPU-only v9 import, fixed saved genome, NO target references, NO training writes.
@@ -60,6 +62,7 @@ Frozen CPU-only v9 import, fixed saved genome, NO target references, NO training
   --response-ages 0,8,16        Enable +/- response at these OFFSETS from saved age
   --response-epsilons .01,.02   L2 perturbation amplitudes (default .01,.02)
   --response-bands low,mid,high Bands to probe (default low,mid,high)
+  --operators FILE             Frozen transport/diffusion projection sidecar JSON
   --fixed-rms E                 State stagnation threshold (default 1e-6)
   --fixed-window N              Consecutive small updates (default 8)
 Outputs: manifest.json, trajectory.jsonl, response.jsonl, recurrence.f64le, recurrence.json,
@@ -90,6 +93,7 @@ fn parse(args: &[String]) -> Result<Options> {
         response_bands: vec![Band::Low, Band::Mid, Band::High],
         fixed_rms: 1e-6,
         fixed_window: 8,
+        operators: None,
     };
     ensure!(
         args.len().is_multiple_of(2),
@@ -123,6 +127,7 @@ fn parse(args: &[String]) -> Result<Options> {
             "--response-bands" => {
                 o.response_bands = v.split(',').map(band).collect::<Result<_>>()?
             }
+            "--operators" => o.operators = Some(v.into()),
             "--fixed-rms" => o.fixed_rms = v.parse()?,
             "--fixed-window" => o.fixed_window = v.parse()?,
             _ => bail!("unknown option {}; see --help", pair[0]),
@@ -194,13 +199,18 @@ fn identities(paths: &[PathBuf]) -> Result<BTreeMap<String, String>> {
         .map(|p| Ok((p.display().to_string(), sha256(p)?)))
         .collect()
 }
-fn advance(dynamics: &DynamicsSystem, x: &WorldState, genome: &Tensor) -> Result<WorldState> {
+fn advance(
+    dynamics: &DynamicsSystem,
+    x: &WorldState,
+    genome: &Tensor,
+    operators: &operators::Operators,
+) -> Result<(WorldState, Value)> {
     let out = dynamics.step(x, genome, None, None, 0., false)?;
     ensure!(
         out.micro_reference_drive_rms == 0. && out.macro_reference_drive_rms == 0.,
         "unexpected reference drive"
     );
-    Ok(out.world.detached())
+    operators.apply(x, out.world.detached(), out.macro_updated)
 }
 fn perturbation(x: &WorldState, o: &Options, b: Band) -> Result<Vec<f64>> {
     let (_, _, h, w) = x.micro.dims4()?;
@@ -261,6 +271,13 @@ fn run(o: Options) -> Result<()> {
     let original: RunConfig =
         serde_json::from_value(input.get("config").unwrap_or(&input).clone())?;
     original.validate()?;
+    let operators: operators::Operators = o
+        .operators
+        .as_ref()
+        .map(|p| -> Result<_> { Ok(serde_json::from_slice(&std::fs::read(p)?)?) })
+        .transpose()?
+        .unwrap_or_default();
+    operators.validate(original.channels)?;
     let paths = ArtifactPaths::new(&original);
     ensure!(
         paths.checkpoint_complete(),
@@ -270,7 +287,7 @@ fn run(o: Options) -> Result<()> {
         !original.output_dir.join(".fork-incomplete").exists(),
         "incomplete fork"
     );
-    let protected = vec![
+    let mut protected = vec![
         paths.model.clone(),
         paths.optimizer.clone(),
         paths.world.clone(),
@@ -280,6 +297,9 @@ fn run(o: Options) -> Result<()> {
         paths.events.clone(),
         o.config.clone(),
     ];
+    if let Some(p) = &o.operators {
+        protected.push(p.clone());
+    }
     let before = identities(&protected)?;
     std::fs::create_dir(&o.output)
         .context("output must be a new directory with an existing parent")?;
@@ -333,7 +353,8 @@ fn run(o: Options) -> Result<()> {
         "binary_sha256":sha256(&binary)?,"source_config":original,"effective_config":config,"options":o,
         "checkpoint_hashes_sha256":before,"load":load,"training_step":initial_step,"saved_developmental_age":initial_age,
         "conditioning":{"genome_source_index":sample.index,"source_fingerprint":sample.fingerprint,"references_present":false,"reference_fidelity":0.0},
-        "enabled_operators":["legacy_G"],"state_order":["micro_NCHW","macro_NCHW","memory"],
+        "enabled_operators":operators.enabled(),"operator_coefficients":operators,
+        "operator_policy":"sidecar coefficients frozen; unit grid/step; periodic first-order upwind transport and five-point diffusion; evaluated at x, added after legacy G without new limiting; macro correction only on legacy macro-update steps; R is aggregate legacy delta","state_order":["micro_NCHW","macro_NCHW","memory"],
         "shapes":[world.micro.dims(),world.macro_field.dims(),world.memory.dims()],
         "bands":{"domain":"periodic original latent grids; no windowing; cycles per cell; DC included in low energy",
             "radius":"sqrt((min(kx,W-kx)/W)^2+(min(ky,H-ky)/H)^2)","low":"0 <= f <= low_cutoff","mid":"low_cutoff < f <= mid_cutoff","high":"f > mid_cutoff",
@@ -394,7 +415,7 @@ fn run(o: Options) -> Result<()> {
         let need_next = offset < o.steps || o.response_ages.contains(&offset);
         let next = if need_next {
             let tick = Instant::now();
-            let y = advance(&dynamics, &world, &sample.genome_tensor)?;
+            let y = advance(&dynamics, &world, &sample.genome_tensor, &operators)?;
             dynamics_seconds += tick.elapsed().as_secs_f64();
             Some(y)
         } else {
@@ -402,7 +423,7 @@ fn run(o: Options) -> Result<()> {
         };
         if o.response_ages.contains(&offset) {
             let tick = Instant::now();
-            let base = next.as_ref().unwrap();
+            let base = &next.as_ref().unwrap().0;
             let base_delta = distance(&full(base)?, &x);
             for &b in &o.response_bands {
                 let p = perturbation(&world, &o, b)?;
@@ -415,8 +436,8 @@ fn run(o: Options) -> Result<()> {
                         norm(&plus_delta) > 0. && norm(&minus_delta) > 0.,
                         "response perturbation vanished in f32"
                     );
-                    let gp = advance(&dynamics, &xp, &sample.genome_tensor)?;
-                    let gm = advance(&dynamics, &xm, &sample.genome_tensor)?;
+                    let gp = advance(&dynamics, &xp, &sample.genome_tensor, &operators)?.0;
+                    let gm = advance(&dynamics, &xm, &sample.genome_tensor, &operators)?.0;
                     let qm = low_response(&gp.micro, &gm.micro, &base.micro, epsilon, &o)?;
                     let qa = low_response(
                         &gp.macro_field,
@@ -441,15 +462,13 @@ fn run(o: Options) -> Result<()> {
         if offset < o.steps {
             if let Some((shifted, _)) = &mut growth {
                 let tick = Instant::now();
-                *shifted = advance(&dynamics, shifted, &sample.genome_tensor)?;
+                *shifted = advance(&dynamics, shifted, &sample.genome_tensor, &operators)?.0;
                 probe_seconds += tick.elapsed().as_secs_f64();
             }
             let next = next.unwrap();
-            let r = difference(&full(&next)?, &x);
-            let zero = vec![0.; n];
-            previous_update = Some(metrics::cancellation(&r, &zero, &zero, &zero));
+            previous_update = Some(next.1);
             previous = Some(x);
-            world = next;
+            world = next.0;
         }
         if offset > 0 && offset % 64 == 0 {
             eprintln!(

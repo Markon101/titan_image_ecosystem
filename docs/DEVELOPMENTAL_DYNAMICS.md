@@ -105,3 +105,47 @@ This first pass does not add trainable checkpoint tensors, stress closure,
 channel timescale groups, scale schedules, self-similar event extraction or
 metastability classification. Those need separate ablations and validation.
 No entropy/chaos objective, attractor correction or new state clamp is introduced.
+
+## Optional transport and diffusion sidecars
+
+Pass `--operators path.json` to activate either mechanism. Missing/zero bounds
+leave the state tensors exactly as returned by legacy G (no reconstruction or
+addition of floating zero). The two bounds independently enable ablations.
+For example, a small fixed state-dependent transport control:
+
+```json
+{"transport_max":0.01,
+ "velocity_x":{"terms":[[0,1.0]]},
+ "velocity_y":{"terms":[[1,1.0]]}}
+```
+
+A separate constant diffusion control:
+
+```json
+{"diffusion_max":0.01,"diffusivity":{"bias":0.0}}
+```
+
+Each projection is `b + sum_j w_j x[channel_j]`, shared spatially and across both
+grids. `ax,ay=transport_max*tanh(projection)` and
+`nu=diffusion_max*sigmoid(projection)`. Velocity is broadcast over channels;
+nu is nonnegative and bounded. Coefficients may be supplied from an externally
+learned projection; this binary freezes them and saves the complete coefficients
+and sidecar hash. The examples are **fixed controls, not trained velocity models**.
+Training these coefficients jointly with Titan is deferred; no claim of learned
+transport is made by this implementation or its validation.
+
+T is `-ax*upwind_dx(x)-ay*upwind_dy(x)`, choosing backward differences for positive
+velocity and forward differences for negative velocity. D is the five-point
+Laplacian times nu. Both use periodic neighbors, unit spacing and unit step.
+They are evaluated at the old state and added to the output of legacy G.
+Micro receives them every step; macro only when legacy G updates macro; memory
+receives neither. The validator requires `2*transport_max+4*diffusion_max <= 1`,
+a sufficient convex-stencil bound for the isolated transport/diffusion update.
+It does **not** guarantee stability when added to an arbitrary nonlinear G.
+No new clamp is applied; nonfinite values cause an error and incomplete output.
+
+Cancellation reports include separate legacy, transport and diffusion norms,
+the mathematical sum norm, the actual f32 update norm and the residual introduced
+by f32 composition. Stress is explicitly zero. Enabling both operators is allowed
+but should follow individual controls. Projection typos, bad channel indices,
+nonfinite coefficients and invalid bounds fail validation.
