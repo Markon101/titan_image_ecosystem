@@ -9,6 +9,10 @@ import time
 import numpy as np
 
 
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
 def sha(path):
     with Path(path).open('rb') as stream:
         return hashlib.file_digest(stream, 'sha256').hexdigest()
@@ -58,8 +62,9 @@ def rqa(distance, ages, epsilon, theiler=2, minimum=2):
     dl = diagonals[diagonals >= minimum]
     vl = verticals[verticals >= minimum]
     returns = []
-    for row in recurrence:
-        starts = np.flatnonzero(row & ~np.r_[False, row[:-1]])
+    for reference, row in enumerate(recurrence):
+        future = row & (ages > ages[reference] + theiler)
+        starts = np.flatnonzero(future & ~np.r_[False, future[:-1]])
         returns.extend(np.diff(ages[starts]).tolist())
     return dict(epsilon_rms=epsilon, theiler_steps=theiler, minimum_line=minimum,
                 recurrence_rate=points/int(eligible.sum()) if eligible.any() else None,
@@ -70,7 +75,7 @@ def rqa(distance, ages, epsilon, theiler=2, minimum=2):
                 laminarity=float(vl.sum())/points if points else None,
                 trapping_time=float(vl.mean()) if len(vl) else None,
                 recurrence_time_steps=dict(Counter(returns)),
-                recurrence_time_definition='gaps between entries into recurrent runs, each reference row; not an independent return-time sample',
+                recurrence_time_definition='gaps between forward-time entries into recurrent runs after the reference age plus Theiler window; not independent samples',
                 line_length_unit='retained samples; edge-truncated lines included')
 
 
@@ -308,7 +313,7 @@ def local_jacobian(data):
     for r in data:
         gram = np.array(r['jv_gram'])
         eigenvalues, vectors = np.linalg.eigh(gram)
-        assert eigenvalues.min() >= -1e-10*max(1, eigenvalues.max()), 'invalid Gram matrix'
+        require(eigenvalues.min() >= -1e-10*max(1, eigenvalues.max()), 'invalid Gram matrix')
         gains = np.sqrt(np.maximum(0, eigenvalues))
         result.append(dict(offset=r['offset'], epsilon=r['epsilon'], input_bands=r['input_bands'],
                            directional_jv_norms=np.sqrt(np.maximum(0, np.diag(gram))),
@@ -323,16 +328,16 @@ def analyze(root, output, epsilons=(.01, .05, .1, .2), theiler=2, rank=6, event_
     started = time.monotonic()
     root, output = Path(root).resolve(), Path(output).resolve()
     summary, manifest = read(root/'summary.json'), read(root/'manifest.json')
-    assert summary['complete'] and summary['training_files_unchanged']
+    require(summary['complete'] and summary['training_files_unchanged'], 'incomplete or mutated source run')
     protected = {str(root/'summary.json'): sha(root/'summary.json')}
     for path, digest in summary['artifacts_sha256'].items():
-        assert sha(path) == digest, path
+        require(sha(path) == digest, f'artifact hash mismatch: {path}')
         protected[path] = digest
     trajectory = rows(root/'trajectory.jsonl')
     ages = read(root/'recurrence.json')['developmental_ages']
     nscalar = sum(int(np.prod(s)) for s in manifest['shapes'])
     distance = np.fromfile(root/'recurrence.f64le', dtype='<f8').reshape(len(ages), len(ages))/np.sqrt(nscalar)
-    assert np.isfinite(distance).all() and np.allclose(distance, distance.T) and np.all(distance.diagonal()==0)
+    require(np.isfinite(distance).all() and np.allclose(distance, distance.T) and np.all(distance.diagonal()==0), 'invalid recurrence matrix')
     extra = rows(root/'observables.jsonl') if (root/'observables.jsonl').exists() else []
     lyap = rows(root/'lyapunov.jsonl') if (root/'lyapunov.jsonl').exists() else []
     local = rows(root/'local_jacobian.jsonl') if (root/'local_jacobian.jsonl').exists() else []
@@ -340,7 +345,7 @@ def analyze(root, output, epsilons=(.01, .05, .1, .2), theiler=2, rank=6, event_
     spatial = None
     if (root/'spatial.f32le').exists():
         _, _, h, w = manifest['shapes'][0]
-        assert (root/'spatial.f32le').stat().st_size == len(trajectory)*h*w*4
+        require((root/'spatial.f32le').stat().st_size == len(trajectory)*h*w*4, 'invalid spatial export size')
         spatial = np.memmap(root/'spatial.f32le', dtype='<f4', mode='r', shape=(len(trajectory), h, w))
     output.mkdir(exist_ok=False)
     response = response_slopes(rows(root/'response.jsonl'))
@@ -368,8 +373,8 @@ def analyze(root, output, epsilons=(.01, .05, .1, .2), theiler=2, rank=6, event_
                 'local_jacobian.json': spectra, 'phase_signature.json': points}
     for name, payload in payloads.items():
         write(output/name, payload)
-    assert all(sha(path)==digest for path, digest in protected.items()), 'input analysis changed'
-    write(output/'summary.json', dict(schema='titan.dynamical_analysis.v2', complete=True,
+    require(all(sha(path)==digest for path, digest in protected.items()), 'input analysis changed')
+    write(output/'summary.json', dict(schema='titan.dynamical_analysis.v2.1', complete=True,
           source=str(root), source_artifact_hashes=protected, script_sha256=sha(__file__),
           numpy_version=np.__version__, config=dict(rqa_epsilons_rms=epsilons, theiler_steps=theiler, dmd_rank=rank, event_z=event_z),
           artifacts_sha256={str(output/name): sha(output/name) for name in payloads},
@@ -388,5 +393,5 @@ if __name__ == '__main__':
     p.add_argument('--event-z', type=float, default=3.)
     a = p.parse_args()
     eps = tuple(float(e) for e in a.rqa_epsilons.split(','))
-    assert all(np.isfinite(e) and e>0 for e in eps) and a.theiler>=0 and 1<=a.rank<=16 and np.isfinite(a.event_z) and a.event_z>0
+    require(all(np.isfinite(e) and e>0 for e in eps) and a.theiler>=0 and 1<=a.rank<=16 and np.isfinite(a.event_z) and a.event_z>0, 'invalid analysis options')
     print(analyze(a.input, a.output, eps, a.theiler, a.rank, a.event_z))

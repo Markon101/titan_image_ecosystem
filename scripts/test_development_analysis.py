@@ -22,6 +22,19 @@ class AnalysisTests(unittest.TestCase):
         self.assertIsNone(empty['determinism'])
         self.assertEqual(lines([True,True,False,True]).tolist(), [2,1])
 
+    def test_theiler_gap_is_not_a_return(self):
+        ages=np.arange(32)
+        r=rqa(abs(ages[:,None]-ages[None,:]), ages, 5)
+        self.assertGreater(r['recurrence_rate'],0)
+        self.assertEqual(r['recurrence_time_steps'],{})
+
+    def test_fixed_window_qr_uses_accumulated_logs(self):
+        from development_window_map import window_rates
+        data=[dict(offset=t,finite_time_exponents=[.1,-.2]) for t in [4,8,12,16,20,24]]
+        result=window_rates(data,16)
+        self.assertEqual(result[-1]['start_offset'],8)
+        np.testing.assert_allclose(result[-1]['exponents'],[.1,-.2],rtol=0,atol=1e-12)
+
     def test_dmd_known_decay_rotation_and_bad_holdout(self):
         t = np.arange(120)
         theta = .17

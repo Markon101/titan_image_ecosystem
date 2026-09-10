@@ -76,8 +76,10 @@ difference is <=2 steps (Theiler window). RR is recurrent/eligible pairs. DET is
 the fraction of recurrent points in diagonal runs of at least two samples; LAM is
 the corresponding vertical fraction. Average/max diagonal length and mean qualifying
 vertical length (trapping time) use maximal runs, including edge-truncated ones.
-Return-time histograms count gaps between starts of recurrent runs for each reference
-row, in actual developmental steps. Empty point/line denominators produce null.
+Return-time histograms count gaps between starts of **forward-time** recurrent
+runs after each reference age plus the Theiler window, in developmental steps.
+This avoids counting an artificial split across the excluded diagonal as a return.
+The corrected offline schema is `titan.dynamical_analysis.v2.1`. Empty point/line denominators produce null.
 Line lengths are retained samples, not steps; keep recurrence stride fixed across
 comparisons. Recurrence does not imply periodicity; cadence can create diagonal lines.
 
@@ -133,6 +135,23 @@ architecture ablation. No trainable operator, objective, clamp or attractor corr
 is introduced by this stage.
 
 Method references: [Tu et al., DMD](https://arxiv.org/abs/1312.0041) motivates the
-low-rank linear-map interpretation; [Marwan, recurrence quantification overview](https://www.frontiersin.org/journals/physiology/articles/10.3389/fphys.2012.00382/full)
+low-rank linear-map interpretation; [Recurrence Quantification of Fractal Structures](https://www.frontiersin.org/journals/physiology/articles/10.3389/fphys.2012.00382/full)
 describes recurrence-line measures. Exact operational conventions above take
 precedence when comparing these artifacts with other implementations.
+
+
+## Corrected fixed-window map and precision control
+
+After a panel completes, `scripts/development_window_map.py --panel PANEL --output NEW_DIR`
+revalidates every raw run, applies corrected forward-return RQA, and saves JSON/CSV
+phase tables. Its default trailing window is 16 steps. Window exponents are differences
+of accumulated log stretches divided by elapsed window length; the basis remains
+aligned from the original checkpoint. This separates late behavior from cumulative
+initial transients without claiming independently initialized local leading exponents.
+Original raw artifacts and earlier offline reports are preserved. Use this corrected
+output for return-time distributions and the final phase comparison.
+
+`scripts/development_precision_fixture.py --output NEW_FILE.json` compares f32 and
+f64 evaluation of the analytic map `tanh(x)+.2*x²` on a 16x16 zero-mean checkerboard
+perturbation. It checks the f64 Q limit against the analytic second derivative.
+It is a diagnostic precision control, **not an f64 Titan implementation**.

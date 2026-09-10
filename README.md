@@ -427,6 +427,8 @@ For state energy, original-grid spectral bands, full-state recurrence, paired
 perturbation growth, nonlinear cross-scale response and optional frozen transport/
 diffusion controls, see [developmental dynamics](docs/DEVELOPMENTAL_DYNAMICS.md).
 The separate `titan_develop` binary uses strict read-only checkpoint import.
+The [second-stage analysis](docs/DEVELOPMENTAL_STAGE2.md) adds epsilon-convergence
+sweeps, QR perturbation spectra, recurrence quantification, DMD and event/phase exports.
 
 Perturbation recovery and causal dynamics ablations:
 
