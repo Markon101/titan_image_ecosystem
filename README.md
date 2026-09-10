@@ -423,6 +423,11 @@ Source-image pyramid caches remain input caches, never evaluation outputs.
 There is no checkpoint/schema migration, training-trajectory change, or CSV change.
 See [the provenance audit](ANALYSIS_PROVENANCE.md) for the invariant and tests.
 
+For state energy, original-grid spectral bands, full-state recurrence, paired
+perturbation growth, nonlinear cross-scale response and optional frozen transport/
+diffusion controls, see [developmental dynamics](docs/DEVELOPMENTAL_DYNAMICS.md).
+The separate `titan_develop` binary uses strict read-only checkpoint import.
+
 Perturbation recovery and causal dynamics ablations:
 
 ~~~sh

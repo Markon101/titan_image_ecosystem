@@ -95,9 +95,13 @@ optimizer load report, saved training step/age, conditioning and perturbation po
 A manifest alone means incomplete; its `complete:false` is never overwritten.
 The summary confirms protected training-file hashes are unchanged.
 
-Runtime buckets separate base dynamics, diagnostic computation and additional
-probe evaluations. The DFT costs O(C*HW*(H+W)), with O(C*HW) scratch; it favors
-an auditable dependency-free first pass over FFT speed. Recurrence retains
+Runtime buckets separate base transitions, diagnostic computation and additional
+probe evaluations. `base_dynamics_seconds` includes host state extraction and
+component accounting inside `advance`, plus any enabled sidecar corrections; it
+is not a pristine legacy-G benchmark. Response ages at the final offset require
+one extra base transition, which is counted in this bucket. Startup/corpus/hash
+costs appear only in total elapsed time. The DFT costs O(C*HW*(H+W)), with
+O(C*HW) scratch; it favors an auditable dependency-free first pass over FFT speed. Recurrence retains
 O(K*n) f64 values and computes O(K²*n) distances. Its 512 MiB limit excludes
 model/corpus/spectral scratch and is not a total-process memory limit.
 
