@@ -273,7 +273,8 @@ pub fn load_checkpoint(
     }
 }
 
-pub(crate) fn load_checkpoint_read_only(
+/// Strict frozen import: never repairs or republishes a checkpoint generation.
+pub fn load_checkpoint_read_only(
     paths: &ArtifactPaths,
     varmap: &mut VarMap,
     optimizer: &mut PersistentAdamW,

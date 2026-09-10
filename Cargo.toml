@@ -3,6 +3,7 @@ name = "titan_image"
 version = "0.9.1"
 edition = "2021"
 autobins = false
+default-run = "titan_image"
 description = "Phone-first modular morphogenic visual dynamics laboratory"
 build = "build.rs"
 
@@ -33,3 +34,7 @@ strip = "symbols"
 [[bin]]
 name = "titan_image"
 path = "src/main.rs"
+
+[[bin]]
+name = "titan_develop"
+path = "src/development/main.rs"
