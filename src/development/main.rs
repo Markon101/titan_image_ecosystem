@@ -1,4 +1,6 @@
 //! Independent, frozen developmental analysis. No training or checkpoint writes.
+mod ensemble;
+mod extended;
 mod metrics;
 mod operators;
 mod spectral;
@@ -48,6 +50,11 @@ struct Options {
     fixed_rms: f64,
     fixed_window: usize,
     operators: Option<PathBuf>,
+    extended: bool,
+    lyap_vectors: usize,
+    lyap_epsilon: f64,
+    qr_every: usize,
+    event_channel: usize,
 }
 const HELP: &str = "titan_develop --config CONFIG_OR_METADATA.json --output NEW_DIRECTORY [options]
 Frozen CPU-only v9 import, fixed saved genome, NO target references, NO training writes.
@@ -63,6 +70,11 @@ Frozen CPU-only v9 import, fixed saved genome, NO target references, NO training
   --response-epsilons .01,.02   L2 perturbation amplitudes (default .01,.02)
   --response-bands low,mid,high Bands to probe (default low,mid,high)
   --operators FILE             Frozen transport/diffusion projection sidecar JSON
+  --extended true|false        Export precision/Jv, observables, transfer and event field (default false)
+  --lyap-vectors N             Full-state central QR ensemble (0 disables, max 4)
+  --lyap-epsilon E             Reset L2 amplitude per vector (default .1)
+  --qr-every N                 Reorthogonalization interval (default 4)
+  --event-channel N            Micro channel for spatial event analysis (default 0)
   --fixed-rms E                 State stagnation threshold (default 1e-6)
   --fixed-window N              Consecutive small updates (default 8)
 Outputs: manifest.json, trajectory.jsonl, response.jsonl, recurrence.f64le, recurrence.json,
@@ -94,6 +106,11 @@ fn parse(args: &[String]) -> Result<Options> {
         fixed_rms: 1e-6,
         fixed_window: 8,
         operators: None,
+        extended: false,
+        lyap_vectors: 0,
+        lyap_epsilon: 0.1,
+        qr_every: 4,
+        event_channel: 0,
     };
     ensure!(
         args.len().is_multiple_of(2),
@@ -128,6 +145,11 @@ fn parse(args: &[String]) -> Result<Options> {
                 o.response_bands = v.split(',').map(band).collect::<Result<_>>()?
             }
             "--operators" => o.operators = Some(v.into()),
+            "--extended" => o.extended = v.parse()?,
+            "--lyap-vectors" => o.lyap_vectors = v.parse()?,
+            "--lyap-epsilon" => o.lyap_epsilon = v.parse()?,
+            "--qr-every" => o.qr_every = v.parse()?,
+            "--event-channel" => o.event_channel = v.parse()?,
             "--fixed-rms" => o.fixed_rms = v.parse()?,
             "--fixed-window" => o.fixed_window = v.parse()?,
             _ => bail!("unknown option {}; see --help", pair[0]),
@@ -172,6 +194,14 @@ fn parse(args: &[String]) -> Result<Options> {
     ensure!(
         o.fixed_rms.is_finite() && o.fixed_rms >= 0. && o.fixed_window > 0,
         "invalid fixed-point thresholds"
+    );
+    ensure!(
+        o.lyap_vectors <= 4 && o.qr_every > 0 && o.lyap_epsilon.is_finite() && o.lyap_epsilon > 0.,
+        "invalid QR settings"
+    );
+    ensure!(
+        !o.extended || o.steps <= 4096,
+        "extended exports limited to 4096 steps"
     );
     Ok(o)
 }
@@ -278,6 +308,10 @@ fn run(o: Options) -> Result<()> {
         .transpose()?
         .unwrap_or_default();
     operators.validate(original.channels)?;
+    ensure!(
+        o.event_channel < original.channels,
+        "event channel out of range"
+    );
     let paths = ArtifactPaths::new(&original);
     ensure!(
         paths.checkpoint_complete(),
@@ -348,7 +382,7 @@ fn run(o: Options) -> Result<()> {
     let binary = std::env::current_exe()?;
     save(
         &o.output.join("manifest.json"),
-        &json!({"diagnostics_schema":"titan.development.v1","complete":false,
+        &json!({"diagnostics_schema":if o.extended || o.lyap_vectors>0 {"titan.development.v2"} else {"titan.development.v1"},"complete":false,
         "build_commit":env!("TITAN_BUILD_COMMIT"),"build_dirty":env!("TITAN_BUILD_DIRTY"),"build_rustflags":env!("TITAN_BUILD_RUSTFLAGS"),
         "binary_sha256":sha256(&binary)?,"source_config":original,"effective_config":config,"options":o,
         "checkpoint_hashes_sha256":before,"load":load,"training_step":initial_step,"saved_developmental_age":initial_age,
@@ -366,6 +400,36 @@ fn run(o: Options) -> Result<()> {
     )?;
     let mut trajectory = create(&o.output.join("trajectory.jsonl"))?;
     let mut responses = create(&o.output.join("response.jsonl"))?;
+    let mut ensemble = if o.lyap_vectors > 0 {
+        Some(ensemble::Ensemble::new(
+            &world,
+            o.lyap_vectors,
+            o.lyap_epsilon,
+            o.seed,
+        )?)
+    } else {
+        None
+    };
+    let mut lyap_file = if ensemble.is_some() {
+        Some(create(&o.output.join("lyapunov.jsonl"))?)
+    } else {
+        None
+    };
+    let mut observables = if o.extended {
+        Some(create(&o.output.join("observables.jsonl"))?)
+    } else {
+        None
+    };
+    let mut spatial = if o.extended {
+        Some(create(&o.output.join("spatial.f32le"))?)
+    } else {
+        None
+    };
+    let mut local_file = if o.extended {
+        Some(create(&o.output.join("local_jacobian.jsonl"))?)
+    } else {
+        None
+    };
     let mut history = Vec::with_capacity(capacity);
     let mut ages = Vec::with_capacity(capacity);
     let mut energies = Vec::with_capacity(o.steps + 1);
@@ -407,6 +471,19 @@ fn run(o: Options) -> Result<()> {
             "hidden_memory_l2":norm(&values(&world.memory)?),"parameter_gradient_l2":null,"perturbation":growth_row,
             "update_components":previous_update,"state_stagnation_candidate":quiet>=o.fixed_window,"consecutive_small_updates":quiet}),
         )?;
+        if let Some(f) = &mut observables {
+            line(f, &extended::row(&world, previous.as_deref(), &o)?)?;
+        }
+        if let Some(f) = &mut spatial {
+            for v in values(&world.micro.narrow(1, o.event_channel, 1)?)? {
+                f.write_all(&(v as f32).to_le_bytes())?;
+            }
+        }
+        if offset > 0 && (offset % o.qr_every == 0 || offset == o.steps) {
+            if let Some(e) = &mut ensemble {
+                line(lyap_file.as_mut().unwrap(), &e.measure(&world, offset)?)?;
+            }
+        }
         if offset % o.recurrence_stride == 0 || offset == o.steps {
             history.push(x.clone());
             ages.push(world.age);
@@ -425,6 +502,7 @@ fn run(o: Options) -> Result<()> {
             let tick = Instant::now();
             let base = &next.as_ref().unwrap().0;
             let base_delta = distance(&full(base)?, &x);
+            let mut jacobians: BTreeMap<u64, Vec<(Band, Vec<f64>)>> = BTreeMap::new();
             for &b in &o.response_bands {
                 let p = perturbation(&world, &o, b)?;
                 for &epsilon in &o.response_epsilons {
@@ -447,19 +525,59 @@ fn run(o: Options) -> Result<()> {
                         &o,
                     )?;
                     let q = qm.hypot(qa);
+                    ensure!(q.is_finite(), "nonfinite response quotient");
+                    let gp_full = full(&gp)?;
+                    let gm_full = full(&gm)?;
+                    let base_full = full(base)?;
+                    let numerator: Vec<_> = gp_full
+                        .iter()
+                        .zip(&gm_full)
+                        .zip(&base_full)
+                        .map(|((p, m), b)| p + m - 2. * b)
+                        .collect();
+                    let jv: Vec<_> = gp_full
+                        .iter()
+                        .zip(&gm_full)
+                        .map(|(p, m)| (p - m) / (2. * epsilon))
+                        .collect();
+                    if o.extended {
+                        jacobians
+                            .entry(epsilon.to_bits())
+                            .or_default()
+                            .push((b, jv));
+                    }
                     line(
                         &mut responses,
                         &json!({"offset":offset,"developmental_age":world.age,"training_step":initial_step,"band":b,"epsilon":epsilon,
                         "actual_plus_l2":norm(&plus_delta),"actual_minus_l2":norm(&minus_delta),
                         "input_symmetry_residual_l2":norm(&plus_delta.iter().zip(&minus_delta).map(|(a,b)|a+b).collect::<Vec<_>>()),
+                        "numerator_full_l2":norm(&numerator),"numerator_low_spatial_l2":2.*epsilon*epsilon*q,
                         "q_micro_l2":qm,"q_macro_l2":qa,"q_spatial_l2":q,"baseline_full_update_l2":base_delta,
                         "q_over_baseline_update":if base_delta>0. {Some(q/base_delta)} else {None}}),
+                    )?;
+                }
+            }
+            if let Some(f) = &mut local_file {
+                for (bits, columns) in jacobians {
+                    let gram: Vec<Vec<_>> = columns
+                        .iter()
+                        .map(|(_, a)| columns.iter().map(|(_, b)| ensemble::dot(a, b)).collect())
+                        .collect();
+                    line(
+                        f,
+                        &json!({"offset":offset,"age":world.age,"epsilon":f64::from_bits(bits),"input_bands":columns.iter().map(|(b,_)|b).collect::<Vec<_>>(),"jv_gram":gram,
+                    "scope":"central finite differences; singular amplification restricted to orthonormal structured micro input directions; outputs full state"}),
                     )?;
                 }
             }
             probe_seconds += tick.elapsed().as_secs_f64();
         }
         if offset < o.steps {
+            if let Some(e) = &mut ensemble {
+                let tick = Instant::now();
+                e.advance(&dynamics, &sample.genome_tensor, &operators)?;
+                probe_seconds += tick.elapsed().as_secs_f64();
+            }
             if let Some((shifted, _)) = &mut growth {
                 let tick = Instant::now();
                 *shifted = advance(&dynamics, shifted, &sample.genome_tensor, &operators)?.0;
@@ -477,6 +595,17 @@ fn run(o: Options) -> Result<()> {
                 started.elapsed().as_secs_f64()
             );
         }
+    }
+    for f in [
+        &mut lyap_file,
+        &mut observables,
+        &mut spatial,
+        &mut local_file,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        f.flush()?;
     }
     trajectory.flush()?;
     responses.flush()?;
@@ -510,12 +639,16 @@ fn run(o: Options) -> Result<()> {
             "recurrence.f64le",
             "recurrence.json",
             "temporal.json",
+            "observables.jsonl",
+            "spatial.f32le",
+            "local_jacobian.jsonl",
+            "lyapunov.jsonl",
         ]
         .map(|p| o.output.join(p)),
     )?;
     save(
         &o.output.join("summary.json"),
-        &json!({"diagnostics_schema":"titan.development.v1","complete":true,
+        &json!({"diagnostics_schema":if o.extended || o.lyap_vectors>0 {"titan.development.v2"} else {"titan.development.v1"},"complete":true,
         "training_files_unchanged":true,"checkpoint_hashes_after":after,"artifacts_sha256":artifacts,
         "final_developmental_age":world.age,"final_state_energy_per_scalar":energies.last(),"retained_state_bytes":history.len()*n*8,
         "base_dynamics_seconds":dynamics_seconds,"diagnostics_seconds":diagnostics_seconds,"additional_probe_seconds":probe_seconds,

@@ -100,6 +100,18 @@ impl Spectrum {
         }
         e
     }
+    pub fn cross(&self, other: &Self, low: f64, mid: f64) -> [f64; 3] {
+        assert_eq!(
+            (self.h, self.w, self.re.len()),
+            (other.h, other.w, other.re.len())
+        );
+        let mut t = [0.; 3];
+        for i in 0..self.re.len() {
+            t[self.band(i, low, mid)] +=
+                (self.re[i] * other.re[i] + self.im[i] * other.im[i]) / (self.h * self.w) as f64;
+        }
+        t
+    }
     pub fn project(&self, band: Band, low: f64, mid: f64, remove_dc: bool) -> Vec<f64> {
         let b = match band {
             Band::Low => 0,
@@ -121,6 +133,25 @@ impl Spectrum {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn band_work_closes_discrete_energy_budget() -> Result<()> {
+        let x: Vec<_> = (0..64).map(|i| (i as f64).sin()).collect();
+        let delta: Vec<_> = (0..64).map(|i| 0.2 * (i as f64 * 0.3).cos()).collect();
+        let next: Vec<_> = x.iter().zip(&delta).map(|(a, b)| a + b).collect();
+        let a = Spectrum::new(&x, 8, 8)?;
+        let b = Spectrum::new(&delta, 8, 8)?;
+        let c = Spectrum::new(&next, 8, 8)?;
+        let (ea, ed, ec, t) = (
+            a.energies(0.125, 0.25),
+            b.energies(0.125, 0.25),
+            c.energies(0.125, 0.25),
+            a.cross(&b, 0.125, 0.25),
+        );
+        for k in 0..3 {
+            assert!((ec[k] - ea[k] - 2. * t[k] - ed[k]).abs() < 1e-12);
+        }
+        Ok(())
+    }
     #[test]
     fn parseval_bands_and_projection_on_rectangular_grid() -> Result<()> {
         let (h, w) = (6, 8);
