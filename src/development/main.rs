@@ -3,6 +3,7 @@ mod ensemble;
 mod extended;
 mod metrics;
 mod operators;
+mod recovery;
 mod spectral;
 use anyhow::{bail, ensure, Context, Result};
 use candle_core::{DType, Device, Tensor};
@@ -51,6 +52,7 @@ struct Options {
     fixed_window: usize,
     operators: Option<PathBuf>,
     extended: bool,
+    recovery: bool,
     lyap_vectors: usize,
     lyap_epsilon: f64,
     qr_every: usize,
@@ -58,6 +60,8 @@ struct Options {
 }
 const HELP: &str = "titan_develop --config CONFIG_OR_METADATA.json --output NEW_DIRECTORY [options]
 Frozen CPU-only v9 import, fixed saved genome, NO target references, NO training writes.
+  --recovery true|false        Paired off/fixed diffusion macro recovery (default false; max 512 steps)
+                               Recovery accepts only config/output/steps/seed; writes 96px frames.
   --steps N                    Developmental steps after saved state (default 16, max 100000)
   --seed N                     Perturbation seed (default 42; checkpoint seed retained separately)
   --low-cutoff F                Radial low band upper edge, cycles/pixel (default .125)
@@ -107,6 +111,7 @@ fn parse(args: &[String]) -> Result<Options> {
         fixed_window: 8,
         operators: None,
         extended: false,
+        recovery: false,
         lyap_vectors: 0,
         lyap_epsilon: 0.1,
         qr_every: 4,
@@ -146,6 +151,7 @@ fn parse(args: &[String]) -> Result<Options> {
             }
             "--operators" => o.operators = Some(v.into()),
             "--extended" => o.extended = v.parse()?,
+            "--recovery" => o.recovery = v.parse()?,
             "--lyap-vectors" => o.lyap_vectors = v.parse()?,
             "--lyap-epsilon" => o.lyap_epsilon = v.parse()?,
             "--qr-every" => o.qr_every = v.parse()?,
@@ -166,7 +172,7 @@ fn parse(args: &[String]) -> Result<Options> {
         "invalid step/recurrence limits"
     );
     ensure!(
-        o.steps.div_ceil(o.recurrence_stride) < o.recurrence_max,
+        o.recovery || o.steps.div_ceil(o.recurrence_stride) < o.recurrence_max,
         "increase recurrence stride or capacity"
     );
     ensure!(
@@ -203,6 +209,11 @@ fn parse(args: &[String]) -> Result<Options> {
         !o.extended || o.steps <= 4096,
         "extended exports limited to 4096 steps"
     );
+    if o.recovery {
+        ensure!(o.steps <= 512, "paired recovery limited to 512 steps");
+        ensure!(args.chunks(2).all(|p| ["--config", "--output", "--steps", "--seed", "--recovery"].contains(&p[0].as_str())),
+                "recovery accepts only config/output/steps/seed/recovery; other diagnostics are separate runs");
+    }
     Ok(o)
 }
 fn create(path: &Path) -> Result<BufWriter<File>> {
@@ -348,7 +359,7 @@ fn run(o: Options) -> Result<()> {
     let mut vars = VarMap::new();
     let vb = VarBuilder::from_varmap(&vars, DType::F32, &device);
     let dynamics = DynamicsSystem::new(&config, vb.pp("dynamics"), &device)?;
-    let _renderer = ImplicitRenderer::new(&config, vb.pp("renderer"))?;
+    let renderer = ImplicitRenderer::new(&config, vb.pp("renderer"))?;
     let _flow = RectifiedFlowRenderer::new(&config, vb.pp("flow"))?;
     let mut optimizer = PersistentAdamW::new(&vars, &config)?;
     let (mut world, load) = load_checkpoint_read_only(
@@ -370,7 +381,11 @@ fn run(o: Options) -> Result<()> {
     );
     let initial = full(&world)?;
     let n = initial.len();
-    let capacity = o.steps.div_ceil(o.recurrence_stride) + 1;
+    let capacity = if o.recovery {
+        0
+    } else {
+        o.steps.div_ceil(o.recurrence_stride) + 1
+    };
     ensure!(
         n.checked_mul(capacity)
             .and_then(|v| v.checked_mul(8))
@@ -382,12 +397,13 @@ fn run(o: Options) -> Result<()> {
     let binary = std::env::current_exe()?;
     save(
         &o.output.join("manifest.json"),
-        &json!({"diagnostics_schema":if o.extended || o.lyap_vectors>0 {"titan.development.v2"} else {"titan.development.v1"},"complete":false,
+        &json!({"diagnostics_schema":if o.recovery {"titan.development.recovery.v1"} else if o.extended || o.lyap_vectors>0 {"titan.development.v2"} else {"titan.development.v1"},"complete":false,
         "build_commit":env!("TITAN_BUILD_COMMIT"),"build_dirty":env!("TITAN_BUILD_DIRTY"),"build_rustflags":env!("TITAN_BUILD_RUSTFLAGS"),
         "binary_sha256":sha256(&binary)?,"source_config":original,"effective_config":config,"options":o,
         "checkpoint_hashes_sha256":before,"load":load,"training_step":initial_step,"saved_developmental_age":initial_age,
         "conditioning":{"genome_source_index":sample.index,"source_fingerprint":sample.fingerprint,"references_present":false,"reference_fidelity":0.0},
-        "enabled_operators":operators.enabled(),"operator_coefficients":operators,
+        "enabled_operators":if o.recovery {vec!["legacy_G", "paired_fixed_diffusion"]} else {operators.enabled()},
+        "operator_coefficients":if o.recovery {json!({"off":operators::Operators::default(),"fixed":operators::Operators {diffusion_max:0.02,..Default::default()}})} else {json!(operators)},
         "operator_policy":"sidecar coefficients frozen; unit grid/step; periodic first-order upwind transport and five-point diffusion; evaluated at x, added after legacy G without new limiting; macro correction only on legacy macro-update steps; R is aggregate legacy delta","state_order":["micro_NCHW","macro_NCHW","memory"],
         "shapes":[world.micro.dims(),world.macro_field.dims(),world.memory.dims()],
         "bands":{"domain":"periodic original latent grids; no windowing; cycles per cell; DC included in low energy",
@@ -395,9 +411,37 @@ fn run(o: Options) -> Result<()> {
             "DFT":"unnormalized forward f64; inverse /HW; Parseval energy sum(abs(F)^2)/HW"},
         "gradient_policy":"spatial gradient reported; parameter gradient null because no loss or backward pass",
         "clock_policy":"saved counters advance normally; same clocks in all pairs; distances exclude counters; conditional finite-time growth, no Jacobian or asymptotic claim",
-        "perturbation_policy":"ChaCha8 seed; uniform[-1,1), exact band projection, per-channel DC removed, global micro L2 normalized to 1; cast displaced states to f32",
+        "perturbation_policy":if o.recovery {"macro-only ChaCha8 uniform[-.03,.03) noise or central-third patch erasure; no new clamping; see summary recovery protocol"} else {"ChaCha8 seed; uniform[-1,1), exact band projection, per-channel DC removed, global micro L2 normalized to 1; cast displaced states to f32"},
         "recurrence_retained_state_bytes":n*capacity*8}),
     )?;
+    if o.recovery {
+        let result = recovery::run(
+            &o,
+            &config,
+            &dynamics,
+            &renderer,
+            &world,
+            &sample.genome_tensor,
+        )?;
+        let after = identities(&protected)?;
+        ensure!(
+            before == after,
+            "protected training files changed during recovery"
+        );
+        let files = std::fs::read_dir(&o.output)?
+            .map(|entry| entry.map(|e| e.path()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        save(
+            &o.output.join("summary.json"),
+            &json!({
+            "diagnostics_schema":"titan.development.recovery.v1", "complete":true,
+            "training_files_unchanged":true,"checkpoint_hashes_after":after,
+            "artifacts_sha256":identities(&files)?,"recovery":result,
+            "elapsed_seconds":started.elapsed().as_secs_f64()}),
+        )?;
+        println!("Frozen paired recovery complete: {}", o.output.display());
+        return Ok(());
+    }
     let mut trajectory = create(&o.output.join("trajectory.jsonl"))?;
     let mut responses = create(&o.output.join("response.jsonl"))?;
     let mut ensemble = if o.lyap_vectors > 0 {
@@ -681,6 +725,8 @@ mod tests {
             "--steps 99999",
             "--response-ages 17",
             "--low-cutoff .3",
+            "--recovery true --steps 513",
+            "--recovery true --operators sidecar.json",
         ] {
             assert!(parse(&args(s)).is_err(), "{s}");
         }
