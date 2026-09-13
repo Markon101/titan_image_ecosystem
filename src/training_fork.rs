@@ -156,6 +156,7 @@ pub fn create(request: &ForkRequest) -> Result<Value> {
     // Corpus decoding may create caches, so use the new destination's namespace.
     // Reserve first; a failed import leaves an explicitly incomplete directory.
     std::fs::create_dir(&child.output_dir)?;
+    let _lease = crate::run_lease::RunLease::acquire(child, "fork")?;
     std::fs::write(
         child.output_dir.join(".fork-incomplete"),
         b"import in progress; do not resume",

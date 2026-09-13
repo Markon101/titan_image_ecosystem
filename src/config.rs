@@ -12,6 +12,8 @@ Experimental configuration:
   --training-rmsnorm MODE       legacy | differentiable (tracked training only)
   --optimizer-diagnostics       Per-group gradient/update JSONL
   Training withdrawal phases are configured in experiment.withdrawal in JSON.
+  --write-diagnostics-every N   Sample interface writes every N full-core windows (0 off)
+  Initialize only: titan_image initialize --corpus-dir PATH --output-dir NEW [options]
   Fork/import: titan_image fork --help
 
 Lifecycle and presets:
@@ -772,7 +774,10 @@ impl Default for RunConfig {
 
 impl RunConfig {
     pub fn parse_env() -> Result<Option<Self>> {
-        let args: Vec<String> = std::env::args().skip(1).collect();
+        Self::parse_args(&std::env::args().skip(1).collect::<Vec<_>>())
+    }
+
+    pub fn parse_args(args: &[String]) -> Result<Option<Self>> {
         if args.iter().any(|arg| arg == "--help" || arg == "-h") {
             println!("{}", Self::help());
             return Ok(None);
@@ -795,7 +800,7 @@ impl RunConfig {
         } else {
             Self::default()
         };
-        preapply_presets(&args, &mut cfg)?;
+        preapply_presets(args, &mut cfg)?;
         let mut corpus_was_explicit = args.iter().any(|a| a == "--config-json");
         let mut i = 0;
         while i < args.len() {
@@ -818,6 +823,9 @@ impl RunConfig {
                     }
                 }
                 "--optimizer-diagnostics" => cfg.experiment.optimizer_diagnostics = true,
+                "--write-diagnostics-every" => {
+                    cfg.experiment.write_diagnostics_every = value()?.parse()?
+                }
                 "--corpus-dir" => {
                     cfg.corpus_dir = PathBuf::from(value()?);
                     corpus_was_explicit = true;

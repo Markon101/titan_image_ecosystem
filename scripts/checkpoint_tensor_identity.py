@@ -15,7 +15,8 @@ def tensor_identity(path):
         if name=='__metadata__' or name.endswith(('.checkpoint_id','.immutable_signature','.resolved_signature')):
             continue
         start,end=tensor['data_offsets']
-        assert 0<=start<=end<=len(data)-offset
+        if not 0<=start<=end<=len(data)-offset:
+            raise ValueError(f'{path}: invalid data offsets for {name}')
         result[name]=dict(dtype=tensor['dtype'],shape=tensor['shape'],
                           sha256=hashlib.sha256(data[offset+start:offset+end]).hexdigest())
     return result

@@ -47,6 +47,8 @@ pub struct TrainingExperiment {
     pub saturation_penalty: Option<SaturationPenalty>,
     /// Output-only diagnostics; excluded from the learned-evolution signature.
     pub optimizer_diagnostics: bool,
+    /// Output-only sampling before full-core windows 1, 1+N, ...; zero disables.
+    pub write_diagnostics_every: usize,
     pub panel: Option<PanelConfig>,
 }
 

@@ -112,6 +112,33 @@ impl DynamicsSystem {
         })
     }
 
+    /// One untracked interface forward pass; no sensitivity perturbations or world advance.
+    pub fn inspect_interface_writes(
+        &self,
+        world: &WorldState,
+        genome: &Tensor,
+        reference_micro: &Tensor,
+        reference_macro: &Tensor,
+        fidelity: f32,
+    ) -> Result<serde_json::Value> {
+        let phase = (world.age as f32 / self.config.developmental_horizon() as f32).min(1.0);
+        let (_, trace) = self.interface.inspect(
+            &world.micro,
+            &world.macro_field,
+            reference_micro,
+            reference_macro,
+            genome,
+            &world.memory,
+            fidelity,
+            phase,
+            world.morph_active_depth,
+        )?;
+        Ok(
+            serde_json::json!({"fidelity":fidelity,"micro":trace.micro,"macro_field":trace.macro_field,
+            "token_rms_per_loop":trace.token_rms_per_loop}),
+        )
+    }
+
     pub fn inspect_interface(
         &self,
         world: &WorldState,

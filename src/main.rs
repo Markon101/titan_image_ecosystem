@@ -3,6 +3,15 @@ use titan_image::{run, RunConfig};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a == "initialize") {
+        if let Some(config) = RunConfig::parse_args(&args[1..])? {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&titan_image::initialization::create(config)?)?
+            );
+        }
+        return Ok(());
+    }
     if args.first().is_some_and(|a| a == "fork") {
         return titan_image::training_fork::cli(&args[1..]);
     }

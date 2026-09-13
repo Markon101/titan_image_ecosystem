@@ -228,6 +228,7 @@ struct RunMetadata<'a> {
     schema_version: u32,
     package_version: &'static str,
     run_id: String,
+    invocation_id: String,
     build: BuildProvenance,
     invocation: Vec<String>,
     config: &'a RunConfig,
@@ -273,6 +274,8 @@ struct RunMetadata<'a> {
 pub fn run(config: RunConfig) -> Result<()> {
     let mut config = config;
     config.validate()?;
+    std::fs::create_dir_all(&config.output_dir)?;
+    let run_lease = crate::run_lease::RunLease::acquire(&config, "run")?;
     anyhow::ensure!(
         !config.output_dir.join(".fork-incomplete").try_exists()?,
         "incomplete training fork; restore/recreate the fork before resuming"
@@ -402,6 +405,16 @@ pub fn run(config: RunConfig) -> Result<()> {
     let mut episode_schedule = EpisodeSchedule::for_world(&config, &world)?;
     let start_world_step = world.step;
     let optimizer_updates_start = optimizer.updates();
+    write_json_atomic(
+        &config.output_dir.join(format!(
+            "titan_image_invocation{}_{}.json",
+            config.suffix(),
+            run_lease.invocation_id
+        )),
+        &serde_json::json!({"version":1,"invocation_id":run_lease.invocation_id,"pid":std::process::id(),
+            "start_world_step":start_world_step,"optimizer_updates_start":optimizer_updates_start,
+            "config":config,"build_commit":env!("TITAN_BUILD_COMMIT")}),
+    )?;
     let mut target_telemetry = TargetTelemetry::new(start_world_step);
 
     if checkpoint_load.model.grafted {
@@ -743,6 +756,32 @@ pub fn run(config: RunConfig) -> Result<()> {
         let opencl_core_window = train_core && config.compute_backend == ComputeBackend::OpenCl;
         let opencl_training_window = opencl_decoder_window || opencl_core_window;
 
+        let every = config.experiment.write_diagnostics_every;
+        if train_core && every > 0 && (full_core_windows - 1).is_multiple_of(every) {
+            let diagnostic_tick = Instant::now();
+            let fidelity = config.experiment.withdrawal.as_ref().map_or_else(
+                || reference_fidelity(&config, world.step),
+                |schedule| schedule.fidelity(world.age, world.episode, config.seed),
+            );
+            let writes = dynamics.inspect_interface_writes(
+                &world.detached(),
+                &sample.genome_tensor,
+                &sample.reference_micro,
+                &sample.reference_macro,
+                fidelity,
+            )?;
+            append_jsonl(
+                &config
+                    .output_dir
+                    .join(format!("write_diagnostics{}.jsonl", config.suffix())),
+                &serde_json::json!({"version":1,"invocation_id":run_lease.invocation_id,"pid":std::process::id(),
+                    "start_world_step":start_world_step,"world_step":world.step,"age":world.age,"episode":world.episode,
+                    "target_index":sample.index,"optimizer_update":optimizer.updates(),"full_core_window":full_core_windows,
+                    "sampling":"before tracked window; current weights and world; no dynamics step or optimizer update",
+                    "backend":"cpu","diagnostic_seconds":seconds(diagnostic_tick.elapsed()),"writes":writes}),
+            )?;
+            phase.metrics_and_logging += seconds(diagnostic_tick.elapsed());
+        }
         let mut micro_movement_sum = 0.0f32;
         let mut micro_movement_max = 0.0f32;
         let mut macro_movement_sum = 0.0f32;
@@ -1069,7 +1108,7 @@ pub fn run(config: RunConfig) -> Result<()> {
                 &config
                     .output_dir
                     .join(format!("training_diagnostics{}.jsonl", config.suffix())),
-                &serde_json::json!({"version":1,"start_world_step":start_world_step,
+                &serde_json::json!({"version":1,"invocation_id":run_lease.invocation_id,"pid":std::process::id(),"start_world_step":start_world_step,
                     "world_step":world.step,"optimizer_update":optimizer.updates(),
                     "full_core":train_core,"full_core_updates":full_core_windows,
                     "decoder_only_updates":decoder_only_windows,"effective_bptt":config.bptt,"peak_rss_kib":peak_rss_kib(),
@@ -1446,6 +1485,7 @@ pub fn run(config: RunConfig) -> Result<()> {
         schema_version: SCHEMA_VERSION,
         package_version: env!("CARGO_PKG_VERSION"),
         run_id: run_id(),
+        invocation_id: run_lease.invocation_id.clone(),
         build: BuildProvenance {
             commit: env!("TITAN_BUILD_COMMIT"),
             dirty: env!("TITAN_BUILD_DIRTY") == "true",
@@ -1976,7 +2016,7 @@ fn unit_initialized_parameter(name: &str) -> bool {
     name.contains("norm.weight")
 }
 
-fn deterministic_initialize(varmap: &VarMap, seed: u64) -> Result<()> {
+pub(crate) fn deterministic_initialize(varmap: &VarMap, seed: u64) -> Result<()> {
     let data = varmap.data().lock().expect("VarMap mutex poisoned");
     let mut names: Vec<&String> = data.keys().collect();
     names.sort();
