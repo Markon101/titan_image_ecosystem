@@ -1,5 +1,7 @@
 # Frozen diffusion recovery pilot
 
+Completed results: [September 13 noise, patch, and detail comparison](FROZEN_DIFFUSION_RECOVERY_RESULTS_2026-09-13.md).
+
 This testing-only mode compares no diffusion and fixed `nu=.01` using the same
 CPU/f32 frozen sidecar as stage two. It adds no trainable parameters and never
 saves model, world, or optimizer checkpoints. Both arms start from the exact saved
