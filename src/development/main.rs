@@ -4,6 +4,7 @@ mod extended;
 mod metrics;
 mod operators;
 mod recovery;
+mod residual;
 mod spectral;
 use anyhow::{bail, ensure, Context, Result};
 use candle_core::{DType, Device, Tensor};
@@ -397,7 +398,7 @@ fn run(o: Options) -> Result<()> {
     let binary = std::env::current_exe()?;
     save(
         &o.output.join("manifest.json"),
-        &json!({"diagnostics_schema":if o.recovery {"titan.development.recovery.v1"} else if o.extended || o.lyap_vectors>0 {"titan.development.v2"} else {"titan.development.v1"},"complete":false,
+        &json!({"diagnostics_schema":if o.recovery {"titan.development.recovery.v2"} else if o.extended || o.lyap_vectors>0 {"titan.development.v2"} else {"titan.development.v1"},"complete":false,
         "build_commit":env!("TITAN_BUILD_COMMIT"),"build_dirty":env!("TITAN_BUILD_DIRTY"),"build_rustflags":env!("TITAN_BUILD_RUSTFLAGS"),
         "binary_sha256":sha256(&binary)?,"source_config":original,"effective_config":config,"options":o,
         "checkpoint_hashes_sha256":before,"load":load,"training_step":initial_step,"saved_developmental_age":initial_age,
@@ -434,7 +435,7 @@ fn run(o: Options) -> Result<()> {
         save(
             &o.output.join("summary.json"),
             &json!({
-            "diagnostics_schema":"titan.development.recovery.v1", "complete":true,
+            "diagnostics_schema":"titan.development.recovery.v2", "complete":true,
             "training_files_unchanged":true,"checkpoint_hashes_after":after,
             "artifacts_sha256":identities(&files)?,"recovery":result,
             "elapsed_seconds":started.elapsed().as_secs_f64()}),

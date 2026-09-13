@@ -48,3 +48,19 @@ states from the earlier 512-step recovery report. Two noise seeds do not measure
 across-target or across-checkpoint generalization. Autonomous target reconstruction
 is not measured, and no target tensors enter the dynamics. Guided held-out
 reconstruction should be evaluated separately before any training extension.
+
+## Residual decomposition (schema v2)
+
+Each sampled recovery row additionally exports `residuals`, ordered as noise,
+patch. Each case reports micro, macro, and memory RMS, squared L2 energy, and its
+contribution to the initial-distance-normalized recovery ratio. Field shares use
+the sum of RMS values, so they add back to the existing recovery metric despite
+different field sizes. Energy totals across fields are not used as RMS shares.
+
+Spatial fields also report the damaged-minus-control channel means and a
+partition into DC, low, mid, and high squared L2 energies. The per-channel means
+are removed before the existing f64 DFT; radial cutoffs remain .125/.25 cycles
+per original grid cell. Zero-energy fractions are null, and memory has no spatial
+bands. Both Rust and the runner check partition closure and reconstruction of
+the original distance. These passive measurements run only at existing output
+intervals and do not change the model's f32 dynamics or checkpoint format.

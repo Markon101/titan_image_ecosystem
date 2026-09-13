@@ -136,6 +136,22 @@ pub(super) fn run(
                 ratios.push(ratio);
             }
             if sample {
+                let mut residuals = Vec::new();
+                for case in 0..2 {
+                    let residual = super::residual::measure(
+                        &states[0],
+                        &states[case + 1],
+                        initial_distances[case],
+                        o.low_cutoff,
+                        o.mid_cutoff,
+                    )?;
+                    let measured = residual["state_distance_ratio"].as_f64().unwrap();
+                    ensure!(
+                        (measured - ratios[case]).abs() <= 1e-12 * ratios[case].abs().max(1.),
+                        "residual components disagree with recovery distance"
+                    );
+                    residuals.push(residual);
+                }
                 let mut images = Vec::new();
                 for (state, case) in states.iter().zip(["control", "macro_noise", "macro_patch"]) {
                     let (_, emergence) = config.developmental_schedule(
@@ -160,7 +176,7 @@ pub(super) fn run(
                 }
                 let row = json!({"offset":offset,"age":states[0].age,"world_step":states[0].step,
                     "arm":name,"seed":o.seed,"runtime_references_present":false,"reference_fidelity":0.,
-                    "same_clock_sequence":true,"state_distance_ratio":ratios,
+                    "same_clock_sequence":true,"state_distance_ratio":ratios,"residuals":residuals,
                     "render_l1_to_paired_control":[image_l1(&images[0],&images[1]),image_l1(&images[0],&images[2])],
                     "control_image":image_stats(&images[0],resolution),
                     "control_micro":metrics::field(&states[0].micro,o.low_cutoff,o.mid_cutoff)?,

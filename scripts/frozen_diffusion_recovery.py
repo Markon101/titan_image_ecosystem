@@ -2,6 +2,7 @@
 """Run a small reference-free fixed-diffusion recovery panel against an immutable checkpoint."""
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -12,6 +13,28 @@ from frozen_fork_followup import digest, identities, read, write, finite
 def require(condition, message):
     if not condition:
         raise RuntimeError(message)
+
+
+def validate_residuals(rows):
+    for row in rows:
+        require(len(row['residuals']) == 2, 'missing residual cases')
+        for index, residual in enumerate(row['residuals']):
+            fields = residual['fields']
+            require(set(fields) == {'micro', 'macro', 'memory'}, 'residual fields differ')
+            require(math.isclose(sum(f['rms'] for f in fields.values()), residual['sum_rms'],
+                                 rel_tol=1e-12, abs_tol=1e-24), 'field RMS sum mismatch')
+            require(math.isclose(sum(f['initial_distance_normalized_rms'] for f in fields.values()),
+                                 row['state_distance_ratio'][index], rel_tol=1e-12, abs_tol=1e-24),
+                    'residual distance reconstruction mismatch')
+            for name, field in fields.items():
+                require(math.isclose(field['rms']**2 * field['scalar_count'], field['l2_energy'],
+                                     rel_tol=1e-12, abs_tol=1e-24), 'residual RMS/energy mismatch')
+                if name != 'memory':
+                    spatial = field['spatial']
+                    require(math.isclose(spatial['channel_mean_energy']
+                                         + sum(spatial['spatial_band_energy_excluding_dc']),
+                                         field['l2_energy'], rel_tol=1e-9, abs_tol=1e-24),
+                            'residual spatial energy partition mismatch')
 
 
 def main():
@@ -66,6 +89,8 @@ def main():
         require(identities(summary['artifacts_sha256']) == summary['artifacts_sha256'], 'artifact changed')
         rows = [json.loads(line) for line in (out / 'recovery.jsonl').read_text().splitlines()]
         require(finite(rows), 'non-finite recovery rows')
+        if manifest['diagnostics_schema'] == 'titan.development.recovery.v2':
+            validate_residuals(rows)
         require(all(row['same_clock_sequence'] and row['runtime_references_present'] is False
                     and row['reference_fidelity'] == 0 for row in rows), 'pairing/reference mismatch')
         for case in ['control', 'macro_noise', 'macro_patch']:
