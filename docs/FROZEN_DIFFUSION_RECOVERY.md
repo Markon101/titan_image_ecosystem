@@ -64,3 +64,5 @@ per original grid cell. Zero-energy fractions are null, and memory has no spatia
 bands. Both Rust and the runner check partition closure and reconstruction of
 the original distance. These passive measurements run only at existing output
 intervals and do not change the model's f32 dynamics or checkpoint format.
+
+Residual findings: [September 13 field and frequency decomposition](RECOVERY_RESIDUAL_RESULTS_2026-09-13.md).
