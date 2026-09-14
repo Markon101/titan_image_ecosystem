@@ -36,11 +36,21 @@ impl Projection {
         Ok(v)
     }
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffusionScope {
+    #[default]
+    Both,
+    Micro,
+    Macro,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Operators {
     pub transport_max: f64,
     pub diffusion_max: f64,
+    pub diffusion_scope: DiffusionScope,
     pub velocity_x: Projection,
     pub velocity_y: Projection,
     pub diffusivity: Projection,
@@ -73,7 +83,14 @@ impl Operators {
         }
         v
     }
-    fn terms(&self, x: &[f64], c: usize, h: usize, w: usize) -> Result<(Vec<f64>, Vec<f64>)> {
+    fn terms(
+        &self,
+        x: &[f64],
+        c: usize,
+        h: usize,
+        w: usize,
+        diffuse: bool,
+    ) -> Result<(Vec<f64>, Vec<f64>)> {
         let n = h * w;
         let mut t = vec![0.; x.len()];
         let mut d = t.clone();
@@ -82,8 +99,11 @@ impl Operators {
                 let i = y * w + a;
                 let ax = self.transport_max * self.velocity_x.at(x, n, i)?.tanh();
                 let ay = self.transport_max * self.velocity_y.at(x, n, i)?.tanh();
-                let nu =
-                    self.diffusion_max * (0.5 + 0.5 * (self.diffusivity.at(x, n, i)? / 2.).tanh());
+                let nu = if diffuse {
+                    self.diffusion_max * (0.5 + 0.5 * (self.diffusivity.at(x, n, i)? / 2.).tanh())
+                } else {
+                    0.
+                };
                 for k in 0..c {
                     let at = |y: usize, a: usize| x[k * n + y * w + a];
                     let center = at(y, a);
@@ -120,13 +140,23 @@ impl Operators {
         let mut d = t.clone();
         if self.transport_max > 0. || self.diffusion_max > 0. {
             let mut cursor = 0;
-            for (source, dest, active) in [
-                (&x.micro, &mut next.micro, true),
-                (&x.macro_field, &mut next.macro_field, macro_updated),
+            for (source, dest, active, diffuse) in [
+                (
+                    &x.micro,
+                    &mut next.micro,
+                    true,
+                    self.diffusion_scope != DiffusionScope::Macro,
+                ),
+                (
+                    &x.macro_field,
+                    &mut next.macro_field,
+                    macro_updated,
+                    self.diffusion_scope != DiffusionScope::Micro,
+                ),
             ] {
                 let (_, c, h, w) = source.dims4()?;
-                if active {
-                    let (ft, fd) = self.terms(&values(source)?, c, h, w)?;
+                if active && (self.transport_max > 0. || (diffuse && self.diffusion_max > 0.)) {
+                    let (ft, fd) = self.terms(&values(source)?, c, h, w, diffuse)?;
                     let base = values(dest)?;
                     let v: Vec<f32> = (0..base.len())
                         .map(|i| (base[i] + ft[i] + fd[i]) as f32)
@@ -169,7 +199,7 @@ mod tests {
             ..Default::default()
         };
         o.validate(1)?;
-        let (t, d) = o.terms(&[3.; 16], 1, 4, 4)?;
+        let (t, d) = o.terms(&[3.; 16], 1, 4, 4, true)?;
         assert_eq!(norm(&t) + norm(&d), 0.);
         let x: Vec<_> = (0..16)
             .map(|i| if (i / 4 + i % 4) % 2 == 0 { 1. } else { -1. })
@@ -178,7 +208,7 @@ mod tests {
             diffusion_max: 0.2,
             ..Default::default()
         };
-        let (_, d) = diffusion.terms(&x, 1, 4, 4)?;
+        let (_, d) = diffusion.terms(&x, 1, 4, 4, true)?;
         let y: Vec<_> = x.iter().zip(&d).map(|(x, d)| x + d).collect();
         assert!((norm(&y) / norm(&x) - 0.2).abs() < 1e-12);
         assert!(d.iter().sum::<f64>().abs() < 1e-12);
@@ -195,7 +225,7 @@ mod tests {
             ..Default::default()
         };
         let x = [0., 1., 0., 0.];
-        let (t, _) = o.terms(&x, 1, 1, 4)?;
+        let (t, _) = o.terms(&x, 1, 1, 4, true)?;
         let y: Vec<_> = x.iter().zip(&t).map(|(x, t)| x + t).collect();
         assert!(y.iter().all(|v| *v >= 0. && *v <= 1.));
         assert!((y.iter().sum::<f64>() - 1.).abs() < 1e-12);
@@ -209,6 +239,84 @@ mod tests {
         assert_eq!(report["f32_composition_residual_l2"], 0.);
         Ok(())
     }
+    #[test]
+    fn grid_selection_preserves_excluded_fields_and_macro_cadence() -> Result<()> {
+        let mut x = WorldState::fresh(&RunConfig::default(), 42, &Device::Cpu)?;
+        let checker: Vec<f32> = (0..16)
+            .map(|i| if (i / 4 + i % 4) % 2 == 0 { 1. } else { -1. })
+            .collect();
+        x.micro = Tensor::from_vec(checker.clone(), (1, 1, 4, 4), &Device::Cpu)?;
+        x.macro_field = x.micro.clone();
+        for scope in [
+            DiffusionScope::Both,
+            DiffusionScope::Micro,
+            DiffusionScope::Macro,
+        ] {
+            let o = Operators {
+                diffusion_max: 0.02,
+                diffusion_scope: scope,
+                ..Default::default()
+            };
+            for macro_updated in [false, true] {
+                let mut next = x.detached();
+                // Signed zero catches unintended re-encoding of excluded fields.
+                next.micro = Tensor::from_vec(vec![-0.0f32; 16], (1, 1, 4, 4), &Device::Cpu)?;
+                next.macro_field = next.micro.clone();
+                let (out, _) = o.apply(&x, next, macro_updated)?;
+                for (field, enabled) in [
+                    (&out.micro, scope != DiffusionScope::Macro),
+                    (
+                        &out.macro_field,
+                        macro_updated && scope != DiffusionScope::Micro,
+                    ),
+                ] {
+                    for (v, original) in field.flatten_all()?.to_vec1::<f32>()?.iter().zip(&checker)
+                    {
+                        if enabled {
+                            assert!((*v + 0.08 * original).abs() < 1e-7);
+                        } else {
+                            assert_eq!(v.to_bits(), (-0.0f32).to_bits());
+                        }
+                    }
+                }
+                assert_eq!(values(&out.memory)?, values(&x.memory)?);
+                assert_eq!((out.age, out.step), (x.age, x.step));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn scope_defaults_are_compatible_and_do_not_scope_transport() -> Result<()> {
+        let legacy: Operators = serde_json::from_str(r#"{"diffusion_max":0.02}"#)?;
+        let explicit: Operators =
+            serde_json::from_str(r#"{"diffusion_max":0.02,"diffusion_scope":"both"}"#)?;
+        assert_eq!(legacy.diffusion_scope, DiffusionScope::Both);
+        let x = WorldState::fresh(&RunConfig::default(), 42, &Device::Cpu)?;
+        assert_eq!(
+            full(&legacy.apply(&x, x.detached(), true)?.0)?,
+            full(&explicit.apply(&x, x.detached(), true)?.0)?
+        );
+        let transport = Operators {
+            transport_max: 0.1,
+            velocity_x: Projection {
+                bias: 1.,
+                terms: vec![],
+            },
+            ..Default::default()
+        };
+        let baseline = full(&transport.apply(&x, x.detached(), true)?.0)?;
+        for scope in [DiffusionScope::Micro, DiffusionScope::Macro] {
+            let scoped = Operators {
+                diffusion_scope: scope,
+                ..transport.clone()
+            };
+            assert_eq!(full(&scoped.apply(&x, x.detached(), true)?.0)?, baseline);
+        }
+        assert!(serde_json::from_str::<Operators>(r#"{"diffusion_scope":"unknown"}"#).is_err());
+        Ok(())
+    }
+
     #[test]
     fn invalid_coefficients_and_cfl_rejected() {
         assert!(Operators {
